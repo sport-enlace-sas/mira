@@ -228,6 +228,7 @@ class ReviewJobModel(BaseModel):
     error: str
     provider_used: str
     fallback_used: bool
+    next_attempt_at: float
     created_at: float
     updated_at: float
 

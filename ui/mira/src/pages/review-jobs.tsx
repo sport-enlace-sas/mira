@@ -87,7 +87,12 @@ export function ReviewJobsPage() {
                       {job.provider_used || "pending"}
                       {job.fallback_used && <span className="ml-1 text-xs text-amber-600">fallback</span>}
                     </TableCell>
-                    <TableCell>{job.attempts}</TableCell>
+                    <TableCell>
+                      {job.attempts}
+                      {job.status === "pending" && job.attempts > 0 && job.next_attempt_at > Date.now() / 1000 && (
+                        <div className="mt-1 text-xs text-muted-foreground">retry scheduled</div>
+                      )}
+                    </TableCell>
                     <TableCell className="text-sm text-muted-foreground">{relativeTime(job.updated_at)}</TableCell>
                   </TableRow>
                 ))}
