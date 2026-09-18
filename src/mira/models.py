@@ -229,6 +229,10 @@ class WalkthroughResult:
         failure_notice: str | None = None,
         advisory_comments: list[ReviewComment] | None = None,
         head_sha: str = "",
+        full_pr_revalidation: bool = False,
+        historical_findings: int = 0,
+        provider_used: str = "",
+        fallback_used: bool = False,
     ) -> str:
         """Render as a markdown PR comment."""
         parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
@@ -243,6 +247,17 @@ class WalkthroughResult:
         if head_sha:
             parts.append(f"Scope: `{head_sha[:12]}` · advisory only")
             parts.append("")
+        if full_pr_revalidation:
+            parts.append(
+                "Mode: **full PR revalidation** — the complete current PR diff was analyzed."
+            )
+            parts.append("")
+        if provider_used:
+            provider_label = f"Provider: `{provider_used}`"
+            if fallback_used:
+                provider_label += " · fallback activated"
+            parts.append(provider_label)
+            parts.append("")
         parts.append("| Check | Status |")
         parts.append("|---|---|")
         for check, categories in ADVISORY_CHECKS:
@@ -256,6 +271,16 @@ class WalkthroughResult:
             else:
                 status = "N/A"
             parts.append(f"| `{check}` | {status} |")
+
+        if historical_findings:
+            parts.append("")
+            parts.append("### Historical findings")
+            parts.append("")
+            parts.append(
+                f"{historical_findings} earlier Mira finding"
+                f"{'s are' if historical_findings != 1 else ' is'} retained as historical context. "
+                "They are not new findings from this SHA."
+            )
 
         if self.sequence_diagram:
             # Hardening at render time — the single choke point every

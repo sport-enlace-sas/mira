@@ -294,6 +294,12 @@ class ReviewConfig(BaseModel):
     # locally before pushing — only the final diff gets reviewed.
     review_on_synchronize: bool = True
 
+    # When enabled, every new PR SHA is reviewed against the complete current
+    # PR diff, even when earlier Mira threads exist.  The default incremental
+    # strategy is cheaper and quieter; this mode is intended for corporate
+    # assurance workflows that must detect regressions outside the latest hunk.
+    full_revalidation_on_synchronize: bool = False
+
 
 class IndexConfig(BaseModel):
     # Skip indexing any file larger than this (bytes). Generated SDKs, vendored

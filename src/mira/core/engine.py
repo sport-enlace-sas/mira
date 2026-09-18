@@ -48,6 +48,7 @@ from mira.models import (
     PR_SUMMARY_END,
     PR_SUMMARY_START,
     WALKTHROUGH_MARKER,
+    BotThreadRecord,
     FileChangeType,
     KeyIssue,
     OverlapFinding,
@@ -618,6 +619,7 @@ class ReviewEngine:
         review_round = 1
         is_review_rest = getattr(self, "_review_only_paths", None) is not None
         resolved_thread_dicts: list[dict] = []
+        all_bot_threads: list[BotThreadRecord] = []
         try:
             if self.bot_name and self.provider is not None:
                 all_bot_threads = await self.provider.get_all_bot_threads(
@@ -638,11 +640,17 @@ class ReviewEngine:
         except Exception as exc:
             logger.warning("Failed to compute review round: %s", exc)
 
-        # Round 2+ uses incremental diff to avoid re-flagging untouched files.
-        # Overlap detection keeps the full diff — its fingerprint must cover the
-        # whole PR, not just the latest commits.
+        # Upstream round 2+ uses an incremental diff to avoid re-flagging
+        # untouched files. Corporate assurance mode deliberately opts out: a
+        # correction can induce a regression anywhere in the PR, so each SHA
+        # must be revalidated against the full current PR diff. Overlap
+        # detection always keeps the full diff in either mode.
         full_diff_text = diff_text
-        if review_round >= 2 and pr_info.head_sha:
+        if (
+            review_round >= 2
+            and pr_info.head_sha
+            and not self.config.review.full_revalidation_on_synchronize
+        ):
             try:
                 from mira.dashboard.api import _app_db
 
@@ -696,6 +704,13 @@ class ReviewEngine:
                     "Incremental diff fetch failed, falling back to full diff: %s",
                     exc,
                 )
+        elif review_round >= 2 and self.config.review.full_revalidation_on_synchronize:
+            logger.info(
+                "Full PR revalidation enabled for round %d on %s; reviewing %d chars",
+                review_round,
+                pr_info.url,
+                len(full_diff_text),
+            )
 
         team_conventions = ""
         try:
@@ -861,6 +876,17 @@ class ReviewEngine:
 
                     import os as _os
 
+                    provider_chains = (self.llm, self.indexing_llm, self.security_llm)
+                    fallback_used = any(
+                        getattr(candidate, "last_provider", "primary") == "fallback"
+                        for candidate in provider_chains
+                    )
+                    provider_used = (
+                        self.config.llm.fallback_provider
+                        if fallback_used
+                        else self.config.llm.provider
+                    ) or "unknown"
+
                     markdown = result.walkthrough.to_markdown(
                         bot_name=self.bot_name,
                         review_stats=stats,
@@ -876,6 +902,10 @@ class ReviewEngine:
                         overlaps=overlaps or None,
                         advisory_comments=result.comments,
                         head_sha=pr_info.head_sha,
+                        full_pr_revalidation=self.config.review.full_revalidation_on_synchronize,
+                        historical_findings=len(all_bot_threads),
+                        provider_used=provider_used,
+                        fallback_used=fallback_used,
                     )
                     comment_id = placeholder_id
                     if comment_id is None:

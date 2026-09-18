@@ -25,6 +25,19 @@ filter:
   exclude_deleted: true
 
 review:
+  # Each new commit re-audits the complete current PR. This is intentionally
+  # more thorough than upstream incremental review so corrective commits are
+  # checked for regressions outside their newest hunk.
+  full_revalidation_on_synchronize: true
+  # Earlier native GitHub review comments remain visible as historical
+  # evidence. Mira does not automatically close them; a human remains in
+  # control of thread resolution during the pilot.
+  auto_resolve_conversations: false
+  # Raise limits for the corporate pilot so a full PR is not silently reduced
+  # to its latest commits. Individual oversized/generated files can still be
+  # reported as explicitly skipped.
+  max_diff_size: 1000000
+  max_chunks_per_review: 20
   include_summary: true
   walkthrough: true
   walkthrough_sequence_diagram: true
