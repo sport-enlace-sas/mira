@@ -1,0 +1,46 @@
+# Deployment-wide policy for the Inlaze advisory reviewer.  This file is
+# loaded by `mira serve`; repository-local .mira.yaml files cannot replace the
+# provider chain or executable settings.
+llm:
+  provider: claude-cli
+  model: claude-sonnet-5
+  fallback_provider: codex-cli
+  fallback_model: codex-default
+  temperature: 0.2
+  max_tokens: 4096
+  max_retries: 2
+  request_timeout: 120
+  retry_min_wait: 2
+  retry_max_wait: 15
+  codex_sandbox: read-only
+  codex_timeout_seconds: 900
+  claude_timeout_seconds: 900
+
+filter:
+  confidence_threshold: 0.80
+  max_comments: 8
+  min_severity: warning
+  # Secrets, generated output, and lock files are deterministic scans or
+  # high-noise input. The walkthrough reports any review scope limitation.
+  exclude_deleted: true
+
+review:
+  include_summary: true
+  walkthrough: true
+  walkthrough_sequence_diagram: true
+  pr_summary: disable
+  review_on_synchronize: true
+  self_critique: true
+  security_pass: true
+  # CLI providers are one-shot, isolated processes. Do not expose Mira's
+  # agentic read/grep tools to them in this corporate deployment.
+  agentic_tools: false
+  security_agentic: false
+  secrets_scan: true
+  osv_scan: true
+  blast_radius: true
+  overlap:
+    enabled: true
+
+provider:
+  type: github

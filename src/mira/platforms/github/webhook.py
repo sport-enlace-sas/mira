@@ -480,6 +480,16 @@ async def dispatch_github_event(
             logger.debug("Ignoring pull_request event from self (%s)", sender)
             return "ignored"
 
+        # External forks must never receive a review from the corporate
+        # installation: their diff is untrusted and the App's installation
+        # token is scoped to the base repository, not the contributor fork.
+        head_repo = payload.get("pull_request", {}).get("head", {}).get("repo") or {}
+        base_full_name = payload.get("repository", {}).get("full_name", "")
+        head_full_name = head_repo.get("full_name", "")
+        if head_repo.get("fork") or (head_full_name and base_full_name and head_full_name != base_full_name):
+            logger.info("PR from fork skipped for %s", base_full_name or "unknown repository")
+            return "ignored"
+
         # Opt out of per-push reviews: only open/reopen auto-review, later
         # commits wait for an explicit `@bot review` comment.
         if action == "synchronize" and not cfg.review.review_on_synchronize:

@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
+from mira.llm.claude_cli import ClaudeCLIProvider
 from mira.llm.codex_cli import CodexCLIProvider
+from mira.llm.provider_chain import ProviderChain
 
 
 class TestCodexCLIProvider:
@@ -90,6 +92,15 @@ class TestCodexCLIProvider:
 
         assert (runtime_home / "auth.json").read_text() == '{"tokens": "secret"}'
         assert not (runtime_home / "config.toml").exists()
+
+    def test_runtime_codex_home_uses_sealed_json_without_a_host_mount(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MIRA_CODEX_AUTH_JSON", '{"tokens": "sealed"}')
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
+
+        runtime_home = Path(provider._prepare_codex_home(str(tmp_path / "invocation")))
+
+        assert (runtime_home / "auth.json").read_text() == '{"tokens": "sealed"}'
+        assert (runtime_home / "auth.json").stat().st_mode & 0o777 == 0o600
 
     def test_command_disables_user_rules_and_shell_environment_inheritance(self):
         provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
@@ -223,3 +234,59 @@ class TestCodexCLIProvider:
 
         assert msg == {"content": "", "tool_calls": []}
         provider._run_codex.assert_not_awaited()
+
+
+class TestClaudeAndFallbackProvider:
+    def test_factory_builds_claude_to_codex_chain(self):
+        provider = create_llm(
+            LLMConfig(
+                provider="claude-cli",
+                model="claude-sonnet-5",
+                fallback_provider="codex-cli",
+                fallback_model="codex-default",
+            )
+        )
+        assert isinstance(provider, ProviderChain)
+        assert isinstance(provider.primary, ClaudeCLIProvider)
+        assert isinstance(provider.fallback, CodexCLIProvider)
+
+    def test_claude_command_is_restricted_and_not_bare(self):
+        provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
+        command = provider._command()
+        assert command[:3] == ["claude", "-p", "--restricted"]
+        assert "--bare" not in command
+
+    def test_claude_environment_only_contains_its_oauth_token(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
+        monkeypatch.setenv("DATABASE_URL", "postgres://secret")
+        provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
+        env = provider._env(str(tmp_path))
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "secret"
+        assert "DATABASE_URL" not in env
+
+    @pytest.mark.asyncio
+    async def test_transient_claude_failure_uses_codex_once(self):
+        primary = MagicMock()
+        fallback = MagicMock()
+        primary.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        fallback.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        primary.complete = AsyncMock(side_effect=LLMError("codex_timeout", seconds=1))
+        fallback.complete = AsyncMock(return_value='{"comments": []}')
+        chain = ProviderChain(primary, fallback)
+
+        assert await chain.complete([{"role": "user", "content": "review"}]) == '{"comments": []}'
+        fallback.complete.assert_awaited_once()
+        assert chain.last_provider == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_invalid_claude_credentials_do_not_use_codex(self):
+        primary = MagicMock()
+        fallback = MagicMock()
+        primary.usage = fallback.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        primary.complete = AsyncMock(side_effect=NonRetriableLLMError("no_api_key", api_key_env="x"))
+        fallback.complete = AsyncMock()
+        chain = ProviderChain(primary, fallback)
+
+        with pytest.raises(NonRetriableLLMError):
+            await chain.complete([{"role": "user", "content": "review"}])
+        fallback.complete.assert_not_awaited()
