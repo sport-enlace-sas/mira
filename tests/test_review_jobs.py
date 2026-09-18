@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from mira.dashboard import db as dashboard_db
 from mira.dashboard.db import AppDatabase
 
 
@@ -30,7 +31,9 @@ def test_new_sha_supersedes_pending_review_and_duplicate_is_idempotent(tmp_path)
     assert not db.is_review_job_current(job.id)
 
 
-def test_transient_failure_returns_job_to_queue(tmp_path) -> None:
+def test_transient_failure_returns_job_to_queue_after_backoff(tmp_path, monkeypatch) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(
         owner="o", repo="r", pr_number=1, head_sha="c" * 40,
@@ -40,6 +43,10 @@ def test_transient_failure_returns_job_to_queue(tmp_path) -> None:
     first = db.claim_next_review_job()
     assert first is not None
     db.finish_review_job(first.id, error="provider timeout", retry=True)
+    # First retry is intentionally delayed by 10 seconds rather than looping
+    # while a provider is unavailable.
+    assert db.claim_next_review_job() is None
+    now += 10
     second = db.claim_next_review_job()
     assert second is not None
     assert second.id == first.id

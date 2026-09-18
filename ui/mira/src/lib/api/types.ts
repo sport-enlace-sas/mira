@@ -28,6 +28,7 @@ export interface ReviewJobModel {
   error: string
   provider_used: string
   fallback_used: boolean
+  next_attempt_at: number
   created_at: number
   updated_at: number
 }

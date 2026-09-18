@@ -126,11 +126,14 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     error TEXT NOT NULL DEFAULT '',
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used INTEGER NOT NULL DEFAULT 0,
+    -- A transient error is deliberately not re-claimed immediately. This
+    -- keeps an unavailable provider from turning one webhook into a hot loop.
+    next_attempt_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, next_attempt_at, created_at);
 
 -- ── Contributor analytics ──
 -- People who contribute to indexed repos, keyed provider-agnostically so a
@@ -316,11 +319,12 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     error TEXT NOT NULL DEFAULT '',
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used BOOLEAN NOT NULL DEFAULT FALSE,
+    next_attempt_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, next_attempt_at, created_at);
 
 -- ── Contributor analytics ── (see SQLite schema above for column rationale)
 CREATE TABLE IF NOT EXISTS contributors (
@@ -526,6 +530,7 @@ class ReviewJobStatus:
     error: str
     provider_used: str
     fallback_used: bool
+    next_attempt_at: float
     created_at: float
     updated_at: float
 
@@ -647,6 +652,18 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE mira_review_jobs ADD COLUMN fallback_used INTEGER NOT NULL DEFAULT 0"
             )
+        if "next_attempt_at" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
+        # The original claim index did not include the retry due time. Rebuild
+        # it even on existing databases so delayed jobs stay out of the hot
+        # pending scan.
+        self._sqlite_conn.execute("DROP INDEX IF EXISTS idx_mira_review_jobs_claim")
+        self._sqlite_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim "
+            "ON mira_review_jobs(status, next_attempt_at, created_at)"
+        )
         # Adding `platform` to the primary key requires a table rebuild (SQLite
         # can't alter a PK in place). Rename the old table, recreate it from the
         # current schema, and copy rows in as 'github'.
@@ -717,6 +734,15 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
                     "fallback_used BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "next_attempt_at DOUBLE PRECISION NOT NULL DEFAULT 0"
+                )
+                cur.execute("DROP INDEX IF EXISTS idx_mira_review_jobs_claim")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim "
+                    "ON mira_review_jobs(status, next_attempt_at, created_at)"
                 )
                 # Add `platform` to the key on existing DBs. Postgres can swap
                 # the PK in place; guard so it only rebuilds when needed.
@@ -1401,10 +1427,10 @@ class AppDatabase:
             )
             cur = self._sqlite_conn.execute(
                 "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
-                "pr_title, installation_id, is_private, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) "
+                "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING",
-                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, int(is_private), now, now),
+                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, int(is_private), now, now, now),
             )
             self._sqlite_conn.commit()
             return cur.rowcount > 0
@@ -1417,10 +1443,10 @@ class AppDatabase:
             )
             cur.execute(
                 "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
-                "pr_title, installation_id, is_private, status, created_at, updated_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) "
+                "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING RETURNING id",
-                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, is_private, now, now),
+                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, is_private, now, now, now),
             )
             inserted = cur.fetchone() is not None
         self._pg_commit()
@@ -1433,13 +1459,16 @@ class AppDatabase:
             assert self._sqlite_conn is not None
             row = self._sqlite_conn.execute(
                 "SELECT id, platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, "
-                "is_private, attempts FROM mira_review_jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
+                "is_private, attempts FROM mira_review_jobs "
+                "WHERE status='pending' AND next_attempt_at<=? "
+                "ORDER BY next_attempt_at, created_at LIMIT 1",
+                (now,),
             ).fetchone()
             if row is None:
                 return None
             cur = self._sqlite_conn.execute(
                 "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, updated_at=? "
-                "WHERE id=? AND status='pending'", (now, row[0])
+                "WHERE id=? AND status='pending' AND next_attempt_at<=?", (now, row[0], now)
             )
             self._sqlite_conn.commit()
             if cur.rowcount == 0:
@@ -1447,13 +1476,14 @@ class AppDatabase:
             return ReviewJob(*row[:10], attempts=int(row[10]) + 1)
         with self._pg_cursor() as cur:
             cur.execute(
-                "WITH next_job AS (SELECT id FROM mira_review_jobs WHERE status='pending' "
-                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
+                "WITH next_job AS (SELECT id FROM mira_review_jobs "
+                "WHERE status='pending' AND next_attempt_at<=%s "
+                "ORDER BY next_attempt_at, created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
                 "UPDATE mira_review_jobs j SET status='running', attempts=j.attempts+1, updated_at=%s "
                 "FROM next_job WHERE j.id=next_job.id "
                 "RETURNING j.id,j.platform,j.owner,j.repo,j.pr_number,j.head_sha,j.pr_url,j.pr_title,"
                 "j.installation_id,j.is_private,j.attempts",
-                (now,),
+                (now, now),
             )
             row = cur.fetchone()
         self._pg_commit()
@@ -1480,39 +1510,61 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             cur = self._sqlite_conn.execute(
-                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=? "
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', "
+                "next_attempt_at=?, updated_at=? "
                 "WHERE status='running'",
-                (now,),
+                (now, now),
             )
             self._sqlite_conn.commit()
             return cur.rowcount
         with self._pg_cursor() as cur:
             cur.execute(
-                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=%s "
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', "
+                "next_attempt_at=%s, updated_at=%s "
                 "WHERE status='running' RETURNING id",
-                (now,),
+                (now, now),
             )
             count = len(cur.fetchall())
         self._pg_commit()
         return count
 
     def finish_review_job(self, job_id: int, *, error: str = "", retry: bool = False) -> None:
-        """Complete a job, or return a transient failure to the durable queue."""
+        """Complete a job, or schedule a bounded exponential retry.
+
+        The worker can poll cheaply while idle, but a provider outage must not
+        consume the subscription quota in a tight loop.  Retries therefore run
+        after 10, 20, 40, 80, 160, then at most 300 seconds.
+        """
         now = time.time()
         status = "pending" if retry else ("failed" if error else "completed")
         safe_error = error[:1000]
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(
+                "SELECT attempts FROM mira_review_jobs WHERE id=? AND status='running'", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            delay = min(300, 10 * (2 ** max(0, int(row[0]) - 1))) if retry else 0
             self._sqlite_conn.execute(
-                "UPDATE mira_review_jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
-                (status, safe_error, now, job_id),
+                "UPDATE mira_review_jobs SET status=?, error=?, next_attempt_at=?, updated_at=? "
+                "WHERE id=? AND status='running'",
+                (status, safe_error, now + delay, now, job_id),
             )
             self._sqlite_conn.commit()
         else:
             with self._pg_cursor() as cur:
                 cur.execute(
-                    "UPDATE mira_review_jobs SET status=%s, error=%s, updated_at=%s "
-                    "WHERE id=%s AND status='running'", (status, safe_error, now, job_id)
+                    "SELECT attempts FROM mira_review_jobs WHERE id=%s AND status='running' FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return
+                delay = min(300, 10 * (2 ** max(0, int(row[0]) - 1))) if retry else 0
+                cur.execute(
+                    "UPDATE mira_review_jobs SET status=%s, error=%s, next_attempt_at=%s, updated_at=%s "
+                    "WHERE id=%s AND status='running'", (status, safe_error, now + delay, now, job_id)
                 )
             self._pg_commit()
 
@@ -1545,7 +1597,7 @@ class AppDatabase:
         bounded_limit = max(1, min(limit, 500))
         columns = (
             "id,platform,owner,repo,pr_number,head_sha,pr_url,pr_title,status,attempts,error,"
-            "provider_used,fallback_used,created_at,updated_at"
+            "provider_used,fallback_used,next_attempt_at,created_at,updated_at"
         )
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
@@ -1565,7 +1617,8 @@ class AppDatabase:
                 id=int(row[0]), platform=row[1], owner=row[2], repo=row[3],
                 pr_number=int(row[4]), head_sha=row[5], pr_url=row[6], pr_title=row[7],
                 status=row[8], attempts=int(row[9]), error=row[10], provider_used=row[11],
-                fallback_used=bool(row[12]), created_at=float(row[13]), updated_at=float(row[14]),
+                fallback_used=bool(row[12]), next_attempt_at=float(row[13]),
+                created_at=float(row[14]), updated_at=float(row[15]),
             )
             for row in rows
         ]
