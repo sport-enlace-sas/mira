@@ -65,6 +65,27 @@ def test_startup_recovers_interrupted_job(tmp_path) -> None:
     assert db.claim_next_review_job() is not None
 
 
+def test_manual_retry_reschedules_failed_job_but_not_superseded_sha(tmp_path) -> None:
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    args = {
+        "owner": "o", "repo": "r", "pr_number": 1,
+        "pr_url": "https://github.com/o/r/pull/1", "pr_title": "t",
+        "installation_id": 1, "is_private": True,
+    }
+    assert db.enqueue_review_job(head_sha="f" * 40, **args)
+    failed = db.claim_next_review_job()
+    assert failed is not None
+    db.finish_review_job(failed.id, error="provider unavailable")
+    assert db.retry_review_job(failed.id)
+    assert db.claim_next_review_job() is not None
+
+    # A newer SHA must supersede even a failed job, and a manual retry must
+    # never revive that stale SHA.
+    db.finish_review_job(failed.id, error="provider unavailable")
+    assert db.enqueue_review_job(head_sha="g" * 40, **args)
+    assert not db.retry_review_job(failed.id)
+
+
 def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(
