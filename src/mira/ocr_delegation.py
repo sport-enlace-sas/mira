@@ -7,6 +7,7 @@ remain owned by Mira's configured Claude -> Codex provider chain.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -185,11 +186,16 @@ class OpenCodeReviewDelegation:
             "GIT_TERMINAL_PROMPT": "0",
         }
         if token:
+            # Git's HTTPS transport authenticates installation access tokens
+            # through HTTP Basic auth. The token stays in a process-local
+            # environment value: never in the remote URL, command arguments,
+            # repository config, logs, or OCR input.
+            basic_auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             env.update(
                 {
                     "GIT_CONFIG_COUNT": "1",
                     "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-                    "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: bearer {token}",
+                    "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic_auth}",
                 }
             )
         return env
