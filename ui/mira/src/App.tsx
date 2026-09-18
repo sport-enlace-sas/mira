@@ -18,6 +18,7 @@ import { PackagesPage } from "@/pages/packages"
 import { RepoDetailPage } from "@/pages/repo-detail"
 import { RelationshipsPage } from "@/pages/relationships"
 import { ReposPage } from "@/pages/repos"
+import { ReviewJobsPage } from "@/pages/review-jobs"
 import { SettingsPage } from "@/pages/settings"
 import { SetupPage } from "@/pages/setup"
 import { RulesPage } from "@/pages/rules"
@@ -202,6 +203,7 @@ export function App() {
         >
           <Route index element={<DashboardPage />} />
           <Route path="activity" element={<ActivityPage />} />
+          <Route path="advisory-jobs" element={<ReviewJobsPage />} />
           <Route path="repos" element={<ReposPage />} />
           <Route path="repos/:owner/:repo" element={<RepoDetailPage />} />
           <Route path="contributors" element={<ContributorsPage />} />
