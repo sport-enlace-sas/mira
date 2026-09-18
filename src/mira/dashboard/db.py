@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
 -- Durable native review queue. A newer SHA supersedes any pending/running
 -- review for the same PR, so webhook retries and fast pushes cannot publish a
 -- stale review after a container restart.
-CREATE TABLE IF NOT EXISTS review_jobs (
+CREATE TABLE IF NOT EXISTS mira_review_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     platform TEXT NOT NULL DEFAULT 'github',
     owner TEXT NOT NULL,
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     updated_at REAL NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_review_jobs_claim ON review_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
 
 -- ── Contributor analytics ──
 -- People who contribute to indexed repos, keyed provider-agnostically so a
@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
 
-CREATE TABLE IF NOT EXISTS review_jobs (
+CREATE TABLE IF NOT EXISTS mira_review_jobs (
     id BIGSERIAL PRIMARY KEY,
     platform TEXT NOT NULL DEFAULT 'github',
     owner TEXT NOT NULL,
@@ -316,7 +316,7 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_review_jobs_claim ON review_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
 
 -- ── Contributor analytics ── (see SQLite schema above for column rationale)
 CREATE TABLE IF NOT EXISTS contributors (
@@ -1350,13 +1350,13 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             self._sqlite_conn.execute(
-                "UPDATE review_jobs SET status='superseded', updated_at=? "
+                "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
                 "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
                 "AND head_sha<>? AND status IN ('pending','running')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur = self._sqlite_conn.execute(
-                "INSERT INTO review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
+                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
                 "pr_title, installation_id, is_private, status, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING",
@@ -1366,13 +1366,13 @@ class AppDatabase:
             return cur.rowcount > 0
         with self._pg_cursor() as cur:
             cur.execute(
-                "UPDATE review_jobs SET status='superseded', updated_at=%s "
+                "UPDATE mira_review_jobs SET status='superseded', updated_at=%s "
                 "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s "
                 "AND head_sha<>%s AND status IN ('pending','running')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur.execute(
-                "INSERT INTO review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
+                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
                 "pr_title, installation_id, is_private, status, created_at, updated_at) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING RETURNING id",
@@ -1389,12 +1389,12 @@ class AppDatabase:
             assert self._sqlite_conn is not None
             row = self._sqlite_conn.execute(
                 "SELECT id, platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, "
-                "is_private, attempts FROM review_jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
+                "is_private, attempts FROM mira_review_jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
             cur = self._sqlite_conn.execute(
-                "UPDATE review_jobs SET status='running', attempts=attempts+1, updated_at=? "
+                "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, updated_at=? "
                 "WHERE id=? AND status='pending'", (now, row[0])
             )
             self._sqlite_conn.commit()
@@ -1403,9 +1403,9 @@ class AppDatabase:
             return ReviewJob(*row[:10], attempts=int(row[10]) + 1)
         with self._pg_cursor() as cur:
             cur.execute(
-                "WITH next_job AS (SELECT id FROM review_jobs WHERE status='pending' "
+                "WITH next_job AS (SELECT id FROM mira_review_jobs WHERE status='pending' "
                 "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
-                "UPDATE review_jobs j SET status='running', attempts=j.attempts+1, updated_at=%s "
+                "UPDATE mira_review_jobs j SET status='running', attempts=j.attempts+1, updated_at=%s "
                 "FROM next_job WHERE j.id=next_job.id "
                 "RETURNING j.id,j.platform,j.owner,j.repo,j.pr_number,j.head_sha,j.pr_url,j.pr_title,"
                 "j.installation_id,j.is_private,j.attempts",
@@ -1422,11 +1422,11 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             row = self._sqlite_conn.execute(
-                "SELECT status FROM review_jobs WHERE id=?", (job_id,)
+                "SELECT status FROM mira_review_jobs WHERE id=?", (job_id,)
             ).fetchone()
         else:
             with self._pg_cursor() as cur:
-                cur.execute("SELECT status FROM review_jobs WHERE id=%s", (job_id,))
+                cur.execute("SELECT status FROM mira_review_jobs WHERE id=%s", (job_id,))
                 row = cur.fetchone()
         return bool(row and row[0] == "running")
 
@@ -1436,7 +1436,7 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             cur = self._sqlite_conn.execute(
-                "UPDATE review_jobs SET status='pending', error='worker restarted', updated_at=? "
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=? "
                 "WHERE status='running'",
                 (now,),
             )
@@ -1444,7 +1444,7 @@ class AppDatabase:
             return cur.rowcount
         with self._pg_cursor() as cur:
             cur.execute(
-                "UPDATE review_jobs SET status='pending', error='worker restarted', updated_at=%s "
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=%s "
                 "WHERE status='running' RETURNING id",
                 (now,),
             )
@@ -1460,14 +1460,14 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             self._sqlite_conn.execute(
-                "UPDATE review_jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
+                "UPDATE mira_review_jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
                 (status, safe_error, now, job_id),
             )
             self._sqlite_conn.commit()
         else:
             with self._pg_cursor() as cur:
                 cur.execute(
-                    "UPDATE review_jobs SET status=%s, error=%s, updated_at=%s "
+                    "UPDATE mira_review_jobs SET status=%s, error=%s, updated_at=%s "
                     "WHERE id=%s AND status='running'", (status, safe_error, now, job_id)
                 )
             self._pg_commit()
