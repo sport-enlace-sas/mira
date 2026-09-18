@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     updated_at REAL NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, next_attempt_at, created_at);
+-- The claim index is created by the migration after adding newer queue
+-- columns.  Keeping it out of this initial schema keeps upgrades from an
+-- older table valid on PostgreSQL.
 
 -- ── Contributor analytics ──
 -- People who contribute to indexed repos, keyed provider-agnostically so a
@@ -324,7 +326,7 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
-CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, next_attempt_at, created_at);
+-- Created after additive queue-column migrations; see _init_postgres.
 
 -- ── Contributor analytics ── (see SQLite schema above for column rationale)
 CREATE TABLE IF NOT EXISTS contributors (
