@@ -36,9 +36,14 @@ def test_transient_failure_returns_job_to_queue_after_backoff(tmp_path, monkeypa
     monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(
-        owner="o", repo="r", pr_number=1, head_sha="c" * 40,
-        pr_url="https://github.com/o/r/pull/1", pr_title="t",
-        installation_id=1, is_private=True,
+        owner="o",
+        repo="r",
+        pr_number=1,
+        head_sha="c" * 40,
+        pr_url="https://github.com/o/r/pull/1",
+        pr_title="t",
+        installation_id=1,
+        is_private=True,
     )
     first = db.claim_next_review_job()
     assert first is not None
@@ -56,9 +61,14 @@ def test_transient_failure_returns_job_to_queue_after_backoff(tmp_path, monkeypa
 def test_startup_recovers_interrupted_job(tmp_path) -> None:
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(
-        owner="o", repo="r", pr_number=1, head_sha="d" * 40,
-        pr_url="https://github.com/o/r/pull/1", pr_title="t",
-        installation_id=1, is_private=True,
+        owner="o",
+        repo="r",
+        pr_number=1,
+        head_sha="d" * 40,
+        pr_url="https://github.com/o/r/pull/1",
+        pr_title="t",
+        installation_id=1,
+        is_private=True,
     )
     assert db.claim_next_review_job() is not None
     assert db.recover_interrupted_review_jobs() == 1
@@ -68,9 +78,13 @@ def test_startup_recovers_interrupted_job(tmp_path) -> None:
 def test_manual_retry_reschedules_failed_job_but_not_superseded_sha(tmp_path) -> None:
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     args = {
-        "owner": "o", "repo": "r", "pr_number": 1,
-        "pr_url": "https://github.com/o/r/pull/1", "pr_title": "t",
-        "installation_id": 1, "is_private": True,
+        "owner": "o",
+        "repo": "r",
+        "pr_number": 1,
+        "pr_url": "https://github.com/o/r/pull/1",
+        "pr_title": "t",
+        "installation_id": 1,
+        "is_private": True,
     }
     assert db.enqueue_review_job(head_sha="f" * 40, **args)
     failed = db.claim_next_review_job()
@@ -89,9 +103,14 @@ def test_manual_retry_reschedules_failed_job_but_not_superseded_sha(tmp_path) ->
 def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(
-        owner="o", repo="r", pr_number=2, head_sha="e" * 40,
-        pr_url="https://github.com/o/r/pull/2", pr_title="provider fixture",
-        installation_id=1, is_private=True,
+        owner="o",
+        repo="r",
+        pr_number=2,
+        head_sha="e" * 40,
+        pr_url="https://github.com/o/r/pull/2",
+        pr_title="provider fixture",
+        installation_id=1,
+        is_private=True,
     )
     job = db.claim_next_review_job()
     assert job is not None
@@ -102,3 +121,33 @@ def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     assert listed.status == "completed"
     assert listed.provider_used == "codex-cli"
     assert listed.fallback_used is True
+
+
+def test_dashboard_job_list_includes_ocr_provenance(tmp_path) -> None:
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    assert db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=3,
+        head_sha="h" * 40,
+        pr_url="https://github.com/o/r/pull/3",
+        pr_title="OCR fixture",
+        installation_id=1,
+        is_private=True,
+    )
+    job = db.claim_next_review_job()
+    assert job is not None
+    db.set_review_job_ocr(
+        job.id,
+        status="degraded",
+        version="open-code-review dev linux/amd64",
+        duration_ms=91,
+        error="invalid_preview",
+    )
+    db.finish_review_job(job.id)
+
+    [listed] = db.list_review_jobs()
+    assert listed.ocr_status == "degraded"
+    assert listed.ocr_version == "open-code-review dev linux/amd64"
+    assert listed.ocr_duration_ms == 91
+    assert listed.ocr_error == "invalid_preview"

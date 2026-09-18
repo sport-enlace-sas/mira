@@ -10,7 +10,16 @@ RUN npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUD
 COPY ui/mira/ ./
 RUN npm run build
 
-# ── Stage 2: backend + bundled UI ─────────────────────────────────
+# ── Stage 2: pinned OpenCodeReview delegation binary ───────────────
+FROM golang:1.25-bookworm AS ocr-builder
+ARG OPEN_CODE_REVIEW_COMMIT=7a571b78d3493b249f6ad14d835c6a79a0a67d2e
+RUN git clone https://github.com/alibaba/open-code-review.git /src/ocr \
+ && cd /src/ocr \
+ && git checkout --detach "$OPEN_CODE_REVIEW_COMMIT" \
+ && test "$(git rev-parse HEAD)" = "$OPEN_CODE_REVIEW_COMMIT" \
+ && CGO_ENABLED=0 go build -trimpath -buildvcs=true -o /out/ocr ./cmd/opencodereview
+
+# ── Stage 3: backend + bundled UI ─────────────────────────────────
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source="https://github.com/miracodeai/mira"
 LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
@@ -18,6 +27,8 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 COPY . /app
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "/app[serve,bedrock]"
 
 # Codex CLI is bundled for the optional codex-cli backend. Keep the version
@@ -31,6 +42,8 @@ RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/loca
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up
 # automatically and serves it at / with SPA fallback.
 COPY --from=ui-builder /ui/dist /app/ui_dist
+COPY --from=ocr-builder /out/ocr /usr/local/bin/ocr
+RUN ocr --version
 
 EXPOSE 8000
 # ENTRYPOINT (not CMD) so `docker run … image --config /app/mira.yaml`

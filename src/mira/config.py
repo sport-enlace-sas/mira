@@ -300,6 +300,15 @@ class ReviewConfig(BaseModel):
     # assurance workflows that must detect regressions outside the latest hunk.
     full_revalidation_on_synchronize: bool = False
 
+    # OpenCodeReview is a deployment-owned deterministic preprocessor.  It is
+    # off by default for upstream-compatible deployments; the corporate
+    # deployment enables it from deploy/inlaze-advisory.yaml only.
+    ocr_delegation: bool = False
+    ocr_command: str = "ocr"
+    ocr_rule_path: str = ""
+    ocr_timeout_seconds: int = Field(default=90, ge=5, le=600)
+    ocr_max_rule_groups: int = Field(default=32, ge=1, le=128)
+
 
 class IndexConfig(BaseModel):
     # Skip indexing any file larger than this (bytes). Generated SDKs, vendored
@@ -367,17 +376,26 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     }
 )
 
+_DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset(
+    {"ocr_delegation", "ocr_command", "ocr_rule_path", "ocr_timeout_seconds", "ocr_max_rule_groups"}
+)
+
 
 def _strip_deployment_only_llm_settings(overlay: dict[str, Any]) -> dict[str, Any]:
     """Remove process-execution settings from an untrusted per-repo overlay."""
     cleaned = dict(overlay)
     llm = cleaned.get("llm")
-    if not isinstance(llm, dict):
-        return cleaned
-    cleaned_llm = dict(llm)
-    for key in _DEPLOYMENT_ONLY_LLM_KEYS:
-        cleaned_llm.pop(key, None)
-    cleaned["llm"] = cleaned_llm
+    if isinstance(llm, dict):
+        cleaned_llm = dict(llm)
+        for key in _DEPLOYMENT_ONLY_LLM_KEYS:
+            cleaned_llm.pop(key, None)
+        cleaned["llm"] = cleaned_llm
+    review = cleaned.get("review")
+    if isinstance(review, dict):
+        cleaned_review = dict(review)
+        for key in _DEPLOYMENT_ONLY_REVIEW_KEYS:
+            cleaned_review.pop(key, None)
+        cleaned["review"] = cleaned_review
     return cleaned
 
 

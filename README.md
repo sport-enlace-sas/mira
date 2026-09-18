@@ -8,6 +8,33 @@
   <strong>Self-hosted AI code review. Your code, your dashboard, your LLM key.</strong>
 </p>
 
+> **Inlaze corporate fork.** This repository combines the self-hosted review
+> platform from [Mira upstream](https://github.com/miracodeai/mira) with the
+> deterministic delegation interface from
+> [Alibaba OpenCodeReview](https://github.com/alibaba/open-code-review).
+> Mira owns the GitHub App, dashboard, durable jobs, policy, publishing and
+> Claude Code → Codex fallback. OpenCodeReview is consumed as a pinned binary
+> that selects reviewable files and path-targeted rules; its source is neither
+> copied nor modified here. See [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## Corporate review chain
+
+```
+OpenCodeReview (deterministic plan) → Claude Code → Codex fallback → Mira → GitHub
+```
+
+For the Inlaze deployment, OCR receives only an ephemeral, detached checkout
+of the base and head SHA. It cannot run repository hooks, submodules, project
+scripts, plugins or MCP servers. Its JSON plan is passed to Mira as context;
+the configured LLM providers remain the only components that reason about
+findings. If OCR is unavailable or returns invalid data, Mira records a
+degraded scope and uses its native planner rather than silently dropping a PR.
+
+The exact OCR revision is tracked in
+[`third_party/open-code-review.lock`](third_party/open-code-review.lock).
+Update Mira or OCR only through a reviewed PR, including the compatibility and
+Docker test suites.
+
 <p align="center">
   <a href="https://docs.miracode.ai"><img src="https://img.shields.io/badge/Docs-docs.miracode.ai-orange?style=flat&logo=readthedocs&logoColor=white" alt="Documentation" /></a>
   <a href="https://discord.gg/uEU6qvYhgm"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Join our Discord" /></a>

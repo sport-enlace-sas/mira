@@ -1,0 +1,24 @@
+{
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/*.min.js",
+    "**/*.map",
+    "**/package-lock.json",
+    "**/pnpm-lock.yaml",
+    "**/yarn.lock"
+  ],
+  "rules": [
+    {
+      "path": "**/*.{ts,tsx,js,jsx}",
+      "merge_system_rule": true,
+      "rule": "Apply Inlaze standards: preserve API contracts, validate authorization boundaries, avoid leaking personal data in logs, and prefer shared packages over duplicated logic."
+    },
+    {
+      "path": "**/*.{sql,prisma}",
+      "merge_system_rule": true,
+      "rule": "Apply Inlaze data standards: migrations must be reversible where practical, preserve data integrity, and avoid unsafe or unbounded transformations."
+    }
+  ]
+}

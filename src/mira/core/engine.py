@@ -722,6 +722,38 @@ class ReviewEngine:
         except Exception:
             pass
 
+        # Corporate deployments may add OpenCodeReview's deterministic file
+        # plan and path-targeted rules before the LLM sees the diff.  OCR is a
+        # best-effort preprocessor: a failure deliberately falls back to the
+        # normal Mira path instead of dropping an advisory review.
+        self._ocr_plan = None
+        if self.config.review.ocr_delegation:
+            try:
+                from mira.ocr_delegation import OpenCodeReviewDelegation
+
+                ocr = OpenCodeReviewDelegation(
+                    self.config.review.ocr_command,
+                    self.config.review.ocr_rule_path,
+                    self.config.review.ocr_timeout_seconds,
+                    self.config.review.ocr_max_rule_groups,
+                )
+                self._ocr_plan = await ocr.prepare(self.provider, pr_info)
+                if self._ocr_plan.status == "used":
+                    selected_paths = set(self._ocr_plan.reviewed_paths)
+                    diff_text = _restrict_diff_to_paths(diff_text, selected_paths)
+                    if self._ocr_plan.rules_context:
+                        team_conventions = "\n\n".join(
+                            part
+                            for part in (team_conventions, self._ocr_plan.rules_context)
+                            if part
+                        )
+                else:
+                    logger.warning(
+                        "OCR delegation degraded for %s: %s", pr_info.url, self._ocr_plan.error
+                    )
+            except Exception:
+                logger.warning("OCR delegation setup failed; using native planner", exc_info=True)
+
         # Cross-PR overlap detection runs alongside the main review — it only
         # needs the diff + GitHub, not the review output. Skipped when the
         # review itself is skipped (empty incremental diff): findings only
@@ -741,6 +773,18 @@ class ReviewEngine:
                 resolved_threads=resolved_thread_dicts or None,
                 team_conventions=team_conventions,
             )
+            if self._ocr_plan is not None:
+                result.audit.append(
+                    {
+                        "ocr_status": self._ocr_plan.status,
+                        "ocr_version": self._ocr_plan.version,
+                        "ocr_duration_ms": self._ocr_plan.duration_ms,
+                        "ocr_error": self._ocr_plan.error,
+                        "ocr_selected_paths": self._ocr_plan.reviewed_paths,
+                        "ocr_excluded_paths": self._ocr_plan.excluded_paths,
+                        "ocr_rule_groups": len(self._ocr_plan.rule_groups),
+                    }
+                )
         except BaseException as exc:
             if overlap_task is not None:
                 overlap_task.cancel()

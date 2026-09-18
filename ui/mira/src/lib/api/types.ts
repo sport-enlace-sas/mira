@@ -28,6 +28,10 @@ export interface ReviewJobModel {
   error: string
   provider_used: string
   fallback_used: boolean
+  ocr_status: string
+  ocr_version: string
+  ocr_duration_ms: number
+  ocr_error: string
   next_attempt_at: number
   created_at: number
   updated_at: number

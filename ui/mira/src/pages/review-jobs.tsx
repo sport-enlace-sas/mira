@@ -79,6 +79,7 @@ export function ReviewJobsPage() {
                   <TableHead>Pull request / SHA</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Provider</TableHead>
+                  <TableHead>OCR</TableHead>
                   <TableHead>Attempts</TableHead>
                   <TableHead />
                   <TableHead>Updated</TableHead>
@@ -98,6 +99,11 @@ export function ReviewJobsPage() {
                     <TableCell className="text-sm">
                       {job.provider_used || "pending"}
                       {job.fallback_used && <span className="ml-1 text-xs text-amber-600">fallback</span>}
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      <span>{job.ocr_status}</span>
+                      {job.ocr_version && <div className="text-muted-foreground">{job.ocr_version}</div>}
+                      {job.ocr_error && <div className="text-destructive">{job.ocr_error}</div>}
                     </TableCell>
                     <TableCell>
                       {job.attempts}

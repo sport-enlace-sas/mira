@@ -261,9 +261,7 @@ class WalkthroughResult:
         parts.append("| Check | Status |")
         parts.append("|---|---|")
         for check, categories in ADVISORY_CHECKS:
-            matches = [
-                c for c in (advisory_comments or []) if c.category.lower() in categories
-            ]
+            matches = [c for c in (advisory_comments or []) if c.category.lower() in categories]
             if any(c.severity == Severity.BLOCKER for c in matches):
                 status = "FAIL"
             elif matches:
@@ -484,6 +482,10 @@ class PRInfo:
     repo: str
     # Round 2+ reviews diff against last_reviewed_sha → head_sha; empty falls back to full diff.
     head_sha: str = ""
+    # Immutable base commit for a PR.  Kept separate from ``base_branch`` so
+    # hardened review helpers can fetch exactly two commits without trusting a
+    # repository-controlled ref.
+    base_sha: str = ""
     # Hosting platform ("github" / "gitlab") — scopes per-PR review progress.
     platform: str = "github"
     # Platform login of the PR author; used to attribute review-quality stats

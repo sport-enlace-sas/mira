@@ -1,0 +1,7 @@
+# OpenCodeReview is compiled into the corporate Mira image as a binary only.
+# Update this file and Dockerfile together through a reviewed corporate PR.
+name = "open-code-review"
+repository = "https://github.com/alibaba/open-code-review"
+commit = "7a571b78d3493b249f6ad14d835c6a79a0a67d2e"
+license = "Apache-2.0"
+mode = "delegate-json"
