@@ -9,6 +9,7 @@ import { packagesApi } from "./api/packages"
 import { relationshipsApi } from "./api/relationships"
 import { reposApi } from "./api/repos"
 import { reviewInsightsApi } from "./api/review-insights"
+import { reviewJobsApi } from "./api/review-jobs"
 import { rulesApi } from "./api/rules"
 import { settingsApi } from "./api/settings"
 import { statsApi } from "./api/stats"
@@ -33,4 +34,5 @@ export const api = {
   ...webhooksApi,
   ...contributorsApi,
   ...reviewInsightsApi,
+  ...reviewJobsApi,
 }

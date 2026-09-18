@@ -214,6 +214,24 @@ class ActivityResponse(BaseModel):
     repos: list[str]
 
 
+class ReviewJobModel(BaseModel):
+    id: int
+    platform: str
+    owner: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    pr_url: str
+    pr_title: str
+    status: str
+    attempts: int
+    error: str
+    provider_used: str
+    fallback_used: bool
+    created_at: float
+    updated_at: float
+
+
 class ReviewCommentModel(BaseModel):
     id: int
     review_id: int

@@ -56,3 +56,21 @@ def test_startup_recovers_interrupted_job(tmp_path) -> None:
     assert db.claim_next_review_job() is not None
     assert db.recover_interrupted_review_jobs() == 1
     assert db.claim_next_review_job() is not None
+
+
+def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    assert db.enqueue_review_job(
+        owner="o", repo="r", pr_number=2, head_sha="e" * 40,
+        pr_url="https://github.com/o/r/pull/2", pr_title="provider fixture",
+        installation_id=1, is_private=True,
+    )
+    job = db.claim_next_review_job()
+    assert job is not None
+    db.set_review_job_execution(job.id, provider_used="codex-cli", fallback_used=True)
+    db.finish_review_job(job.id)
+
+    [listed] = db.list_review_jobs()
+    assert listed.status == "completed"
+    assert listed.provider_used == "codex-cli"
+    assert listed.fallback_used is True

@@ -1,5 +1,6 @@
 import {
   Activity,
+  ClipboardList,
   BookOpen,
   Brain,
   ChevronRight,
@@ -71,6 +72,7 @@ import { UserAvatar } from "@/components/ui/user-avatar"
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/activity", icon: Activity, label: "Activity" },
+  { to: "/advisory-jobs", icon: ClipboardList, label: "Advisory jobs", adminOnly: true },
   { to: "/repos", icon: Database, label: "Repositories" },
   { to: "/contributors", icon: Users2, label: "Reviewers", adminOnly: true },
   { to: "/packages", icon: Package, label: "Packages" },
@@ -91,6 +93,7 @@ const settingsSubItems = [
 
 const PAGE_LABELS: Record<string, string> = {
   activity: "Activity",
+  "advisory-jobs": "Advisory jobs",
   repos: "Repositories",
   contributors: "Reviewers",
   packages: "Packages",

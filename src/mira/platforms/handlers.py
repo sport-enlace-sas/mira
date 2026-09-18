@@ -87,6 +87,7 @@ async def run_pr_review(
     platform: str = "github",
     pr_title: str = "",
     publish_guard: Callable[[], bool] | None = None,
+    job_id: int = 0,
 ) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
@@ -133,6 +134,18 @@ async def run_pr_review(
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
         result = await engine.review_pr(pr_url)
+        if job_id:
+            chains = (llm, indexing_llm, security_llm)
+            fallback_used = any(
+                getattr(candidate, "last_provider", "primary") == "fallback"
+                for candidate in chains
+            )
+            _app_db.set_review_job_execution(
+                job_id,
+                provider_used=(config.llm.fallback_provider if fallback_used else config.llm.provider)
+                or "unknown",
+                fallback_used=fallback_used,
+            )
         review_tracker.complete(repo_full, number)
     except Exception as exc:
         review_tracker.fail(repo_full, number, str(exc))
