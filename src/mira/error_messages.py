@@ -119,6 +119,19 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex CLI returned malformed JSON: {error}: {excerpt}",
         safe="Codex CLI returned malformed JSON",
     ),
+    # Claude Code CLI provider errors
+    "claude_command_not_found": ErrorMessage(
+        full="Claude Code CLI command not found: {command!r}. Install Claude Code or set llm.claude_command.",
+        safe="Claude Code CLI command not found — install Claude Code or set llm.claude_command",
+    ),
+    "claude_timeout": ErrorMessage(
+        full="Claude Code CLI timed out after {seconds}s",
+        safe="Claude Code CLI timed out",
+    ),
+    "claude_exit_failed": ErrorMessage(
+        full="Claude Code CLI failed with exit {exit_code}: {detail}",
+        safe="Claude Code CLI failed",
+    ),
     "codex_no_json_object": ErrorMessage(
         full="Codex CLI response did not contain a JSON object: {excerpt}",
         safe="Codex CLI response did not contain a JSON object",
