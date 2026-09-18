@@ -387,6 +387,24 @@ class TestWalkthroughToMarkdown:
         assert "`financial-integrity` | N/A" in md
         assert "`0123456789ab` · advisory only" in md
 
+    def test_full_revalidation_labels_prior_findings_as_historical(self):
+        md = WalkthroughResult(summary="Revalidated.").to_markdown(
+            head_sha="0123456789abcdef",
+            full_pr_revalidation=True,
+            historical_findings=2,
+        )
+
+        assert "full PR revalidation" in md
+        assert "### Historical findings" in md
+        assert "2 earlier Mira findings are retained as historical context" in md
+
+    def test_walkthrough_identifies_the_fallback_provider(self):
+        md = WalkthroughResult(summary="Revalidated.").to_markdown(
+            provider_used="codex-cli", fallback_used=True
+        )
+
+        assert "Provider: `codex-cli` · fallback activated" in md
+
     def test_summary_rendered(self):
         result = WalkthroughResult(
             summary="Added new features.",

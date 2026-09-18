@@ -181,11 +181,17 @@ async def run_pr_review(
     try:
         pr_info = await provider.get_pr_info(pr_url)
         conclusion = "neutral" if any(sev >= Severity.WARNING for sev in stats) else "success"
+        validation_mode = (
+            "Full PR revalidation completed for this SHA. "
+            if config.review.full_revalidation_on_synchronize
+            else "Incremental review completed for this SHA. "
+        )
         await provider.post_advisory_check(
             pr_info,
             conclusion=conclusion,
             summary=(
                 f"Advisory review for `{pr_info.head_sha[:12]}`. "
+                f"{validation_mode}"
                 f"{len(result.comments)} inline finding(s); "
                 "this check never blocks a merge."
             ),
