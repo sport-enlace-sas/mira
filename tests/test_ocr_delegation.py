@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 from mira.config import _strip_deployment_only_llm_settings
@@ -114,3 +115,13 @@ def test_ocr_output_contract_drops_unsafe_paths_and_unexpected_rule_fields():
     assert plan.rule_groups == [
         {"files": ["src/a.py"], "rule": "Corporate rule", "source": "", "pattern": ""}
     ]
+
+
+def test_checkout_uses_process_local_basic_auth_header() -> None:
+    token = "installation-token"
+    env = OpenCodeReviewDelegation("ocr", "", 5, 1)._env(token)
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {encoded}"
+    assert token not in env["GIT_CONFIG_VALUE_0"]
