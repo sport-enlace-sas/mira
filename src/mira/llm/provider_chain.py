@@ -51,7 +51,11 @@ class ProviderChain:
             return await getattr(self.primary, method)(*args, **kwargs)
         except NonRetriableLLMError:
             raise
-        except Exception:
+        except LLMError:
+            # Providers deliberately raise LLMError only for transient
+            # transport/provider conditions here (timeouts, 429 and 5xx).
+            # Configuration, auth and parsing failures are non-retriable and
+            # must remain visible instead of consuming the fallback account.
             logger.warning("Primary review provider failed transiently; using configured fallback")
             try:
                 self.last_provider = "fallback"

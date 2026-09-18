@@ -47,6 +47,22 @@ class BaseProvider(abc.ABC):
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         """Post a top-level comment on a pull request."""
 
+    async def post_advisory_check(
+        self,
+        pr_info: PRInfo,
+        *,
+        conclusion: str,
+        summary: str,
+        title: str = "Inlaze Advisory Reviewer",
+    ) -> None:
+        """Publish an informational check run when the platform supports it.
+
+        Providers without a check-run primitive intentionally keep this as a
+        no-op.  The check is never a merge gate; branch protection is owned by
+        the repository, not by Mira.
+        """
+        return
+
     @abc.abstractmethod
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         """Find an existing comment containing the marker. Returns comment ID or None."""

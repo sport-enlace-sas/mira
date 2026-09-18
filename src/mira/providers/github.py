@@ -589,6 +589,41 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to post comment: {e}") from e
 
+    async def post_advisory_check(
+        self,
+        pr_info: PRInfo,
+        *,
+        conclusion: str,
+        summary: str,
+        title: str = "Inlaze Advisory Reviewer",
+    ) -> None:
+        """Create the completed, informational GitHub Check Run for a PR SHA."""
+        token = await self._resolve_token()
+        gh = self._make_client(token)
+        # GitHub limits check output fields.  Preserve the beginning, which
+        # contains the scope and outcome, rather than failing a completed PR
+        # review because its summary is unusually verbose.
+        safe_summary = summary[:65_000]
+
+        @_retry_transient
+        def _post_check() -> None:
+            gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            gh_repo.create_check_run(
+                name=title,
+                head_sha=pr_info.head_sha,
+                status="completed",
+                conclusion=conclusion,
+                output={"title": title, "summary": safe_summary},
+            )
+
+        try:
+            await asyncio.to_thread(_post_check)
+        except Exception as exc:
+            # A missing Checks:write permission must not turn an advisory
+            # review into a failed job.  The walkthrough/review remains the
+            # source of feedback while the app permission is corrected.
+            logger.warning("Unable to publish advisory check run: %s", type(exc).__name__)
+
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         token = await self._resolve_token()
         gh = self._make_client(token)
