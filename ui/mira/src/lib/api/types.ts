@@ -14,6 +14,24 @@ export interface RepoListItem {
   last_indexed: string | null
 }
 
+export interface ReviewJobModel {
+  id: number
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  head_sha: string
+  pr_url: string
+  pr_title: string
+  status: "pending" | "running" | "completed" | "failed" | "superseded"
+  attempts: number
+  error: string
+  provider_used: string
+  fallback_used: boolean
+  created_at: number
+  updated_at: number
+}
+
 export interface SymbolModel {
   name: string
   kind: string

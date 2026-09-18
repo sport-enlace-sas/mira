@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
+    provider_used TEXT NOT NULL DEFAULT '',
+    fallback_used INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
@@ -312,6 +314,8 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
+    provider_used TEXT NOT NULL DEFAULT '',
+    fallback_used BOOLEAN NOT NULL DEFAULT FALSE,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
@@ -505,6 +509,27 @@ class ReviewJob:
     attempts: int
 
 
+@dataclass
+class ReviewJobStatus:
+    """Durable queue record exposed to the authenticated dashboard."""
+
+    id: int
+    platform: str
+    owner: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    pr_url: str
+    pr_title: str
+    status: str
+    attempts: int
+    error: str
+    provider_used: str
+    fallback_used: bool
+    created_at: float
+    updated_at: float
+
+
 # Valid contribution kinds and the contribution_days column each one rolls up.
 _CONTRIB_KIND_COLUMNS = {
     "commit": "commits",
@@ -611,6 +636,17 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE pr_reviewers ADD COLUMN bare_approval INTEGER NOT NULL DEFAULT 0"
             )
+        review_job_cols = {
+            r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(mira_review_jobs)").fetchall()
+        }
+        if "provider_used" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN provider_used TEXT NOT NULL DEFAULT ''"
+            )
+        if "fallback_used" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN fallback_used INTEGER NOT NULL DEFAULT 0"
+            )
         # Adding `platform` to the primary key requires a table rebuild (SQLite
         # can't alter a PK in place). Rename the old table, recreate it from the
         # current schema, and copy rows in as 'github'.
@@ -673,6 +709,14 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE pr_reviewers ADD COLUMN IF NOT EXISTS "
                     "bare_approval INTEGER NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "provider_used TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "fallback_used BOOLEAN NOT NULL DEFAULT FALSE"
                 )
                 # Add `platform` to the key on existing DBs. Postgres can swap
                 # the PK in place; guard so it only rebuilds when needed.
@@ -1471,6 +1515,60 @@ class AppDatabase:
                     "WHERE id=%s AND status='running'", (status, safe_error, now, job_id)
                 )
             self._pg_commit()
+
+    def set_review_job_execution(
+        self, job_id: int, *, provider_used: str, fallback_used: bool
+    ) -> None:
+        """Persist provider provenance without storing model credentials or prompts."""
+        # Provider names are a small allow-listed operational label (for
+        # example ``claude-cli`` or ``codex-cli``), never a token or command.
+        safe_provider = provider_used[:80]
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET provider_used=?, fallback_used=?, updated_at=? "
+                "WHERE id=? AND status='running'",
+                (safe_provider, int(fallback_used), time.time(), job_id),
+            )
+            self._sqlite_conn.commit()
+            return
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE mira_review_jobs SET provider_used=%s, fallback_used=%s, updated_at=%s "
+                "WHERE id=%s AND status='running'",
+                (safe_provider, fallback_used, time.time(), job_id),
+            )
+        self._pg_commit()
+
+    def list_review_jobs(self, limit: int = 200) -> list[ReviewJobStatus]:
+        """Newest durable jobs for the authenticated operations dashboard."""
+        bounded_limit = max(1, min(limit, 500))
+        columns = (
+            "id,platform,owner,repo,pr_number,head_sha,pr_url,pr_title,status,attempts,error,"
+            "provider_used,fallback_used,created_at,updated_at"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            rows = self._sqlite_conn.execute(
+                f"SELECT {columns} FROM mira_review_jobs ORDER BY created_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(
+                    f"SELECT {columns} FROM mira_review_jobs ORDER BY created_at DESC LIMIT %s",
+                    (bounded_limit,),
+                )
+                rows = cur.fetchall()
+        return [
+            ReviewJobStatus(
+                id=int(row[0]), platform=row[1], owner=row[2], repo=row[3],
+                pr_number=int(row[4]), head_sha=row[5], pr_url=row[6], pr_title=row[7],
+                status=row[8], attempts=int(row[9]), error=row[10], provider_used=row[11],
+                fallback_used=bool(row[12]), created_at=float(row[13]), updated_at=float(row[14]),
+            )
+            for row in rows
+        ]
 
     # ── Settings ──
 

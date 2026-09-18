@@ -15,6 +15,7 @@ from mira.dashboard.api import (
     CostEstimate,
     IndexStatusModel,
     OrgStatsModel,
+    ReviewJobModel,
     ReviewStatsModel,
     TimeSeriesPoint,
     _open_relationships,
@@ -177,6 +178,12 @@ def list_activity(limit: int = 200, repo: str = "", q: str = "") -> ActivityResp
 
     events.sort(key=lambda ev: ev.created_at, reverse=True)
     return ActivityResponse(events=events[:limit], repos=repo_slugs)
+
+
+@router.get("/api/review-jobs", response_model=list[ReviewJobModel])
+def list_review_jobs(limit: int = 200) -> list[ReviewJobModel]:
+    """Durable advisory queue, including SHA state and provider provenance."""
+    return [ReviewJobModel(**job.__dict__) for job in _api._app_db.list_review_jobs(limit)]
 
 
 @router.get("/api/stats", response_model=OrgStatsModel)
