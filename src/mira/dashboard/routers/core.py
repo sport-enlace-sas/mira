@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from mira.dashboard import api as _api
@@ -184,6 +184,18 @@ def list_activity(limit: int = 200, repo: str = "", q: str = "") -> ActivityResp
 def list_review_jobs(limit: int = 200) -> list[ReviewJobModel]:
     """Durable advisory queue, including SHA state and provider provenance."""
     return [ReviewJobModel(**job.__dict__) for job in _api._app_db.list_review_jobs(limit)]
+
+
+@router.post("/api/review-jobs/{job_id}/retry", response_model=ReviewJobModel)
+def retry_review_job(job_id: int, request: Request) -> ReviewJobModel:
+    """Let an admin promptly retry a current job after a transient outage."""
+    _api._require_admin(request)
+    if not _api._app_db.retry_review_job(job_id):
+        raise HTTPException(status_code=409, detail="Job is not eligible for retry")
+    job = _api._app_db.get_review_job(job_id)
+    if job is None:  # Defensive: a concurrent cleanup should not become a 500.
+        raise HTTPException(status_code=404, detail="Review job not found")
+    return ReviewJobModel(**job.__dict__)
 
 
 @router.get("/api/stats", response_model=OrgStatsModel)

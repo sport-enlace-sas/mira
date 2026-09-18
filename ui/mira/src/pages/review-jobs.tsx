@@ -35,6 +35,17 @@ export function ReviewJobsPage() {
   useDocumentTitle("Advisory jobs")
   const [refreshNonce, setRefreshNonce] = useState(0)
   const { data: jobs, loading, error } = useAsync(() => api.listReviewJobs(), [refreshNonce])
+  const [retrying, setRetrying] = useState<number | null>(null)
+
+  const retry = async (jobId: number) => {
+    setRetrying(jobId)
+    try {
+      await api.retryReviewJob(jobId)
+      setRefreshNonce((n) => n + 1)
+    } finally {
+      setRetrying(null)
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -69,6 +80,7 @@ export function ReviewJobsPage() {
                   <TableHead>Status</TableHead>
                   <TableHead>Provider</TableHead>
                   <TableHead>Attempts</TableHead>
+                  <TableHead />
                   <TableHead>Updated</TableHead>
                 </TableRow>
               </TableHeader>
@@ -91,6 +103,18 @@ export function ReviewJobsPage() {
                       {job.attempts}
                       {job.status === "pending" && job.attempts > 0 && job.next_attempt_at > Date.now() / 1000 && (
                         <div className="mt-1 text-xs text-muted-foreground">retry scheduled</div>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {(job.status === "failed" || job.status === "pending") && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={retrying !== null}
+                          onClick={() => void retry(job.id)}
+                        >
+                          {retrying === job.id ? "Scheduling…" : "Retry"}
+                        </Button>
                       )}
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">{relativeTime(job.updated_at)}</TableCell>

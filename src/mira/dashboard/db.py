@@ -1424,7 +1424,7 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
                 "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
-                "AND head_sha<>? AND status IN ('pending','running')",
+                "AND head_sha<>? AND status IN ('pending','running','failed')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur = self._sqlite_conn.execute(
@@ -1440,7 +1440,7 @@ class AppDatabase:
             cur.execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=%s "
                 "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s "
-                "AND head_sha<>%s AND status IN ('pending','running')",
+                "AND head_sha<>%s AND status IN ('pending','running','failed')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur.execute(
@@ -1569,6 +1569,39 @@ class AppDatabase:
                     "WHERE id=%s AND status='running'", (status, safe_error, now + delay, now, job_id)
                 )
             self._pg_commit()
+
+    def retry_review_job(self, job_id: int) -> bool:
+        """Make a failed/current pending review eligible for immediate retry.
+
+        Superseded SHA jobs are intentionally excluded: a manual action must
+        never resurrect an older commit and publish a stale advisory review.
+        """
+        now = time.time()
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET status='pending', error='', next_attempt_at=?, updated_at=? "
+                "WHERE id=? AND status IN ('failed','pending')",
+                (now, now, job_id),
+            )
+            self._sqlite_conn.commit()
+            return cur.rowcount > 0
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE mira_review_jobs SET status='pending', error='', next_attempt_at=%s, updated_at=%s "
+                "WHERE id=%s AND status IN ('failed','pending') RETURNING id",
+                (now, now, job_id),
+            )
+            retried = cur.fetchone() is not None
+        self._pg_commit()
+        return retried
+
+    def get_review_job(self, job_id: int) -> ReviewJobStatus | None:
+        """Return one queue item for an authenticated operational action."""
+        for job in self.list_review_jobs(limit=500):
+            if job.id == job_id:
+                return job
+        return None
 
     def set_review_job_execution(
         self, job_id: int, *, provider_used: str, fallback_used: bool
