@@ -418,6 +418,7 @@ class ReviewEngine:
         dry_run: bool = False,
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
+        can_publish: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -426,6 +427,7 @@ class ReviewEngine:
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
+        self._can_publish = can_publish or (lambda: True)
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
         # is not the same as `_index_was_empty` (whole-repo: no data at all).
         # Only the latter drives the user-visible "your repo isn't indexed" nudge.
@@ -440,7 +442,7 @@ class ReviewEngine:
         Uses the walkthrough marker so subsequent updates can swap in the
         real walkthrough + review stats in place.
         """
-        if not self.provider:
+        if not self.provider or not self._can_publish():
             return None
         placeholder = f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
         existing_id = await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
@@ -561,7 +563,11 @@ class ReviewEngine:
             # When auto-resolve is off we skip the thread-resolution path
             # entirely — no fetch, no verify, no resolve. Round detection is
             # unaffected; it runs off the separate get_all_bot_threads call below.
-            if not self.bot_name or not self.config.review.auto_resolve_conversations:
+            if (
+                not self.bot_name
+                or not self.config.review.auto_resolve_conversations
+                or not self._can_publish()
+            ):
                 return 0, 0, [], []
             try:
                 assert self.provider is not None
@@ -593,7 +599,7 @@ class ReviewEngine:
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
         async def _on_walkthrough_ready(wt: WalkthroughResult | None) -> None:
-            if self.dry_run or wt is None or placeholder_id is None:
+            if self.dry_run or wt is None or placeholder_id is None or not self._can_publish():
                 return
             try:
                 markdown = wt.to_markdown(
@@ -739,7 +745,7 @@ class ReviewEngine:
             # If the walkthrough already landed, re-render it without the
             # in-progress banner and append the failure notice — preserves
             # walkthrough content while removing the stuck "in progress" state.
-            if placeholder_id is not None:
+            if placeholder_id is not None and self._can_publish():
                 try:
                     wt = _walkthrough_result[0]
                     if wt is not None:
@@ -795,7 +801,7 @@ class ReviewEngine:
                 if result.key_issues:
                     result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
 
-        if result.walkthrough:
+        if result.walkthrough and self._can_publish():
             _clamp_confidence_to_findings(result.walkthrough, result.comments)
             if self.dry_run:
                 logger.info("Dry run: skipping walkthrough comment posting")
@@ -882,7 +888,7 @@ class ReviewEngine:
                         await self.provider.post_comment(pr_info, markdown)
                 except Exception as exc:
                     logger.warning("Failed to post walkthrough comment: %s", exc)
-        elif placeholder_id is not None:
+        elif placeholder_id is not None and self._can_publish():
             # No walkthrough (all files excluded, empty diff, or generation
             # failed) — finalize the placeholder so it doesn't sit on
             # "Reviewing this PR…" forever.
@@ -897,6 +903,7 @@ class ReviewEngine:
             self.config.review.pr_summary != "disable"
             and not self.dry_run
             and result.pr_summary_block
+            and self._can_publish()
         ):
             try:
                 block = (
@@ -926,7 +933,7 @@ class ReviewEngine:
                     len(result.comments),
                     pr_info.url,
                 )
-            else:
+            elif self._can_publish():
                 posted_comment_ids = (
                     await self.provider.post_review(pr_info, result, bot_name=self.bot_name) or []
                 )

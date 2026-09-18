@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,7 @@ async def run_pr_review(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
+    publish_guard: Callable[[], bool] | None = None,
 ) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
@@ -113,6 +115,7 @@ async def run_pr_review(
         bot_name=bot_name,
         indexing_llm=indexing_llm,
         security_llm=security_llm,
+        can_publish=publish_guard,
     )
 
     from mira.dashboard.api import _app_db
@@ -154,7 +157,28 @@ async def run_pr_review(
         dispatch_event,
     )
 
+    # A synchronize event may have superseded this SHA while its LLM calls
+    # were running.  The engine guards every GitHub mutation, and this final
+    # guard keeps the Check Run and outbound events equally SHA-correct.
+    if publish_guard is not None and not publish_guard():
+        logger.info("Review became stale before publication: %s", pr_url)
+        return True
+
     stats = build_review_stats(result.comments)
+    try:
+        pr_info = await provider.get_pr_info(pr_url)
+        conclusion = "neutral" if any(sev >= Severity.WARNING for sev in stats) else "success"
+        await provider.post_advisory_check(
+            pr_info,
+            conclusion=conclusion,
+            summary=(
+                f"Advisory review for `{pr_info.head_sha[:12]}`. "
+                f"{len(result.comments)} inline finding(s); "
+                "this check never blocks a merge."
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Unable to prepare advisory Check Run: %s", type(exc).__name__)
     event_data = {
         "repo": repo_full,
         "pr_url": pr_url,

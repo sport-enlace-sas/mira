@@ -55,5 +55,15 @@ class ClaudeCLIProvider(CodexCLIProvider):
                 lowered = detail.lower()
                 if any(text in lowered for text in ("unauthorized", "forbidden", "invalid token", "authentication")):
                     raise NonRetriableLLMError("codex_exit_failed", exit_code=proc.returncode, detail="authentication failed")
-                raise LLMError("codex_exit_failed", exit_code=proc.returncode, detail=detail[-2000:])
+                # Only known service-side/transient conditions may cross the
+                # Claude → Codex boundary.  Bad flags, unsupported models and
+                # other client failures stay operationally visible.
+                if any(text in lowered for text in (
+                    "429", "rate limit", "timeout", "timed out", "temporarily",
+                    "server error", "internal server", " 500", " 502", " 503", " 504",
+                )):
+                    raise LLMError("codex_exit_failed", exit_code=proc.returncode, detail=detail[-2000:])
+                raise NonRetriableLLMError(
+                    "codex_exit_failed", exit_code=proc.returncode, detail="non-transient Claude CLI failure"
+                )
             return stdout.decode("utf-8", errors="replace").strip()

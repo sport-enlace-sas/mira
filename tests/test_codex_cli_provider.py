@@ -290,3 +290,16 @@ class TestClaudeAndFallbackProvider:
         with pytest.raises(NonRetriableLLMError):
             await chain.complete([{"role": "user", "content": "review"}])
         fallback.complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_configuration_error_does_not_use_codex(self):
+        primary = MagicMock()
+        fallback = MagicMock()
+        primary.usage = fallback.usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        primary.complete = AsyncMock(side_effect=ValueError("invalid Claude command"))
+        fallback.complete = AsyncMock()
+        chain = ProviderChain(primary, fallback)
+
+        with pytest.raises(ValueError, match="invalid Claude command"):
+            await chain.complete([{"role": "user", "content": "review"}])
+        fallback.complete.assert_not_awaited()

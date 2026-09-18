@@ -59,6 +59,7 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
             reviewed = await run_pr_review(
                 provider, job.owner, job.repo, job.pr_number, job.pr_url,
                 bool(job.is_private), bot_name, platform=job.platform, pr_title=job.pr_title,
+                publish_guard=lambda job_id=job.id: _app_db.is_review_job_current(job_id),
             )
             if not reviewed:
                 # Another SHA may still be completing. Return this job to the

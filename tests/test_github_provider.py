@@ -62,6 +62,27 @@ class TestGitHubProvider:
         with pytest.raises(ProviderError, match="token is required"):
             GitHubProvider(token="")
 
+    @pytest.mark.asyncio
+    async def test_posts_completed_advisory_check_run(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+        provider._token_supplier = _async_constant("test-token")
+        repo = MagicMock()
+        provider._make_client = MagicMock(return_value=MagicMock(get_repo=MagicMock(return_value=repo)))
+        info = _make_pr_info()
+        info.head_sha = "abc123"
+
+        await provider.post_advisory_check(
+            info, conclusion="neutral", summary="advisory review completed"
+        )
+
+        repo.create_check_run.assert_called_once_with(
+            name="Inlaze Advisory Reviewer",
+            head_sha="abc123",
+            status="completed",
+            conclusion="neutral",
+            output={"title": "Inlaze Advisory Reviewer", "summary": "advisory review completed"},
+        )
+
 
 def _make_pr_info() -> PRInfo:
     return PRInfo(
