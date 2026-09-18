@@ -12,6 +12,15 @@ llm:
   temperature: 0.2
   max_tokens: 4096
 
+  # Corporate advisory chain. Claude is primary; Codex CLI is used only after
+  # a transient Claude failure. Deployment-only provider settings are ignored
+  # in repository-local .mira.yaml files.
+  # provider: "claude-cli"
+  # model: "claude-sonnet-5"
+  # fallback_provider: "codex-cli"
+  # fallback_model: "codex-default"
+  # codex_sandbox: "read-only"
+
   # ── AWS Bedrock configuration (uncomment to use) ──
   # provider: "bedrock"
   # model: "us.anthropic.claude-sonnet-4-6-v1:0"

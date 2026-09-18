@@ -57,10 +57,12 @@ def _make_pr_payload(
             "number": number,
             "body": body,
             "labels": labels if labels is not None else [],
+            "head": {"repo": {"full_name": "testowner/testrepo", "fork": False}},
         },
         "repository": {
             "owner": {"login": "testowner"},
             "name": "testrepo",
+            "full_name": "testowner/testrepo",
         },
     }
 
@@ -190,6 +192,25 @@ async def test_pr_closed_ignored(client: AsyncClient) -> None:
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
+
+
+@patch("mira.platforms.github.webhook.handle_pull_request", new_callable=AsyncMock)
+async def test_pr_from_fork_is_skipped(mock_handler: AsyncMock, client: AsyncClient) -> None:
+    payload = _make_pr_payload()
+    payload["pull_request"]["head"] = {"repo": {"full_name": "external/fork", "fork": True}}
+    payload_bytes = json.dumps(payload).encode()
+    response = await client.post(
+        "/webhook",
+        content=payload_bytes,
+        headers={
+            "X-Hub-Signature-256": _sign(payload_bytes),
+            "X-GitHub-Event": "pull_request",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    mock_handler.assert_not_awaited()
 
 
 @patch("mira.platforms.github.webhook.handle_comment", new_callable=AsyncMock)

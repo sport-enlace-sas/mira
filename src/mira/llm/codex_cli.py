@@ -22,7 +22,7 @@ from pathlib import Path
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,18 @@ class CodexCLIProvider:
         """Create writable ephemeral Codex state containing only OAuth auth."""
         destination = Path(invocation_root) / "codex-home"
         destination.mkdir(parents=True, mode=0o700)
+        auth_json = os.environ.get("MIRA_CODEX_AUTH_JSON", "")
+        if auth_json:
+            try:
+                parsed = json.loads(auth_json)
+            except json.JSONDecodeError as exc:
+                raise NonRetriableLLMError("codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON") from exc
+            if not isinstance(parsed, dict):
+                raise NonRetriableLLMError("codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON")
+            destination_auth = destination / "auth.json"
+            destination_auth.write_text(json.dumps(parsed), encoding="utf-8")
+            destination_auth.chmod(0o600)
+            return str(destination)
         source_home = self.config.codex_home or os.environ.get("CODEX_HOME")
         if source_home:
             source_auth = Path(source_home).expanduser() / "auth.json"

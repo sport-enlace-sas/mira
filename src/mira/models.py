@@ -9,6 +9,19 @@ WALKTHROUGH_MARKER = "<!-- mira-walkthrough -->"
 PR_SUMMARY_START = "<!-- mira-pr-summary-start -->"
 PR_SUMMARY_END = "<!-- mira-pr-summary-end -->"
 
+# Corporate advisory rubric.  A check is N/A unless the review had evidence
+# in that area; this avoids presenting an unreviewed area as a passing gate.
+ADVISORY_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("security-access", ("security", "auth", "authorization")),
+    ("secrets-config", ("configuration", "secrets")),
+    ("logs-privacy", ("privacy", "logging")),
+    ("migrations-data", ("migration", "data")),
+    ("financial-integrity", ("financial", "payment")),
+    ("reuse-overlap", ("maintainability", "dependency")),
+    ("repo-standards", ("style", "clarity")),
+    ("correctness-contracts", ("bug", "error-handling", "race-condition")),
+)
+
 
 class FileChangeType(enum.Enum):
     ADDED = "added"
@@ -214,10 +227,35 @@ class WalkthroughResult:
         dashboard_url: str = "",
         overlaps: list[OverlapFinding] | None = None,
         failure_notice: str | None = None,
+        advisory_comments: list[ReviewComment] | None = None,
+        head_sha: str = "",
     ) -> str:
         """Render as a markdown PR comment."""
         parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
         parts.append(self.summary)
+
+        # One durable summary comment carries the same evidence-first rubric
+        # for every review, while actual findings remain native inline GitHub
+        # review comments. This is advisory text only, never a merge gate.
+        parts.append("")
+        parts.append("### Inlaze Advisory Checks")
+        parts.append("")
+        if head_sha:
+            parts.append(f"Scope: `{head_sha[:12]}` · advisory only")
+            parts.append("")
+        parts.append("| Check | Status |")
+        parts.append("|---|---|")
+        for check, categories in ADVISORY_CHECKS:
+            matches = [
+                c for c in (advisory_comments or []) if c.category.lower() in categories
+            ]
+            if any(c.severity == Severity.BLOCKER for c in matches):
+                status = "FAIL"
+            elif matches:
+                status = "WARN"
+            else:
+                status = "N/A"
+            parts.append(f"| `{check}` | {status} |")
 
         if self.sequence_diagram:
             # Hardening at render time — the single choke point every

@@ -374,6 +374,19 @@ class TestConvertToWalkthroughResult:
 
 
 class TestWalkthroughToMarkdown:
+    def test_corporate_advisory_check_matrix_is_evidence_based(self):
+        comment = ReviewComment(
+            path="src/auth.py", line=10, end_line=None, severity=Severity.BLOCKER,
+            category="security", title="Missing authorization", body="Evidence.", confidence=0.9,
+        )
+        md = WalkthroughResult(summary="Changed auth.").to_markdown(
+            advisory_comments=[comment], head_sha="0123456789abcdef"
+        )
+        assert "### Inlaze Advisory Checks" in md
+        assert "`security-access` | FAIL" in md
+        assert "`financial-integrity` | N/A" in md
+        assert "`0123456789ab` · advisory only" in md
+
     def test_summary_rendered(self):
         result = WalkthroughResult(
             summary="Added new features.",

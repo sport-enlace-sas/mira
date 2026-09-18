@@ -868,6 +868,8 @@ class ReviewEngine:
                         index_was_empty=getattr(self, "_index_was_empty", False),
                         dashboard_url=_os.environ.get("MIRA_DASHBOARD_URL", ""),
                         overlaps=overlaps or None,
+                        advisory_comments=result.comments,
+                        head_sha=pr_info.head_sha,
                     )
                     comment_id = placeholder_id
                     if comment_id is None:

@@ -107,6 +107,29 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
 
+-- Durable native review queue. A newer SHA supersedes any pending/running
+-- review for the same PR, so webhook retries and fast pushes cannot publish a
+-- stale review after a container restart.
+CREATE TABLE IF NOT EXISTS mira_review_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    pr_title TEXT NOT NULL DEFAULT '',
+    installation_id INTEGER NOT NULL DEFAULT 0,
+    is_private INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    UNIQUE (platform, owner, repo, pr_number, head_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
+
 -- ── Contributor analytics ──
 -- People who contribute to indexed repos, keyed provider-agnostically so a
 -- future non-GitHub provider slots in without a schema change.
@@ -274,6 +297,26 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
+
+CREATE TABLE IF NOT EXISTS mira_review_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    pr_title TEXT NOT NULL DEFAULT '',
+    installation_id INTEGER NOT NULL DEFAULT 0,
+    is_private BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (platform, owner, repo, pr_number, head_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_mira_review_jobs_claim ON mira_review_jobs(status, created_at);
 
 -- ── Contributor analytics ── (see SQLite schema above for column rationale)
 CREATE TABLE IF NOT EXISTS contributors (
@@ -445,6 +488,21 @@ class ContributionDay:
     prs_merged: int = 0
     reviews: int = 0
     total: int = 0
+
+
+@dataclass
+class ReviewJob:
+    id: int
+    platform: str
+    owner: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    pr_url: str
+    pr_title: str
+    installation_id: int
+    is_private: bool
+    attempts: int
 
 
 # Valid contribution kinds and the contribution_days column each one rolls up.
@@ -1265,6 +1323,153 @@ class AppDatabase:
                 )
             # Explicit commit mirrors set_last_reviewed_sha — the connection is
             # autocommit today, but this keeps the write safe if that changes.
+            self._pg_commit()
+
+    # ── Durable PR review queue ──
+
+    def enqueue_review_job(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        pr_url: str,
+        pr_title: str,
+        installation_id: int,
+        is_private: bool,
+        platform: str = "github",
+    ) -> bool:
+        """Queue one SHA and supersede older work for the same PR.
+
+        The uniqueness constraint makes a repeated GitHub delivery a no-op.
+        A new SHA never overwrites completed history; it only invalidates work
+        that has not yet produced a result.
+        """
+        now = time.time()
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
+                "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
+                "AND head_sha<>? AND status IN ('pending','running')",
+                (now, platform, owner, repo, pr_number, head_sha),
+            )
+            cur = self._sqlite_conn.execute(
+                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
+                "pr_title, installation_id, is_private, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) "
+                "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING",
+                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, int(is_private), now, now),
+            )
+            self._sqlite_conn.commit()
+            return cur.rowcount > 0
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE mira_review_jobs SET status='superseded', updated_at=%s "
+                "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s "
+                "AND head_sha<>%s AND status IN ('pending','running')",
+                (now, platform, owner, repo, pr_number, head_sha),
+            )
+            cur.execute(
+                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
+                "pr_title, installation_id, is_private, status, created_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) "
+                "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING RETURNING id",
+                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, is_private, now, now),
+            )
+            inserted = cur.fetchone() is not None
+        self._pg_commit()
+        return inserted
+
+    def claim_next_review_job(self) -> ReviewJob | None:
+        """Atomically claim the oldest pending job; safe with multiple replicas."""
+        now = time.time()
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(
+                "SELECT id, platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, "
+                "is_private, attempts FROM mira_review_jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            cur = self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, updated_at=? "
+                "WHERE id=? AND status='pending'", (now, row[0])
+            )
+            self._sqlite_conn.commit()
+            if cur.rowcount == 0:
+                return None
+            return ReviewJob(*row[:10], attempts=int(row[10]) + 1)
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "WITH next_job AS (SELECT id FROM mira_review_jobs WHERE status='pending' "
+                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
+                "UPDATE mira_review_jobs j SET status='running', attempts=j.attempts+1, updated_at=%s "
+                "FROM next_job WHERE j.id=next_job.id "
+                "RETURNING j.id,j.platform,j.owner,j.repo,j.pr_number,j.head_sha,j.pr_url,j.pr_title,"
+                "j.installation_id,j.is_private,j.attempts",
+                (now,),
+            )
+            row = cur.fetchone()
+        self._pg_commit()
+        if row is None:
+            return None
+        return ReviewJob(*row)
+
+    def is_review_job_current(self, job_id: int) -> bool:
+        """Return whether a claimed job has not been superseded by a new SHA."""
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(
+                "SELECT status FROM mira_review_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute("SELECT status FROM mira_review_jobs WHERE id=%s", (job_id,))
+                row = cur.fetchone()
+        return bool(row and row[0] == "running")
+
+    def recover_interrupted_review_jobs(self) -> int:
+        """Requeue work left running by a service restart or deploy."""
+        now = time.time()
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=? "
+                "WHERE status='running'",
+                (now,),
+            )
+            self._sqlite_conn.commit()
+            return cur.rowcount
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE mira_review_jobs SET status='pending', error='worker restarted', updated_at=%s "
+                "WHERE status='running' RETURNING id",
+                (now,),
+            )
+            count = len(cur.fetchall())
+        self._pg_commit()
+        return count
+
+    def finish_review_job(self, job_id: int, *, error: str = "", retry: bool = False) -> None:
+        """Complete a job, or return a transient failure to the durable queue."""
+        now = time.time()
+        status = "pending" if retry else ("failed" if error else "completed")
+        safe_error = error[:1000]
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
+                (status, safe_error, now, job_id),
+            )
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(
+                    "UPDATE mira_review_jobs SET status=%s, error=%s, updated_at=%s "
+                    "WHERE id=%s AND status='running'", (status, safe_error, now, job_id)
+                )
             self._pg_commit()
 
     # ── Settings ──

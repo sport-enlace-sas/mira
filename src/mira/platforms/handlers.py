@@ -85,7 +85,7 @@ async def run_pr_review(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
-) -> None:
+) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
     Shared by the GitHub and GitLab webhook handlers — everything here goes
@@ -98,7 +98,7 @@ async def run_pr_review(
     # two concurrent webhooks arrive. Returns False if already reviewing.
     if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
         logger.info("Review already in progress for %s, skipping", pr_url)
-        return
+        return False
 
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
@@ -133,6 +133,12 @@ async def run_pr_review(
         review_tracker.complete(repo_full, number)
     except Exception as exc:
         review_tracker.fail(repo_full, number, str(exc))
+        from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event
+
+        await dispatch_event(
+            REVIEW_FAILED,
+            {"repo": repo_full, "pr_url": pr_url, "error": type(exc).__name__},
+        )
         raise
 
     # The walkthrough comment already carries the "more accurate after indexing"
@@ -160,6 +166,7 @@ async def run_pr_review(
     await dispatch_event(REVIEW_COMPLETED, event_data)
     if any(sev >= Severity.WARNING for sev in stats):
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
+    return True
 
 
 async def run_pr_command(

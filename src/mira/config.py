@@ -57,6 +57,12 @@ class LLMConfig(BaseModel):
     # Provider selection. "openai" uses any OpenAI-compatible endpoint (default).
     # "bedrock" uses AWS Bedrock Converse API directly (requires boto3).
     provider: str = "openai"
+    # Optional provider used after the primary provider has exhausted its
+    # transient retries.  This is deliberately separate from fallback_model:
+    # the latter stays a same-provider model fallback for backwards
+    # compatibility, while fallback_provider enables a safe Claude -> Codex
+    # failover deployment.
+    fallback_provider: str | None = None
     # Protocol dialect for the OpenAI-compatible endpoint: "chat"
     # (Chat Completions, default) or "responses" (OpenAI Responses API).
     # Only meaningful when `provider` is "openai" — bedrock ignores it
@@ -84,6 +90,10 @@ class LLMConfig(BaseModel):
     codex_home: str | None = None
     codex_sandbox: Literal["read-only"] = "read-only"
     codex_timeout_seconds: int = Field(default=900, gt=0)
+    # Claude Code CLI is run in a clean temporary home.  It receives its OAuth
+    # token only in the child environment and is never given repository files.
+    claude_command: str = "claude"
+    claude_timeout_seconds: int = Field(default=900, gt=0)
 
     @field_validator("base_url")
     @classmethod
@@ -341,10 +351,13 @@ _global_defaults: dict[str, Any] = {}
 _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     {
         "provider",
+        "fallback_provider",
         "codex_command",
         "codex_home",
         "codex_sandbox",
         "codex_timeout_seconds",
+        "claude_command",
+        "claude_timeout_seconds",
     }
 )
 

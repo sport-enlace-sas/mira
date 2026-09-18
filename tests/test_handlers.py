@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +23,7 @@ def _make_pr_payload() -> dict[str, Any]:
     return {
         "installation": {"id": 1},
         "action": "opened",
-        "pull_request": {"number": 42},
+        "pull_request": {"number": 42, "title": "Test PR", "head": {"sha": "a" * 40}},
         "repository": {
             "owner": {"login": "testowner"},
             "name": "testrepo",
@@ -68,30 +69,15 @@ def mock_pr_info() -> PRInfo:
     )
 
 
-@patch("mira.platforms.handlers.ReviewEngine")
-@patch("mira.platforms.github.webhook.create_provider")
-@patch("mira.platforms.handlers.create_llm")
-@patch("mira.platforms.handlers.load_config")
 async def test_handle_pr_event(
-    mock_config: MagicMock,
-    mock_llm_cls: MagicMock,
-    mock_provider_cls: MagicMock,
-    mock_engine_cls: MagicMock,
     mock_app_auth: AsyncMock,
 ) -> None:
-    """PR event creates engine and calls review_pr."""
-    mock_config.return_value = MagicMock()
-    mock_engine = AsyncMock()
-    mock_engine.review_pr = AsyncMock(return_value=ReviewResult(summary="ok"))
-    mock_engine_cls.return_value = mock_engine
-
-    await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
-
-    mock_provider_cls.assert_called_once()
-    name, supplier = mock_provider_cls.call_args[0]
-    assert name == "github"
-    assert await supplier() == "ghs_test_token"
-    mock_engine.review_pr.assert_awaited_once_with("https://github.com/testowner/testrepo/pull/42")
+    """PR delivery writes a durable SHA-scoped job; the worker owns execution."""
+    with patch("mira.platforms.github.webhook._get_app_db") as get_db:
+        get_db.return_value.enqueue_review_job.return_value = True
+        await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
+    get_db.return_value.enqueue_review_job.assert_called_once()
+    assert get_db.return_value.enqueue_review_job.call_args.kwargs["head_sha"] == "a" * 40
 
 
 # ── Outbound webhook dispatch wiring ─────────────────────────────────────────
@@ -125,7 +111,13 @@ async def _run_pr_handler(result: ReviewResult | Exception, mock_engine_cls, moc
         patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock) as mock_dispatch,
     ):
         mock_db.get_repo.return_value = MagicMock(status="ready")  # indexed → skip note
-        await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
+        from mira.platforms.handlers import run_pr_review
+
+        with suppress(Exception):
+            await run_pr_review(
+                MagicMock(), "testowner", "testrepo", 42,
+                "https://github.com/testowner/testrepo/pull/42", True, "mira-bot",
+            )
     return mock_dispatch
 
 
@@ -215,7 +207,7 @@ async def test_failed_review_fires_review_failed(
 
     data = _data_for(mock_dispatch, "review.failed")
     assert data["repo"] == "testowner/testrepo"
-    assert "boom" in data["error"]
+    assert data["error"] == "RuntimeError"
 
 
 @patch("mira.platforms.handlers.ReviewEngine")
@@ -339,16 +331,12 @@ async def test_handle_comment_formats_reply_with_attribution(
     assert "O(n^2)" in posted_body
 
 
-@patch(
-    "mira.platforms.github.webhook.run_pr_review", new=AsyncMock(side_effect=RuntimeError("boom"))
-)
-@patch("mira.platforms.github.webhook.create_provider", return_value=MagicMock())
 async def test_handler_exception_logged_not_raised(
     mock_app_auth: AsyncMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Exceptions in handlers are logged, not propagated."""
-    with caplog.at_level(logging.ERROR):
-        # Should not raise
+    with caplog.at_level(logging.ERROR), patch("mira.platforms.github.webhook._get_app_db") as get_db:
+        get_db.return_value.enqueue_review_job.side_effect = RuntimeError("boom")
         await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
 
     assert "boom" in caplog.text

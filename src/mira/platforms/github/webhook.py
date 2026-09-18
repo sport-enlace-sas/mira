@@ -29,7 +29,6 @@ from mira.platforms.handlers import (
     _open_store,
     run_pr_command,
     run_pr_merged_learning,
-    run_pr_review,
     run_thread_reply,
 )
 from mira.platforms.index_handlers import _get_app_db, run_incremental_index
@@ -480,6 +479,16 @@ async def dispatch_github_event(
             logger.debug("Ignoring pull_request event from self (%s)", sender)
             return "ignored"
 
+        # External forks must never receive a review from the corporate
+        # installation: their diff is untrusted and the App's installation
+        # token is scoped to the base repository, not the contributor fork.
+        head_repo = payload.get("pull_request", {}).get("head", {}).get("repo") or {}
+        base_full_name = payload.get("repository", {}).get("full_name", "")
+        head_full_name = head_repo.get("full_name", "")
+        if head_repo.get("fork") or (head_full_name and base_full_name and head_full_name != base_full_name):
+            logger.info("PR from fork skipped for %s", base_full_name or "unknown repository")
+            return "ignored"
+
         # Opt out of per-push reviews: only open/reopen auto-review, later
         # commits wait for an explicit `@bot review` comment.
         if action == "synchronize" and not cfg.review.review_on_synchronize:
@@ -586,46 +595,32 @@ async def handle_pull_request(
     app_auth: GitHubAppAuth,
     bot_name: str,
 ) -> None:
-    """Handle a pull_request event by running a full review."""
-    installation_id: int = payload.get("installation", {}).get("id", 0)
-    pr_url = ""
-    repo_full = ""
+    """Persist a PR review request for the native in-process worker."""
     try:
         pr = payload["pull_request"]
         owner = payload["repository"]["owner"]["login"]
         repo = payload["repository"]["name"]
         number = pr["number"]
-        pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
-        repo_full = f"{owner}/{repo}"
-
-        provider = create_provider(
-            "github", partial(app_auth.get_installation_token, installation_id)
-        )
-        is_private = bool(payload["repository"].get("private", False))
-
-        # Record the authoring contribution before review so it lands even if
-        # the review itself fails. Idempotent on every synchronize re-fire.
+        head_sha = (pr.get("head") or {}).get("sha") or ""
+        if not head_sha:
+            logger.warning("PR %s/%s#%s has no head SHA; not queued", owner, repo, number)
+            return
+        # Record contribution before review so it lands even if the worker
+        # later retries; this path is separately idempotent.
         _record_pr_contribution(payload, "pr_opened")
-
-        await run_pr_review(
-            provider,
-            owner,
-            repo,
-            number,
-            pr_url,
-            is_private,
-            bot_name,
+        queued = _get_app_db().enqueue_review_job(
+            owner=owner,
+            repo=repo,
+            pr_number=number,
+            head_sha=head_sha,
+            pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
             pr_title=pr.get("title", ""),
+            installation_id=int(payload.get("installation", {}).get("id", 0)),
+            is_private=bool(payload["repository"].get("private", False)),
         )
+        logger.info("PR %s/%s#%s %s", owner, repo, number, "queued" if queued else "already queued")
     except Exception as exc:
-        logger.exception("Error handling pull_request event")
-        if pr_url:
-            from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event
-
-            await dispatch_event(
-                REVIEW_FAILED,
-                {"repo": repo_full, "pr_url": pr_url, "error": str(exc)},
-            )
+        logger.exception("Error queueing pull_request event: %s", exc)
 
 
 async def handle_comment(
