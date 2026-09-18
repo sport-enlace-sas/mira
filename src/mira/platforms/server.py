@@ -14,6 +14,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,47 @@ from mira.platforms.github.webhook import (
 logger = logging.getLogger(__name__)
 
 _SAFE_BOT_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
+    """Run the durable review queue inside Mira's single service process."""
+    from mira.dashboard.api import _app_db
+    from mira.exceptions import NonRetriableLLMError
+    from mira.platforms.handlers import run_pr_review
+    from mira.providers import create_provider
+
+    recovered = _app_db.recover_interrupted_review_jobs()
+    if recovered:
+        logger.info("Requeued %s interrupted review job(s)", recovered)
+    while True:
+        job = _app_db.claim_next_review_job()
+        if job is None:
+            await asyncio.sleep(1)
+            continue
+        if not _app_db.is_review_job_current(job.id):
+            # A synchronize event superseded it after it was claimed.
+            continue
+        try:
+            provider = create_provider(
+                "github", partial(app_auth.get_installation_token, job.installation_id)
+            )
+            reviewed = await run_pr_review(
+                provider, job.owner, job.repo, job.pr_number, job.pr_url,
+                bool(job.is_private), bot_name, platform=job.platform, pr_title=job.pr_title,
+            )
+            if not reviewed:
+                # Another SHA may still be completing. Return this job to the
+                # queue so the latest revision is not silently dropped.
+                _app_db.finish_review_job(job.id, error="review already running", retry=job.attempts < 3)
+                continue
+        except NonRetriableLLMError as exc:
+            _app_db.finish_review_job(job.id, error=exc.safe_message)
+            logger.warning("Review job %s failed without retry: %s", job.id, exc.safe_message)
+        except Exception as exc:  # transient host/provider failure; bounded retry
+            _app_db.finish_review_job(job.id, error=type(exc).__name__, retry=job.attempts < 3)
+            logger.warning("Review job %s failed (attempt %s): %s", job.id, job.attempts, type(exc).__name__)
+        else:
+            _app_db.finish_review_job(job.id)
 
 
 def _json_status(status: str) -> Response:
@@ -70,6 +112,12 @@ def create_app(
                     logger.warning("Backfill failed: %s", t.exception()) if t.exception() else None
                 )
             )
+
+        review_worker_task = (
+            asyncio.create_task(_run_review_worker(app_auth, bot_name))
+            if app_auth is not None
+            else None
+        )
 
         # GitLab's equivalent: discover the projects the token can access and
         # register them so they're in the dashboard ready to index up front.
@@ -113,6 +161,8 @@ def create_app(
         yield
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
+        if review_worker_task is not None and not review_worker_task.done():
+            review_worker_task.cancel()
         if forgejo_auth is not None and not fj_task.done():
             fj_task.cancel()
         if not vuln_task.done():
