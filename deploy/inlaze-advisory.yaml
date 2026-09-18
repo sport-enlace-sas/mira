@@ -38,6 +38,13 @@ review:
   # reported as explicitly skipped.
   max_diff_size: 1000000
   max_chunks_per_review: 20
+  # Deterministic OpenCodeReview planning is deployment-owned. PR-local
+  # configuration cannot enable it, change its executable or lift its limits.
+  ocr_delegation: true
+  ocr_command: /usr/local/bin/ocr
+  ocr_rule_path: /app/policies/open-code-review/rule.json
+  ocr_timeout_seconds: 90
+  ocr_max_rule_groups: 32
   include_summary: true
   walkthrough: true
   walkthrough_sequence_diagram: true

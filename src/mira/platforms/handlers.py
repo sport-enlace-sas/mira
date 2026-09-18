@@ -134,6 +134,12 @@ async def run_pr_review(
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
         result = await engine.review_pr(pr_url)
+        ocr_plan = getattr(engine, "_ocr_plan", None)
+        if job_id and ocr_plan is not None:
+            _app_db.set_review_job_ocr(
+                job_id, status=ocr_plan.status, version=ocr_plan.version,
+                duration_ms=ocr_plan.duration_ms, error=ocr_plan.error,
+            )
         if job_id:
             chains = (llm, indexing_llm, security_llm)
             fallback_used = any(

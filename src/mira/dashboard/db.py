@@ -126,6 +126,10 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     error TEXT NOT NULL DEFAULT '',
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used INTEGER NOT NULL DEFAULT 0,
+    ocr_status TEXT NOT NULL DEFAULT 'disabled',
+    ocr_version TEXT NOT NULL DEFAULT '',
+    ocr_duration_ms INTEGER NOT NULL DEFAULT 0,
+    ocr_error TEXT NOT NULL DEFAULT '',
     -- A transient error is deliberately not re-claimed immediately. This
     -- keeps an unavailable provider from turning one webhook into a hot loop.
     next_attempt_at REAL NOT NULL DEFAULT 0,
@@ -321,6 +325,10 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     error TEXT NOT NULL DEFAULT '',
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used BOOLEAN NOT NULL DEFAULT FALSE,
+    ocr_status TEXT NOT NULL DEFAULT 'disabled',
+    ocr_version TEXT NOT NULL DEFAULT '',
+    ocr_duration_ms INTEGER NOT NULL DEFAULT 0,
+    ocr_error TEXT NOT NULL DEFAULT '',
     next_attempt_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -532,6 +540,10 @@ class ReviewJobStatus:
     error: str
     provider_used: str
     fallback_used: bool
+    ocr_status: str
+    ocr_version: str
+    ocr_duration_ms: int
+    ocr_error: str
     next_attempt_at: float
     created_at: float
     updated_at: float
@@ -644,7 +656,8 @@ class AppDatabase:
                 "ALTER TABLE pr_reviewers ADD COLUMN bare_approval INTEGER NOT NULL DEFAULT 0"
             )
         review_job_cols = {
-            r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(mira_review_jobs)").fetchall()
+            r[1]
+            for r in self._sqlite_conn.execute("PRAGMA table_info(mira_review_jobs)").fetchall()
         }
         if "provider_used" not in review_job_cols:
             self._sqlite_conn.execute(
@@ -657,6 +670,19 @@ class AppDatabase:
         if "next_attempt_at" not in review_job_cols:
             self._sqlite_conn.execute(
                 "ALTER TABLE mira_review_jobs ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
+        if "ocr_status" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN ocr_status TEXT NOT NULL DEFAULT 'disabled'"
+            )
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN ocr_version TEXT NOT NULL DEFAULT ''"
+            )
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN ocr_duration_ms INTEGER NOT NULL DEFAULT 0"
+            )
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN ocr_error TEXT NOT NULL DEFAULT ''"
             )
         # The original claim index did not include the retry due time. Rebuild
         # it even on existing databases so delayed jobs stay out of the hot
@@ -740,6 +766,18 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
                     "next_attempt_at DOUBLE PRECISION NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS ocr_status TEXT NOT NULL DEFAULT 'disabled'"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS ocr_version TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS ocr_duration_ms INTEGER NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS ocr_error TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute("DROP INDEX IF EXISTS idx_mira_review_jobs_claim")
                 cur.execute(
@@ -1432,7 +1470,20 @@ class AppDatabase:
                 "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING",
-                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, int(is_private), now, now, now),
+                (
+                    platform,
+                    owner,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    pr_url,
+                    pr_title,
+                    installation_id,
+                    int(is_private),
+                    now,
+                    now,
+                    now,
+                ),
             )
             self._sqlite_conn.commit()
             return cur.rowcount > 0
@@ -1448,7 +1499,20 @@ class AppDatabase:
                 "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING RETURNING id",
-                (platform, owner, repo, pr_number, head_sha, pr_url, pr_title, installation_id, is_private, now, now, now),
+                (
+                    platform,
+                    owner,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    pr_url,
+                    pr_title,
+                    installation_id,
+                    is_private,
+                    now,
+                    now,
+                    now,
+                ),
             )
             inserted = cur.fetchone() is not None
         self._pg_commit()
@@ -1470,7 +1534,8 @@ class AppDatabase:
                 return None
             cur = self._sqlite_conn.execute(
                 "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, updated_at=? "
-                "WHERE id=? AND status='pending' AND next_attempt_at<=?", (now, row[0], now)
+                "WHERE id=? AND status='pending' AND next_attempt_at<=?",
+                (now, row[0], now),
             )
             self._sqlite_conn.commit()
             if cur.rowcount == 0:
@@ -1566,7 +1631,8 @@ class AppDatabase:
                 delay = min(300, 10 * (2 ** max(0, int(row[0]) - 1))) if retry else 0
                 cur.execute(
                     "UPDATE mira_review_jobs SET status=%s, error=%s, next_attempt_at=%s, updated_at=%s "
-                    "WHERE id=%s AND status='running'", (status, safe_error, now + delay, now, job_id)
+                    "WHERE id=%s AND status='running'",
+                    (status, safe_error, now + delay, now, job_id),
                 )
             self._pg_commit()
 
@@ -1627,12 +1693,39 @@ class AppDatabase:
             )
         self._pg_commit()
 
+    def set_review_job_ocr(
+        self, job_id: int, *, status: str, version: str, duration_ms: int, error: str
+    ) -> None:
+        """Persist safe OCR provenance; prompts, paths and subprocess output stay out of the DB."""
+        values = (
+            status[:24],
+            version[:120],
+            max(0, int(duration_ms)),
+            error[:120],
+            time.time(),
+            job_id,
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute(
+                "UPDATE mira_review_jobs SET ocr_status=?,ocr_version=?,ocr_duration_ms=?,ocr_error=?,updated_at=? WHERE id=? AND status='running'",
+                values,
+            )
+            self._sqlite_conn.commit()
+            return
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE mira_review_jobs SET ocr_status=%s,ocr_version=%s,ocr_duration_ms=%s,ocr_error=%s,updated_at=%s WHERE id=%s AND status='running'",
+                values,
+            )
+        self._pg_commit()
+
     def list_review_jobs(self, limit: int = 200) -> list[ReviewJobStatus]:
         """Newest durable jobs for the authenticated operations dashboard."""
         bounded_limit = max(1, min(limit, 500))
         columns = (
             "id,platform,owner,repo,pr_number,head_sha,pr_url,pr_title,status,attempts,error,"
-            "provider_used,fallback_used,next_attempt_at,created_at,updated_at"
+            "provider_used,fallback_used,ocr_status,ocr_version,ocr_duration_ms,ocr_error,next_attempt_at,created_at,updated_at"
         )
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
@@ -1649,11 +1742,26 @@ class AppDatabase:
                 rows = cur.fetchall()
         return [
             ReviewJobStatus(
-                id=int(row[0]), platform=row[1], owner=row[2], repo=row[3],
-                pr_number=int(row[4]), head_sha=row[5], pr_url=row[6], pr_title=row[7],
-                status=row[8], attempts=int(row[9]), error=row[10], provider_used=row[11],
-                fallback_used=bool(row[12]), next_attempt_at=float(row[13]),
-                created_at=float(row[14]), updated_at=float(row[15]),
+                id=int(row[0]),
+                platform=row[1],
+                owner=row[2],
+                repo=row[3],
+                pr_number=int(row[4]),
+                head_sha=row[5],
+                pr_url=row[6],
+                pr_title=row[7],
+                status=row[8],
+                attempts=int(row[9]),
+                error=row[10],
+                provider_used=row[11],
+                fallback_used=bool(row[12]),
+                ocr_status=row[13],
+                ocr_version=row[14],
+                ocr_duration_ms=int(row[15]),
+                ocr_error=row[16],
+                next_attempt_at=float(row[17]),
+                created_at=float(row[18]),
+                updated_at=float(row[19]),
             )
             for row in rows
         ]
