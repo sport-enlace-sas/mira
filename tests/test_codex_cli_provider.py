@@ -250,11 +250,39 @@ class TestClaudeAndFallbackProvider:
         assert isinstance(provider.primary, ClaudeCLIProvider)
         assert isinstance(provider.fallback, CodexCLIProvider)
 
-    def test_claude_command_is_restricted_and_not_bare(self):
+    def test_claude_command_disables_tools_settings_and_mcp(self):
         provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
         command = provider._command()
-        assert command[:3] == ["claude", "-p", "--restricted"]
+        assert command[:2] == ["claude", "-p"]
+        assert ["--permission-mode", "dontAsk"] == command[2:4]
+        assert ["--tools", ""] == command[4:6]
+        assert "--strict-mcp-config" in command
+        assert ["--setting-sources", ""] == command[7:9]
+        assert "--no-session-persistence" in command
+        assert "--disable-slash-commands" in command
         assert "--bare" not in command
+
+    @pytest.mark.asyncio
+    async def test_claude_quota_exhaustion_is_eligible_for_codex_fallback(self, monkeypatch):
+        proc = AsyncMock()
+        proc.returncode = 1
+        proc.communicate.return_value = (b"You've hit your limit", b"")
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+        provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
+
+        with pytest.raises(LLMError, match="You've hit your limit") as error:
+            await provider._run_codex("review")
+        assert error.value.code == "claude_exit_failed"
+
+    @pytest.mark.asyncio
+    async def test_cli_review_and_walkthrough_use_exported_tool_schemas(self):
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
+        provider.complete_with_tools = AsyncMock(return_value='{"comments": []}')  # type: ignore[method-assign]
+
+        assert await provider.review([{"role": "user", "content": "review"}]) == '{"comments": []}'
+        assert await provider.walkthrough([{"role": "user", "content": "walkthrough"}]) == '{"comments": []}'
+        assert provider.complete_with_tools.await_count == 2
 
     def test_claude_environment_only_contains_its_oauth_token(self, monkeypatch, tmp_path):
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
