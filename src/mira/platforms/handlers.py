@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,7 @@ async def run_pr_review(
         logger.info("Review already in progress for %s, skipping", pr_url)
         return False
 
+    review_started_at = time.monotonic()
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
 
@@ -163,10 +165,20 @@ async def run_pr_review(
                     for candidate in chains
                 )
                 attempted_models: list[str] = []
+                input_tokens = 0
+                output_tokens = 0
                 for candidate in chains:
                     for model in getattr(candidate, "attempted_models", []):
                         if model and model not in attempted_models:
                             attempted_models.append(model)
+                    usage = getattr(candidate, "usage", {})
+                    if isinstance(usage, dict):
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                        if isinstance(prompt_tokens, int):
+                            input_tokens += max(0, prompt_tokens)
+                        if isinstance(completion_tokens, int):
+                            output_tokens += max(0, completion_tokens)
                 _app_db.set_review_job_execution(
                     job_id,
                     provider_used=(
@@ -175,6 +187,11 @@ async def run_pr_review(
                     or "unknown",
                     fallback_used=fallback_used,
                     models_attempted=" -> ".join(attempted_models),
+                    audit_duration_ms=max(
+                        0, int((time.monotonic() - review_started_at) * 1000)
+                    ),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                 )
             except Exception:
                 # Operational provenance must never replace the review's real

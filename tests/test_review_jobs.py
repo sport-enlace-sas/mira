@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from mira.dashboard import db as dashboard_db
 from mira.dashboard.db import AppDatabase
 
@@ -119,6 +121,9 @@ def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
         provider_used="codex-cli",
         fallback_used=True,
         models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+        audit_duration_ms=12_345,
+        input_tokens=8_765,
+        output_tokens=432,
     )
     db.finish_review_job(job.id)
 
@@ -127,6 +132,74 @@ def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     assert listed.provider_used == "codex-cli"
     assert listed.fallback_used is True
     assert listed.models_attempted == "claude-fable-5-1 -> gpt-5.6-sol"
+    assert listed.audit_duration_ms == 12_345
+    assert listed.input_tokens == 8_765
+    assert listed.output_tokens == 432
+
+
+def test_dashboard_job_metrics_accumulate_across_retries(tmp_path, monkeypatch) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    assert db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=4,
+        head_sha="i" * 40,
+        pr_url="https://github.com/o/r/pull/4",
+        pr_title="metrics fixture",
+        installation_id=1,
+        is_private=True,
+    )
+
+    first = db.claim_next_review_job()
+    assert first is not None
+    db.set_review_job_execution(
+        first.id,
+        provider_used="claude-cli",
+        fallback_used=False,
+        audit_duration_ms=1_500,
+        input_tokens=100,
+        output_tokens=20,
+    )
+    db.finish_review_job(first.id, error="provider timeout", retry=True)
+
+    now += 10
+    second = db.claim_next_review_job()
+    assert second is not None
+    db.set_review_job_execution(
+        second.id,
+        provider_used="codex-cli",
+        fallback_used=True,
+        audit_duration_ms=2_500,
+        input_tokens=200,
+        output_tokens=40,
+    )
+    db.finish_review_job(second.id)
+
+    [listed] = db.list_review_jobs()
+    assert listed.audit_duration_ms == 4_000
+    assert listed.input_tokens == 300
+    assert listed.output_tokens == 60
+
+
+def test_existing_review_job_table_adds_execution_metric_columns(tmp_path) -> None:
+    db_path = tmp_path / "app.db"
+    db = AppDatabase(str(db_path), admin_password="test-password")
+    db.close()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("ALTER TABLE mira_review_jobs DROP COLUMN audit_duration_ms")
+        connection.execute("ALTER TABLE mira_review_jobs DROP COLUMN input_tokens")
+        connection.execute("ALTER TABLE mira_review_jobs DROP COLUMN output_tokens")
+
+    migrated = AppDatabase(str(db_path), admin_password="test-password")
+    assert migrated._sqlite_conn is not None
+    columns = {
+        row[1]
+        for row in migrated._sqlite_conn.execute("PRAGMA table_info(mira_review_jobs)").fetchall()
+    }
+    assert {"audit_duration_ms", "input_tokens", "output_tokens"} <= columns
 
 
 def test_dashboard_job_list_includes_ocr_provenance(tmp_path) -> None:

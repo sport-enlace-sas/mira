@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used INTEGER NOT NULL DEFAULT 0,
     models_attempted TEXT NOT NULL DEFAULT '',
+    audit_duration_ms INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
     ocr_status TEXT NOT NULL DEFAULT 'disabled',
     ocr_version TEXT NOT NULL DEFAULT '',
     ocr_duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -327,6 +330,9 @@ CREATE TABLE IF NOT EXISTS mira_review_jobs (
     provider_used TEXT NOT NULL DEFAULT '',
     fallback_used BOOLEAN NOT NULL DEFAULT FALSE,
     models_attempted TEXT NOT NULL DEFAULT '',
+    audit_duration_ms BIGINT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
     ocr_status TEXT NOT NULL DEFAULT 'disabled',
     ocr_version TEXT NOT NULL DEFAULT '',
     ocr_duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -543,6 +549,9 @@ class ReviewJobStatus:
     provider_used: str
     fallback_used: bool
     models_attempted: str
+    audit_duration_ms: int
+    input_tokens: int
+    output_tokens: int
     ocr_status: str
     ocr_version: str
     ocr_duration_ms: int
@@ -674,6 +683,18 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE mira_review_jobs ADD COLUMN models_attempted TEXT NOT NULL DEFAULT ''"
             )
+        if "audit_duration_ms" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN audit_duration_ms INTEGER NOT NULL DEFAULT 0"
+            )
+        if "input_tokens" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"
+            )
+        if "output_tokens" not in review_job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE mira_review_jobs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0"
+            )
         if "next_attempt_at" not in review_job_cols:
             self._sqlite_conn.execute(
                 "ALTER TABLE mira_review_jobs ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
@@ -773,6 +794,18 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
                     "models_attempted TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "audit_duration_ms BIGINT NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "input_tokens BIGINT NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
+                    "output_tokens BIGINT NOT NULL DEFAULT 0"
                 )
                 cur.execute(
                     "ALTER TABLE mira_review_jobs ADD COLUMN IF NOT EXISTS "
@@ -1687,28 +1720,54 @@ class AppDatabase:
         provider_used: str,
         fallback_used: bool,
         models_attempted: str = "",
+        audit_duration_ms: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> None:
-        """Persist provider provenance without storing model credentials or prompts."""
+        """Persist provider provenance and cumulative execution metrics."""
         # Provider names are a small allow-listed operational label (for
         # example ``claude-cli`` or ``codex-cli``), never a token or command.
         safe_provider = provider_used[:80]
         safe_models = models_attempted[:500]
+        safe_duration = max(0, int(audit_duration_ms))
+        safe_input_tokens = max(0, int(input_tokens))
+        safe_output_tokens = max(0, int(output_tokens))
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             self._sqlite_conn.execute(
                 "UPDATE mira_review_jobs SET provider_used=?, fallback_used=?, "
-                "models_attempted=?, updated_at=? "
+                "models_attempted=?, audit_duration_ms=audit_duration_ms+?, "
+                "input_tokens=input_tokens+?, output_tokens=output_tokens+?, updated_at=? "
                 "WHERE id=? AND status='running'",
-                (safe_provider, int(fallback_used), safe_models, time.time(), job_id),
+                (
+                    safe_provider,
+                    int(fallback_used),
+                    safe_models,
+                    safe_duration,
+                    safe_input_tokens,
+                    safe_output_tokens,
+                    time.time(),
+                    job_id,
+                ),
             )
             self._sqlite_conn.commit()
             return
         with self._pg_cursor() as cur:
             cur.execute(
                 "UPDATE mira_review_jobs SET provider_used=%s, fallback_used=%s, "
-                "models_attempted=%s, updated_at=%s "
+                "models_attempted=%s, audit_duration_ms=audit_duration_ms+%s, "
+                "input_tokens=input_tokens+%s, output_tokens=output_tokens+%s, updated_at=%s "
                 "WHERE id=%s AND status='running'",
-                (safe_provider, fallback_used, safe_models, time.time(), job_id),
+                (
+                    safe_provider,
+                    fallback_used,
+                    safe_models,
+                    safe_duration,
+                    safe_input_tokens,
+                    safe_output_tokens,
+                    time.time(),
+                    job_id,
+                ),
             )
         self._pg_commit()
 
@@ -1744,8 +1803,8 @@ class AppDatabase:
         bounded_limit = max(1, min(limit, 500))
         columns = (
             "id,platform,owner,repo,pr_number,head_sha,pr_url,pr_title,status,attempts,error,"
-            "provider_used,fallback_used,models_attempted,ocr_status,ocr_version,ocr_duration_ms,"
-            "ocr_error,next_attempt_at,created_at,updated_at"
+            "provider_used,fallback_used,models_attempted,audit_duration_ms,input_tokens,output_tokens,"
+            "ocr_status,ocr_version,ocr_duration_ms,ocr_error,next_attempt_at,created_at,updated_at"
         )
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
@@ -1776,13 +1835,16 @@ class AppDatabase:
                 provider_used=row[11],
                 fallback_used=bool(row[12]),
                 models_attempted=row[13],
-                ocr_status=row[14],
-                ocr_version=row[15],
-                ocr_duration_ms=int(row[16]),
-                ocr_error=row[17],
-                next_attempt_at=float(row[18]),
-                created_at=float(row[19]),
-                updated_at=float(row[20]),
+                audit_duration_ms=int(row[14]),
+                input_tokens=int(row[15]),
+                output_tokens=int(row[16]),
+                ocr_status=row[17],
+                ocr_version=row[18],
+                ocr_duration_ms=int(row[19]),
+                ocr_error=row[20],
+                next_attempt_at=float(row[21]),
+                created_at=float(row[22]),
+                updated_at=float(row[23]),
             )
             for row in rows
         ]
