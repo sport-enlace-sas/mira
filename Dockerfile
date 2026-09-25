@@ -37,7 +37,9 @@ COPY --from=ui-builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=ui-builder /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
 COPY --from=ui-builder /usr/local/lib/node_modules/@anthropic-ai/claude-code /usr/local/lib/node_modules/@anthropic-ai/claude-code
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
-RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude
+RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude \
+ && codex --version \
+ && claude --version
 
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up
 # automatically and serves it at / with SPA fallback.
