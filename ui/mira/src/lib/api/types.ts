@@ -28,6 +28,7 @@ export interface ReviewJobModel {
   error: string
   provider_used: string
   fallback_used: boolean
+  models_attempted: string
   ocr_status: string
   ocr_version: string
   ocr_duration_ms: number

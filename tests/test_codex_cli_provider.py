@@ -102,6 +102,55 @@ class TestCodexCLIProvider:
         assert (runtime_home / "auth.json").read_text() == '{"tokens": "sealed"}'
         assert (runtime_home / "auth.json").stat().st_mode & 0o777 == 0o600
 
+    def test_refreshed_auth_is_persisted_without_exposing_other_codex_files(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        persistent_home = tmp_path / "persistent-codex-home"
+        monkeypatch.setenv(
+            "MIRA_CODEX_AUTH_JSON",
+            '{"last_refresh":"2026-09-23T10:00:00Z","tokens":{"refresh_token":"old"}}',
+        )
+        provider = CodexCLIProvider(
+            LLMConfig(provider="codex-cli", codex_home=str(persistent_home))
+        )
+        invocation = tmp_path / "invocation"
+        runtime_home = Path(provider._prepare_codex_home(str(invocation)))
+        (runtime_home / "config.toml").write_text("must_not_persist = true")
+        (runtime_home / "auth.json").write_text(
+            '{"last_refresh":"2026-09-24T10:00:00Z","tokens":{"refresh_token":"new"}}'
+        )
+
+        provider._persist_codex_auth(str(runtime_home))
+
+        persisted = (persistent_home / "auth.json").read_text()
+        assert '"refresh_token": "new"' in persisted
+        assert not (persistent_home / "config.toml").exists()
+        assert (persistent_home / "auth.json").stat().st_mode & 0o777 == 0o600
+
+    def test_stale_invocation_cannot_overwrite_newer_persistent_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        persistent_home = tmp_path / "persistent-codex-home"
+        persistent_home.mkdir()
+        (persistent_home / "auth.json").write_text(
+            '{"last_refresh":"2026-09-24T10:00:00Z","tokens":{"refresh_token":"new"}}'
+        )
+        monkeypatch.setenv(
+            "MIRA_CODEX_AUTH_JSON",
+            '{"last_refresh":"2026-09-23T10:00:00Z","tokens":{"refresh_token":"seed"}}',
+        )
+        provider = CodexCLIProvider(
+            LLMConfig(provider="codex-cli", codex_home=str(persistent_home))
+        )
+        runtime_home = Path(provider._prepare_codex_home(str(tmp_path / "invocation")))
+        (runtime_home / "auth.json").write_text(
+            '{"last_refresh":"2026-09-22T10:00:00Z","tokens":{"refresh_token":"stale"}}'
+        )
+
+        provider._persist_codex_auth(str(runtime_home))
+
+        assert '"refresh_token":"new"' in (persistent_home / "auth.json").read_text()
+
     def test_command_disables_user_rules_and_shell_environment_inheritance(self):
         provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
 
@@ -254,13 +303,24 @@ class TestClaudeAndFallbackProvider:
         provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
         command = provider._command()
         assert command[:2] == ["claude", "-p"]
-        assert ["--permission-mode", "dontAsk"] == command[2:4]
-        assert ["--tools", ""] == command[4:6]
+        assert command[2:4] == ["--permission-mode", "dontAsk"]
+        assert command[4:6] == ["--tools", ""]
         assert "--strict-mcp-config" in command
-        assert ["--setting-sources", ""] == command[7:9]
+        assert command[7:9] == ["--setting-sources", ""]
         assert "--no-session-persistence" in command
         assert "--disable-slash-commands" in command
         assert "--bare" not in command
+
+    def test_claude_command_uses_dashboard_selected_anthropic_model(self):
+        provider = ClaudeCLIProvider(
+            LLMConfig(provider="claude-cli", model="anthropic/claude-fable-5.1")
+        )
+
+        command = provider._command()
+
+        model_index = command.index("--model")
+        assert command[model_index + 1] == "claude-fable-5-1"
+        assert provider.effective_model == "claude-fable-5-1"
 
     @pytest.mark.asyncio
     async def test_claude_quota_exhaustion_is_eligible_for_codex_fallback(self, monkeypatch):
@@ -281,7 +341,10 @@ class TestClaudeAndFallbackProvider:
         provider.complete_with_tools = AsyncMock(return_value='{"comments": []}')  # type: ignore[method-assign]
 
         assert await provider.review([{"role": "user", "content": "review"}]) == '{"comments": []}'
-        assert await provider.walkthrough([{"role": "user", "content": "walkthrough"}]) == '{"comments": []}'
+        assert (
+            await provider.walkthrough([{"role": "user", "content": "walkthrough"}])
+            == '{"comments": []}'
+        )
         assert provider.complete_with_tools.await_count == 2
 
     def test_claude_environment_only_contains_its_oauth_token(self, monkeypatch, tmp_path):
@@ -296,6 +359,10 @@ class TestClaudeAndFallbackProvider:
     async def test_transient_claude_failure_uses_codex_once(self):
         primary = MagicMock()
         fallback = MagicMock()
+        primary.config = LLMConfig(provider="claude-cli", model="anthropic/claude-fable-5.1")
+        fallback.config = LLMConfig(provider="codex-cli", model="gpt-5.6-sol")
+        primary.effective_model = "claude-fable-5-1"
+        fallback.effective_model = "gpt-5.6-sol"
         primary.usage = {"prompt_tokens": 0, "completion_tokens": 0}
         fallback.usage = {"prompt_tokens": 0, "completion_tokens": 0}
         primary.complete = AsyncMock(side_effect=LLMError("codex_timeout", seconds=1))
@@ -305,13 +372,18 @@ class TestClaudeAndFallbackProvider:
         assert await chain.complete([{"role": "user", "content": "review"}]) == '{"comments": []}'
         fallback.complete.assert_awaited_once()
         assert chain.last_provider == "fallback"
+        assert chain.attempted_models == ["claude-fable-5-1", "gpt-5.6-sol"]
+        assert chain.attempted_providers == ["claude-cli", "codex-cli"]
+        assert chain.fallback_attempted is True
 
     @pytest.mark.asyncio
     async def test_invalid_claude_credentials_do_not_use_codex(self):
         primary = MagicMock()
         fallback = MagicMock()
         primary.usage = fallback.usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        primary.complete = AsyncMock(side_effect=NonRetriableLLMError("no_api_key", api_key_env="x"))
+        primary.complete = AsyncMock(
+            side_effect=NonRetriableLLMError("no_api_key", api_key_env="x")
+        )
         fallback.complete = AsyncMock()
         chain = ProviderChain(primary, fallback)
 

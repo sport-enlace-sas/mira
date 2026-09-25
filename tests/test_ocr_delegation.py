@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 from mira.config import _strip_deployment_only_llm_settings
@@ -84,6 +85,16 @@ def test_untrusted_repo_config_cannot_enable_or_repoint_ocr():
         }
     )
     assert cleaned["review"] == {"walkthrough": False}
+
+
+def test_github_checkout_uses_basic_auth_extraheader(tmp_path):
+    ocr = OpenCodeReviewDelegation("ocr", "/corporate/rules", 5, 32)
+
+    env = ocr._env("installation-token", tmp_path)
+
+    expected = base64.b64encode(b"x-access-token:installation-token").decode("ascii")
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {expected}"
 
 
 def test_ocr_output_contract_drops_unsafe_paths_and_unexpected_rule_fields():

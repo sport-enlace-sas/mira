@@ -134,24 +134,6 @@ async def run_pr_review(
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
         result = await engine.review_pr(pr_url)
-        ocr_plan = getattr(engine, "_ocr_plan", None)
-        if job_id and ocr_plan is not None:
-            _app_db.set_review_job_ocr(
-                job_id, status=ocr_plan.status, version=ocr_plan.version,
-                duration_ms=ocr_plan.duration_ms, error=ocr_plan.error,
-            )
-        if job_id:
-            chains = (llm, indexing_llm, security_llm)
-            fallback_used = any(
-                getattr(candidate, "last_provider", "primary") == "fallback"
-                for candidate in chains
-            )
-            _app_db.set_review_job_execution(
-                job_id,
-                provider_used=(config.llm.fallback_provider if fallback_used else config.llm.provider)
-                or "unknown",
-                fallback_used=fallback_used,
-            )
         review_tracker.complete(repo_full, number)
     except Exception as exc:
         review_tracker.fail(repo_full, number, str(exc))
@@ -162,6 +144,42 @@ async def run_pr_review(
             {"repo": repo_full, "pr_url": pr_url, "error": type(exc).__name__},
         )
         raise
+    finally:
+        if job_id:
+            try:
+                ocr_plan = getattr(engine, "_ocr_plan", None)
+                if ocr_plan is not None:
+                    _app_db.set_review_job_ocr(
+                        job_id,
+                        status=ocr_plan.status,
+                        version=ocr_plan.version,
+                        duration_ms=ocr_plan.duration_ms,
+                        error=ocr_plan.error,
+                    )
+                chains = (llm, indexing_llm, security_llm)
+                fallback_used = any(
+                    bool(getattr(candidate, "fallback_attempted", False))
+                    or getattr(candidate, "last_provider", "primary") == "fallback"
+                    for candidate in chains
+                )
+                attempted_models: list[str] = []
+                for candidate in chains:
+                    for model in getattr(candidate, "attempted_models", []):
+                        if model and model not in attempted_models:
+                            attempted_models.append(model)
+                _app_db.set_review_job_execution(
+                    job_id,
+                    provider_used=(
+                        config.llm.fallback_provider if fallback_used else config.llm.provider
+                    )
+                    or "unknown",
+                    fallback_used=fallback_used,
+                    models_attempted=" -> ".join(attempted_models),
+                )
+            except Exception:
+                # Operational provenance must never replace the review's real
+                # success or failure with a telemetry write error.
+                logger.warning("Unable to persist review execution provenance", exc_info=True)
 
     # The walkthrough comment already carries the "more accurate after indexing"
     # nudge for unindexed repos, so we don't post a separate note here — that

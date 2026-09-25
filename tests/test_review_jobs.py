@@ -114,13 +114,19 @@ def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     )
     job = db.claim_next_review_job()
     assert job is not None
-    db.set_review_job_execution(job.id, provider_used="codex-cli", fallback_used=True)
+    db.set_review_job_execution(
+        job.id,
+        provider_used="codex-cli",
+        fallback_used=True,
+        models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+    )
     db.finish_review_job(job.id)
 
     [listed] = db.list_review_jobs()
     assert listed.status == "completed"
     assert listed.provider_used == "codex-cli"
     assert listed.fallback_used is True
+    assert listed.models_attempted == "claude-fable-5-1 -> gpt-5.6-sol"
 
 
 def test_dashboard_job_list_includes_ocr_provenance(tmp_path) -> None:
