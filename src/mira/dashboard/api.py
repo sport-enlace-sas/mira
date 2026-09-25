@@ -229,6 +229,9 @@ class ReviewJobModel(BaseModel):
     provider_used: str
     fallback_used: bool
     models_attempted: str
+    audit_duration_ms: int
+    input_tokens: int
+    output_tokens: int
     ocr_status: str
     ocr_version: str
     ocr_duration_ms: int

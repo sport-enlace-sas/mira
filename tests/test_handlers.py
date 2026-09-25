@@ -235,14 +235,19 @@ async def test_failed_review_persists_models_and_ocr_provenance(
         attempted_models=["claude-fable-5-1", "gpt-5.6-sol"],
         attempted_providers=["claude-cli", "codex-cli"],
         fallback_attempted=True,
+        usage={"prompt_tokens": 1_200, "completion_tokens": 240},
     )
     indexing_chain = MagicMock(
-        attempted_models=[], attempted_providers=[], fallback_attempted=False
+        attempted_models=[],
+        attempted_providers=[],
+        fallback_attempted=False,
+        usage={"prompt_tokens": 300, "completion_tokens": 60},
     )
     security_chain = MagicMock(
         attempted_models=["claude-fable-5-1"],
         attempted_providers=["claude-cli"],
         fallback_attempted=False,
+        usage={"prompt_tokens": 500, "completion_tokens": 100},
     )
     mock_llm_cls.side_effect = [review_chain, indexing_chain, security_chain]
 
@@ -259,6 +264,7 @@ async def test_failed_review_persists_models_and_ocr_provenance(
     with (
         patch("mira.dashboard.api._app_db") as mock_db,
         patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock),
+        patch("mira.platforms.handlers.time.monotonic", side_effect=[100.0, 102.5]),
     ):
         from mira.platforms.handlers import run_pr_review
 
@@ -279,6 +285,9 @@ async def test_failed_review_persists_models_and_ocr_provenance(
         provider_used="codex-cli",
         fallback_used=True,
         models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+        audit_duration_ms=2_500,
+        input_tokens=2_000,
+        output_tokens=400,
     )
     mock_db.set_review_job_ocr.assert_called_once_with(
         99,

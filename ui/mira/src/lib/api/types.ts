@@ -29,6 +29,9 @@ export interface ReviewJobModel {
   provider_used: string
   fallback_used: boolean
   models_attempted: string
+  audit_duration_ms: number
+  input_tokens: number
+  output_tokens: number
   ocr_status: string
   ocr_version: string
   ocr_duration_ms: number
