@@ -79,6 +79,7 @@ export function ReviewJobsPage() {
                   <TableHead>Pull request / SHA</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Provider</TableHead>
+                  <TableHead>Models attempted</TableHead>
                   <TableHead>OCR</TableHead>
                   <TableHead>Attempts</TableHead>
                   <TableHead />
@@ -99,6 +100,15 @@ export function ReviewJobsPage() {
                     <TableCell className="text-sm">
                       {job.provider_used || "pending"}
                       {job.fallback_used && <span className="ml-1 text-xs text-amber-600">fallback</span>}
+                    </TableCell>
+                    <TableCell className="max-w-64 text-xs">
+                      {job.models_attempted ? (
+                        job.models_attempted.split(" -> ").map((model) => (
+                          <div key={model} className="font-mono text-muted-foreground">{model}</div>
+                        ))
+                      ) : (
+                        <span className="text-muted-foreground">pending</span>
+                      )}
                     </TableCell>
                     <TableCell className="text-xs">
                       <span>{job.ocr_status}</span>

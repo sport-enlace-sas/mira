@@ -115,8 +115,13 @@ async def _run_pr_handler(result: ReviewResult | Exception, mock_engine_cls, moc
 
         with suppress(Exception):
             await run_pr_review(
-                MagicMock(), "testowner", "testrepo", 42,
-                "https://github.com/testowner/testrepo/pull/42", True, "mira-bot",
+                MagicMock(),
+                "testowner",
+                "testrepo",
+                42,
+                "https://github.com/testowner/testrepo/pull/42",
+                True,
+                "mira-bot",
             )
     return mock_dispatch
 
@@ -208,6 +213,80 @@ async def test_failed_review_fires_review_failed(
     data = _data_for(mock_dispatch, "review.failed")
     assert data["repo"] == "testowner/testrepo"
     assert data["error"] == "RuntimeError"
+
+
+@patch("mira.platforms.handlers.ReviewEngine")
+@patch("mira.platforms.github.webhook.create_provider")
+@patch("mira.platforms.handlers.create_llm")
+@patch("mira.platforms.handlers.load_config")
+async def test_failed_review_persists_models_and_ocr_provenance(
+    mock_config: MagicMock,
+    mock_llm_cls: MagicMock,
+    mock_provider_cls: MagicMock,
+    mock_engine_cls: MagicMock,
+    mock_app_auth: AsyncMock,
+) -> None:
+    config = MagicMock()
+    config.llm.provider = "claude-cli"
+    config.llm.fallback_provider = "codex-cli"
+    mock_config.return_value = config
+
+    review_chain = MagicMock(
+        attempted_models=["claude-fable-5-1", "gpt-5.6-sol"],
+        attempted_providers=["claude-cli", "codex-cli"],
+        fallback_attempted=True,
+    )
+    indexing_chain = MagicMock(
+        attempted_models=[], attempted_providers=[], fallback_attempted=False
+    )
+    security_chain = MagicMock(
+        attempted_models=["claude-fable-5-1"],
+        attempted_providers=["claude-cli"],
+        fallback_attempted=False,
+    )
+    mock_llm_cls.side_effect = [review_chain, indexing_chain, security_chain]
+
+    engine = AsyncMock()
+    engine.review_pr = AsyncMock(side_effect=RuntimeError("boom"))
+    engine._ocr_plan = MagicMock(
+        status="degraded",
+        version="open-code-review test",
+        duration_ms=25,
+        error="ocr_failed",
+    )
+    mock_engine_cls.return_value = engine
+
+    with (
+        patch("mira.dashboard.api._app_db") as mock_db,
+        patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock),
+    ):
+        from mira.platforms.handlers import run_pr_review
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await run_pr_review(
+                MagicMock(),
+                "testowner",
+                "testrepo",
+                42,
+                "https://github.com/testowner/testrepo/pull/42",
+                True,
+                "mira-bot",
+                job_id=99,
+            )
+
+    mock_db.set_review_job_execution.assert_called_once_with(
+        99,
+        provider_used="codex-cli",
+        fallback_used=True,
+        models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+    )
+    mock_db.set_review_job_ocr.assert_called_once_with(
+        99,
+        status="degraded",
+        version="open-code-review test",
+        duration_ms=25,
+        error="ocr_failed",
+    )
 
 
 @patch("mira.platforms.handlers.ReviewEngine")
@@ -335,7 +414,10 @@ async def test_handler_exception_logged_not_raised(
     mock_app_auth: AsyncMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Exceptions in handlers are logged, not propagated."""
-    with caplog.at_level(logging.ERROR), patch("mira.platforms.github.webhook._get_app_db") as get_db:
+    with (
+        caplog.at_level(logging.ERROR),
+        patch("mira.platforms.github.webhook._get_app_db") as get_db,
+    ):
         get_db.return_value.enqueue_review_job.side_effect = RuntimeError("boom")
         await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
 

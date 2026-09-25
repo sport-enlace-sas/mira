@@ -228,6 +228,7 @@ class ReviewJobModel(BaseModel):
     error: str
     provider_used: str
     fallback_used: bool
+    models_attempted: str
     ocr_status: str
     ocr_version: str
     ocr_duration_ms: int

@@ -37,7 +37,7 @@ _SAFE_BOT_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
     """Run the durable review queue inside Mira's single service process."""
     from mira.dashboard.api import _app_db
-    from mira.exceptions import NonRetriableLLMError
+    from mira.exceptions import LLMError, NonRetriableLLMError
     from mira.platforms.handlers import run_pr_review
     from mira.providers import create_provider
 
@@ -57,22 +57,45 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
                 "github", partial(app_auth.get_installation_token, job.installation_id)
             )
             reviewed = await run_pr_review(
-                provider, job.owner, job.repo, job.pr_number, job.pr_url,
-                bool(job.is_private), bot_name, platform=job.platform, pr_title=job.pr_title,
+                provider,
+                job.owner,
+                job.repo,
+                job.pr_number,
+                job.pr_url,
+                bool(job.is_private),
+                bot_name,
+                platform=job.platform,
+                pr_title=job.pr_title,
                 publish_guard=lambda job_id=job.id: _app_db.is_review_job_current(job_id),
                 job_id=job.id,
             )
             if not reviewed:
                 # Another SHA may still be completing. Return this job to the
                 # queue so the latest revision is not silently dropped.
-                _app_db.finish_review_job(job.id, error="review already running", retry=job.attempts < 3)
+                _app_db.finish_review_job(
+                    job.id, error="review already running", retry=job.attempts < 3
+                )
                 continue
         except NonRetriableLLMError as exc:
-            _app_db.finish_review_job(job.id, error=exc.safe_message)
+            _app_db.finish_review_job(job.id, error=f"{exc.code}: {exc.safe_message}")
             logger.warning("Review job %s failed without retry: %s", job.id, exc.safe_message)
+        except LLMError as exc:
+            _app_db.finish_review_job(
+                job.id,
+                error=f"{exc.code}: {exc.safe_message}",
+                retry=job.attempts < 3,
+            )
+            logger.warning(
+                "Review job %s failed (attempt %s): %s",
+                job.id,
+                job.attempts,
+                exc.code,
+            )
         except Exception as exc:  # transient host/provider failure; bounded retry
             _app_db.finish_review_job(job.id, error=type(exc).__name__, retry=job.attempts < 3)
-            logger.warning("Review job %s failed (attempt %s): %s", job.id, job.attempts, type(exc).__name__)
+            logger.warning(
+                "Review job %s failed (attempt %s): %s", job.id, job.attempts, type(exc).__name__
+            )
         else:
             _app_db.finish_review_job(job.id)
 

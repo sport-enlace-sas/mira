@@ -5,7 +5,7 @@ llm:
   provider: claude-cli
   model: claude-sonnet-5
   fallback_provider: codex-cli
-  fallback_model: codex-default
+  fallback_model: gpt-5.6-sol
   temperature: 0.2
   max_tokens: 4096
   max_retries: 2
@@ -13,8 +13,11 @@ llm:
   retry_min_wait: 2
   retry_max_wait: 15
   codex_sandbox: read-only
-  codex_timeout_seconds: 900
-  claude_timeout_seconds: 900
+  # The sealed desktop session seeds this durable volume path. Each isolated
+  # invocation merges a newer CLI-refreshed auth snapshot back into it.
+  codex_home: /data/codex
+  codex_timeout_seconds: 1800
+  claude_timeout_seconds: 1800
 
 filter:
   confidence_threshold: 0.80

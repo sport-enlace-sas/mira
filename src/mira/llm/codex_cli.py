@@ -18,6 +18,7 @@ import signal
 import tempfile
 from contextlib import suppress
 from pathlib import Path
+from threading import Lock
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -41,6 +42,8 @@ _SAFE_ENV_KEYS = frozenset(
         "PATHEXT",
     }
 )
+
+_AUTH_SYNC_LOCK = Lock()
 
 
 class CodexCLIProvider:
@@ -71,6 +74,10 @@ class CodexCLIProvider:
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4) if text else 0
 
+    @property
+    def effective_model(self) -> str:
+        return self.config.model.strip()
+
     def _env(self, runtime_home: str, runtime_codex_home: str) -> dict[str, str]:
         """Build a minimal child environment without Mira service credentials."""
         env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_KEYS}
@@ -78,31 +85,98 @@ class CodexCLIProvider:
         env["CODEX_HOME"] = runtime_codex_home
         return env
 
+    @staticmethod
+    def _read_auth(path: Path) -> dict | None:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _last_refresh(auth: dict | None) -> str:
+        value = auth.get("last_refresh", "") if auth else ""
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _write_auth(path: Path, auth: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".auth-", suffix=".json", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(auth, handle)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+    @staticmethod
+    def _sealed_auth() -> dict | None:
+        auth_json = os.environ.get("MIRA_CODEX_AUTH_JSON", "")
+        if not auth_json:
+            return None
+        try:
+            parsed = json.loads(auth_json)
+        except json.JSONDecodeError as exc:
+            raise NonRetriableLLMError(
+                "codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise NonRetriableLLMError("codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON")
+        return parsed
+
     def _prepare_codex_home(self, invocation_root: str) -> str:
-        """Create writable ephemeral Codex state containing only OAuth auth."""
+        """Create isolated invocation state from a persistent OAuth snapshot.
+
+        Every invocation gets only ``auth.json``. When ``codex_home`` is set,
+        that directory is the durable master copy and a newer sealed secret
+        can seed it without overwriting a token Codex refreshed more recently.
+        """
         destination = Path(invocation_root) / "codex-home"
         destination.mkdir(parents=True, mode=0o700)
-        auth_json = os.environ.get("MIRA_CODEX_AUTH_JSON", "")
-        if auth_json:
-            try:
-                parsed = json.loads(auth_json)
-            except json.JSONDecodeError as exc:
-                raise NonRetriableLLMError("codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON") from exc
-            if not isinstance(parsed, dict):
-                raise NonRetriableLLMError("codex_auth_file_missing", path="MIRA_CODEX_AUTH_JSON")
-            destination_auth = destination / "auth.json"
-            destination_auth.write_text(json.dumps(parsed), encoding="utf-8")
-            destination_auth.chmod(0o600)
+        sealed_auth = self._sealed_auth()
+        source_home = self.config.codex_home
+        if source_home:
+            persistent_auth = Path(source_home).expanduser() / "auth.json"
+            current_auth = self._read_auth(persistent_auth)
+            if sealed_auth is not None and (
+                current_auth is None
+                or self._last_refresh(sealed_auth) > self._last_refresh(current_auth)
+            ):
+                self._write_auth(persistent_auth, sealed_auth)
+                current_auth = sealed_auth
+            if current_auth is None:
+                raise LLMError("codex_auth_file_missing", path=str(persistent_auth))
+            self._write_auth(destination / "auth.json", current_auth)
             return str(destination)
-        source_home = self.config.codex_home or os.environ.get("CODEX_HOME")
+        if sealed_auth is not None:
+            self._write_auth(destination / "auth.json", sealed_auth)
+            return str(destination)
+        source_home = os.environ.get("CODEX_HOME")
         if source_home:
             source_auth = Path(source_home).expanduser() / "auth.json"
             if not source_auth.is_file():
                 raise LLMError("codex_auth_file_missing", path=str(source_auth))
-            destination_auth = destination / "auth.json"
-            destination_auth.write_bytes(source_auth.read_bytes())
-            destination_auth.chmod(0o600)
+            parsed = self._read_auth(source_auth)
+            if parsed is None:
+                raise LLMError("codex_auth_file_missing", path=str(source_auth))
+            self._write_auth(destination / "auth.json", parsed)
         return str(destination)
+
+    def _persist_codex_auth(self, runtime_codex_home: str) -> None:
+        """Merge a refreshed invocation token into the persistent master copy."""
+        if not self.config.codex_home:
+            return
+        refreshed = self._read_auth(Path(runtime_codex_home) / "auth.json")
+        if refreshed is None:
+            return
+        persistent_auth = Path(self.config.codex_home).expanduser() / "auth.json"
+        with _AUTH_SYNC_LOCK:
+            current = self._read_auth(persistent_auth)
+            if current is None or self._last_refresh(refreshed) > self._last_refresh(current):
+                self._write_auth(persistent_auth, refreshed)
 
     def _command(self, output_path: str) -> list[str]:
         codex_command = self.config.codex_command or "codex"
@@ -183,10 +257,14 @@ class CodexCLIProvider:
                 )
             except TimeoutError as exc:
                 await self._terminate_process_tree(proc)
+                self._persist_codex_auth(runtime_codex_home)
                 raise LLMError("codex_timeout", seconds=self.config.codex_timeout_seconds) from exc
             except BaseException:
                 await self._terminate_process_tree(proc)
+                self._persist_codex_auth(runtime_codex_home)
                 raise
+
+            self._persist_codex_auth(runtime_codex_home)
 
             stdout_text = stdout.decode("utf-8", errors="replace")
             stderr_text = stderr.decode("utf-8", errors="replace")

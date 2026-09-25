@@ -25,6 +25,30 @@ class ProviderChain:
         self.primary = primary
         self.fallback = fallback
         self.last_provider = "primary"
+        self.attempted_models: list[str] = []
+        self.attempted_providers: list[str] = []
+        self.fallback_attempted = False
+
+    @staticmethod
+    def _provider_name(provider: LLMProviderProtocol) -> str:
+        config = getattr(provider, "config", None)
+        return str(getattr(config, "provider", "unknown") or "unknown")
+
+    @staticmethod
+    def _model_name(provider: LLMProviderProtocol) -> str:
+        effective = getattr(provider, "effective_model", None)
+        if isinstance(effective, str):
+            return effective
+        config = getattr(provider, "config", None)
+        return str(getattr(config, "model", "unknown") or "unknown")
+
+    def _record_attempt(self, provider: LLMProviderProtocol) -> None:
+        provider_name = self._provider_name(provider)
+        model_name = self._model_name(provider)
+        if provider_name not in self.attempted_providers:
+            self.attempted_providers.append(provider_name)
+        if model_name not in self.attempted_models:
+            self.attempted_models.append(model_name)
 
     @property
     def total_prompt_tokens(self) -> int:
@@ -48,6 +72,7 @@ class ProviderChain:
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         try:
             self.last_provider = "primary"
+            self._record_attempt(self.primary)
             return await getattr(self.primary, method)(*args, **kwargs)
         except NonRetriableLLMError:
             raise
@@ -59,21 +84,40 @@ class ProviderChain:
             logger.warning("Primary review provider failed transiently; using configured fallback")
             try:
                 self.last_provider = "fallback"
+                self.fallback_attempted = True
+                self._record_attempt(self.fallback)
                 return await getattr(self.fallback, method)(*args, **kwargs)
             except Exception as fallback_error:
-                raise LLMError("both_models_failed", primary_model="primary", fallback_model="fallback", error=fallback_error) from fallback_error
+                raise LLMError(
+                    "both_models_failed",
+                    primary_model="primary",
+                    fallback_model="fallback",
+                    error=fallback_error,
+                ) from fallback_error
 
-    async def complete(self, messages: list[dict[str, str]], json_mode: bool = True,
-                       temperature: float | None = None, max_tokens: int | None = None) -> str:
-        return await self._call("complete", messages, json_mode=json_mode,
-                                temperature=temperature, max_tokens=max_tokens)
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        json_mode: bool = True,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        return await self._call(
+            "complete",
+            messages,
+            json_mode=json_mode,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
-    async def complete_with_tools(self, messages: list[dict[str, str]], tools: list[dict],
-                                  temperature: float | None = None) -> str:
+    async def complete_with_tools(
+        self, messages: list[dict[str, str]], tools: list[dict], temperature: float | None = None
+    ) -> str:
         return await self._call("complete_with_tools", messages, tools, temperature=temperature)
 
-    async def complete_agentic(self, messages: list, tools: list[dict],
-                               temperature: float | None = None) -> dict:
+    async def complete_agentic(
+        self, messages: list, tools: list[dict], temperature: float | None = None
+    ) -> dict:
         return await self._call("complete_agentic", messages, tools, temperature=temperature)
 
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
