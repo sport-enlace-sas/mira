@@ -105,18 +105,34 @@ async def resolve_verified_threads(
     pr_info: PRInfo,
     bot_name: str | None,
     dry_run: bool,
+    allow_resolution: bool = True,
 ) -> tuple[int, int, list[UnresolvedThread], list[ThreadDecision]]:
-    """Resolve unresolved bot threads the LLM confirms as fixed.
+    """Verify all historical bot threads and resolve eligible open threads.
 
     Returns (threads_checked, threads_resolved, remaining_unresolved, decisions).
     """
-    threads = await provider.get_unresolved_bot_threads(pr_info, bot_name)
+    records = await provider.get_all_bot_threads(pr_info, bot_name)
+    resolved_before_audit = {record.thread_id for record in records if record.is_resolved}
+    threads = [
+        UnresolvedThread(
+            thread_id=record.thread_id,
+            path=record.path,
+            line=record.line,
+            body=record.body,
+            is_outdated=record.is_outdated,
+        )
+        for record in records
+    ]
+    # Compatibility for providers that have not implemented the all-thread
+    # method yet. GitHub/GitLab/Forgejo use the richer path above.
     if not threads:
-        logger.debug("No unresolved bot threads found for PR %s", pr_info.url)
+        threads = await provider.get_unresolved_bot_threads(pr_info, bot_name)
+    if not threads:
+        logger.debug("No bot threads found for PR %s", pr_info.url)
         return 0, 0, [], []
 
     logger.info(
-        "Found %d unresolved bot thread(s) to verify on PR %s",
+        "Found %d bot thread(s) to verify on PR %s",
         len(threads),
         pr_info.url,
     )
@@ -153,6 +169,9 @@ async def resolve_verified_threads(
         if verification.status in _RESOLVABLE_STATUSES
     ]
     verified_set = set(verified_ids)
+    open_verified_ids = [
+        thread_id for thread_id in verified_ids if thread_id not in resolved_before_audit
+    ]
 
     decisions = [
         ThreadDecision(
@@ -176,17 +195,17 @@ async def resolve_verified_threads(
     ]
 
     resolved = 0
-    if verified_ids:
+    if open_verified_ids and allow_resolution:
         if dry_run:
-            resolved = len(verified_ids)
-            logger.info("Dry run: would resolve %d thread(s): %s", resolved, verified_ids)
+            resolved = len(open_verified_ids)
+            logger.info("Dry run: would resolve %d thread(s): %s", resolved, open_verified_ids)
         else:
-            resolved = await provider.resolve_threads(pr_info, verified_ids)
-            if resolved < len(verified_ids):
+            resolved = await provider.resolve_threads(pr_info, open_verified_ids)
+            if resolved < len(open_verified_ids):
                 logger.error(
                     "Failed to resolve %d/%d verified-fixed thread(s) on PR %s",
-                    len(verified_ids) - resolved,
-                    len(verified_ids),
+                    len(open_verified_ids) - resolved,
+                    len(open_verified_ids),
                     pr_info.url,
                 )
 
@@ -197,5 +216,9 @@ async def resolve_verified_threads(
         resolved,
     )
 
-    remaining = [t for t in threads if t.thread_id not in verified_set]
+    remaining = [
+        thread
+        for thread in threads
+        if thread.thread_id not in resolved_before_audit and thread.thread_id not in verified_set
+    ]
     return len(threads), resolved, remaining, decisions
