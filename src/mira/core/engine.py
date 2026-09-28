@@ -65,7 +65,6 @@ from mira.models import (
     ThreadDecision,
     UnresolvedThread,
     WalkthroughResult,
-    build_review_stats,
 )
 from mira.providers.base import BaseProvider
 from mira.security.secrets_scan import scan_secrets
@@ -685,24 +684,11 @@ class ReviewEngine:
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
         async def _on_walkthrough_ready(wt: WalkthroughResult | None) -> None:
-            if (
-                self.dry_run
-                or wt is None
-                or placeholder_id is None
-                or not self._can_publish()
-                or current_sha_already_recorded
-            ):
-                return
-            try:
-                markdown = wt.to_markdown(
-                    bot_name=self.bot_name or "miracodeai",
-                    in_progress=True,
-                    marker=walkthrough_marker,
-                )
-                await self.provider.update_comment(pr_info, placeholder_id, markdown)
+            # Keep the generated walkthrough available for failure reporting,
+            # but do not publish a transient full-format comment.  The same
+            # placeholder is finalized once with the compact immutable report.
+            if wt is not None:
                 _walkthrough_result[0] = wt
-            except Exception as exc:
-                logger.warning("Failed to post in-progress walkthrough: %s", exc)
 
         # Round 2+ raises the comment threshold so we converge instead of
         # dripping new findings on every push. review-rest is a continuation of
@@ -957,105 +943,6 @@ class ReviewEngine:
             _clamp_confidence_to_findings(result.walkthrough, result.comments)
             if self.dry_run:
                 logger.info("Dry run: skipping walkthrough comment posting")
-            else:
-                try:
-                    stats = build_review_stats(result.comments)
-
-                    cross_repo_blast: list[dict] | None = None
-                    if self.config.review.blast_radius:
-                        try:
-                            from mira.index.relationships import RelationshipStore
-
-                            rs = RelationshipStore()
-                            full_name = f"{pr_info.owner}/{pr_info.repo}"
-                            edges = rs.resolve_edges()
-                            dependents = [
-                                {
-                                    "repo": e.source_repo,
-                                    "files": [{"kind": r.kind, "target": r.target} for r in e.refs],
-                                }
-                                for e in edges
-                                if e.target_repo == full_name
-                            ]
-                            rs.close()
-
-                            # Privacy: a public repo's review is world-readable,
-                            # so it must not name dependents that aren't known
-                            # public. Filter unless the reviewed repo is *known*
-                            # private; keep only dependents known public. Unknown
-                            # visibility (NULL) is treated as private — safe until
-                            # a sync records the real value.
-                            from mira.dashboard.api import _app_db
-
-                            def _dep_private(name: str) -> bool | None:
-                                parts = name.split("/", 1)
-                                rec = _app_db.get_repo(*parts) if len(parts) == 2 else None
-                                return rec.private if rec else None
-
-                            reviewed = _app_db.get_repo(pr_info.owner, pr_info.repo)
-                            kept = filter_blast_radius_for_visibility(
-                                dependents,
-                                reviewed.private if reviewed else None,
-                                _dep_private,
-                            )
-                            if len(kept) != len(dependents):
-                                logger.info(
-                                    "Blast radius: hid %d dependent(s) not known-public from %s",
-                                    len(dependents) - len(kept),
-                                    full_name,
-                                )
-                            dependents = kept
-
-                            if dependents:
-                                cross_repo_blast = dependents
-                        except Exception:
-                            pass
-
-                    import os as _os
-
-                    provider_chains = (self.llm, self.indexing_llm, self.security_llm)
-                    fallback_used = any(
-                        getattr(candidate, "last_provider", "primary") == "fallback"
-                        for candidate in provider_chains
-                    )
-                    provider_used = (
-                        self.config.llm.fallback_provider
-                        if fallback_used
-                        else self.config.llm.provider
-                    ) or "unknown"
-
-                    markdown = result.walkthrough.to_markdown(
-                        bot_name=self.bot_name,
-                        review_stats=stats,
-                        existing_issues=len(unresolved_threads),
-                        blast_radius=cross_repo_blast,
-                        reviewed_files=result.reviewed_files,
-                        total_comments=len(result.comments),
-                        key_issues=result.key_issues or None,
-                        skipped_paths=result.skipped_paths or None,
-                        total_paths=result.total_paths or None,
-                        index_was_empty=getattr(self, "_index_was_empty", False),
-                        dashboard_url=_os.environ.get("MIRA_DASHBOARD_URL", ""),
-                        overlaps=overlaps or None,
-                        advisory_comments=result.comments,
-                        head_sha=pr_info.head_sha,
-                        full_pr_revalidation=self.config.review.full_revalidation_on_synchronize,
-                        historical_findings=len(all_bot_threads),
-                        provider_used=provider_used,
-                        fallback_used=fallback_used,
-                        marker=walkthrough_marker,
-                    )
-                    comment_id = placeholder_id
-                    if comment_id is None:
-                        comment_id = await self.provider.find_bot_comment(
-                            pr_info, walkthrough_marker
-                        )
-                    if comment_id is not None:
-                        await self.provider.update_comment(pr_info, comment_id, markdown)
-                    else:
-                        await self.provider.post_comment(pr_info, markdown)
-                except Exception as exc:
-                    logger.warning("Failed to post walkthrough comment: %s", exc)
         elif placeholder_id is not None and placeholder_created and self._can_publish():
             # No walkthrough (all files excluded, empty diff, or generation
             # failed) — finalize the placeholder so it doesn't sit on
@@ -1199,6 +1086,7 @@ class ReviewEngine:
                     full_pr_revalidation=self.config.review.full_revalidation_on_synchronize,
                     index_was_empty=getattr(self, "_index_was_empty", False),
                     bot_name=self.bot_name or "miracodeai",
+                    overlaps=overlaps or None,
                 )
                 comment_id = placeholder_id
                 if comment_id is None:

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 
 from mira.core.diff_parser import parse_diff
-from mira.models import FileDiff, ReviewComment, ThreadDecision, WalkthroughResult
+from mira.models import FileDiff, OverlapFinding, ReviewComment, ThreadDecision, WalkthroughResult
 
 _REPORT_KIND_RE = re.compile(r"[^a-z0-9_-]+")
 _SCOPE_RE = re.compile(r"[^a-z0-9._-]+")
@@ -615,6 +615,7 @@ def build_compact_audit_report(
     skipped_paths: list[str] | None = None,
     total_paths: list[str] | None = None,
     index_was_empty: bool = False,
+    overlaps: list[OverlapFinding] | None = None,
 ) -> str:
     """Render one high-signal, immutable audit comment for a reviewed SHA."""
     parts = [
@@ -636,6 +637,35 @@ def build_compact_audit_report(
         context.append(f"provider `{_code_span(provider)}`")
     if context:
         parts.append(" · ".join(context))
+
+    if walkthrough.sequence_diagram:
+        from mira.llm.mermaid import harden_mermaid
+
+        diagram = harden_mermaid(walkthrough.sequence_diagram)
+        if diagram:
+            parts.extend(
+                [
+                    "",
+                    "<details>",
+                    "<summary>Flow diagram</summary>",
+                    "",
+                    "```mermaid",
+                    diagram,
+                    "```",
+                    "",
+                    "</details>",
+                ]
+            )
+
+    if overlaps:
+        parts.extend(["", "> ⚠️ **Potential overlap with other open PRs:**"])
+        for overlap in overlaps[:3]:
+            link = (
+                f"[#{overlap.pr_number}]({overlap.url})" if overlap.url else f"#{overlap.pr_number}"
+            )
+            parts.append(f"> - {link} · {_single_line(overlap.reason)}")
+        if len(overlaps) > 3:
+            parts.append(f"> - _…and {len(overlaps) - 3} more_")
 
     parts.extend(["", "### Affected surfaces", ""])
     surface_rows = impact.surface_rows()
