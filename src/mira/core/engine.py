@@ -29,6 +29,11 @@ from mira.core.passes import (
     self_critique,
 )
 from mira.core.priority import rank_files
+from mira.core.review_reports import (
+    analyze_pr_impact,
+    build_evolution_report,
+    make_report_marker,
+)
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.exceptions import MiraError, ResponseParseError
 from mira.index.context import build_code_context
@@ -47,7 +52,6 @@ from mira.llm.response_parser import (
 from mira.models import (
     PR_SUMMARY_END,
     PR_SUMMARY_START,
-    WALKTHROUGH_MARKER,
     BotThreadRecord,
     FileChangeType,
     KeyIssue,
@@ -437,21 +441,30 @@ class ReviewEngine:
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
 
-    async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
+    async def _post_placeholder_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
 
-        Uses the walkthrough marker so subsequent updates can swap in the
-        real walkthrough + review stats in place.
+        Uses the exact SHA-scoped marker so only this audit can be updated.
         """
         if not self.provider or not self._can_publish():
             return None
-        placeholder = f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
-        existing_id = await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
+        placeholder = f"{marker}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
+        existing_id = await self.provider.find_bot_comment(pr_info, marker)
         if existing_id is not None:
             await self.provider.update_comment(pr_info, existing_id, placeholder)
             return existing_id
         await self.provider.post_comment(pr_info, placeholder)
-        return await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
+        return await self.provider.find_bot_comment(pr_info, marker)
+
+    async def _publish_sha_report(self, pr_info: PRInfo, marker: str, body: str) -> None:
+        """Create a report, or replace only the same kind from the same SHA."""
+        if not self.provider or not self._can_publish() or self.dry_run:
+            return
+        existing_id = await self.provider.find_bot_comment(pr_info, marker)
+        if existing_id is not None:
+            await self.provider.update_comment(pr_info, existing_id, body)
+        else:
+            await self.provider.post_comment(pr_info, body)
 
     @staticmethod
     def _format_failure_notice(exc: BaseException) -> str:
@@ -557,6 +570,29 @@ class ReviewEngine:
 
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
+        # GitHub/GitLab providers normally supply head_sha. A unique run scope
+        # is safer than falling back to the legacy cross-SHA marker if they do
+        # not: it may duplicate a retry, but it can never rewrite old history.
+        report_scope = pr_info.head_sha.strip().lower() or (
+            f"pr-{pr_info.number}-run-{_time.time_ns()}"
+        )
+        walkthrough_marker = make_report_marker("walkthrough", report_scope)
+
+        previous_reviewed_sha = ""
+        try:
+            from mira.dashboard.api import _app_db
+
+            previous_reviewed_sha = (
+                _app_db.get_last_reviewed_sha(
+                    pr_info.owner,
+                    pr_info.repo,
+                    pr_info.number,
+                    platform=pr_info.platform,
+                )
+                or ""
+            )
+        except Exception as exc:
+            logger.debug("Failed to load previous reviewed SHA: %s", exc)
 
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
@@ -593,7 +629,7 @@ class ReviewEngine:
         placeholder_id: int | None = None
         if not self.dry_run:
             try:
-                placeholder_id = await self._post_placeholder_comment(pr_info)
+                placeholder_id = await self._post_placeholder_comment(pr_info, walkthrough_marker)
             except Exception as exc:
                 logger.warning("Failed to post walkthrough placeholder: %s", exc)
 
@@ -606,6 +642,7 @@ class ReviewEngine:
                 markdown = wt.to_markdown(
                     bot_name=self.bot_name or "miracodeai",
                     in_progress=True,
+                    marker=walkthrough_marker,
                 )
                 await self.provider.update_comment(pr_info, placeholder_id, markdown)
                 _walkthrough_result[0] = wt
@@ -812,10 +849,11 @@ class ReviewEngine:
                             bot_name=self.bot_name or "miracodeai",
                             in_progress=False,
                             failure_notice=self._format_failure_notice(exc),
+                            marker=walkthrough_marker,
                         )
                     else:
                         failure_body = (
-                            f"{WALKTHROUGH_MARKER}\n"
+                            f"{walkthrough_marker}\n"
                             "## Mira PR Walkthrough\n\n"
                             "---\n\n"
                             "<details>\n"
@@ -950,11 +988,12 @@ class ReviewEngine:
                         historical_findings=len(all_bot_threads),
                         provider_used=provider_used,
                         fallback_used=fallback_used,
+                        marker=walkthrough_marker,
                     )
                     comment_id = placeholder_id
                     if comment_id is None:
                         comment_id = await self.provider.find_bot_comment(
-                            pr_info, WALKTHROUGH_MARKER
+                            pr_info, walkthrough_marker
                         )
                     if comment_id is not None:
                         await self.provider.update_comment(pr_info, comment_id, markdown)
@@ -967,7 +1006,7 @@ class ReviewEngine:
             # failed) — finalize the placeholder so it doesn't sit on
             # "Reviewing this PR…" forever.
             reason = result.skipped_reason or "Walkthrough was not generated."
-            markdown = f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n*{reason}*\n"
+            markdown = f"{walkthrough_marker}\n## Mira PR Walkthrough\n\n*{reason}*\n"
             try:
                 await self.provider.update_comment(pr_info, placeholder_id, markdown)
             except Exception as exc:
@@ -1016,6 +1055,87 @@ class ReviewEngine:
 
         result.thread_decisions = thread_decisions
 
+        # Publish two immutable companion reports after inline findings so the
+        # PR reads chronologically: audit, finding evolution, then impact.
+        if not self.dry_run and self._can_publish():
+            decided_ids = {decision.thread_id for decision in thread_decisions}
+            unverifiable_threads = [
+                ThreadDecision(
+                    thread_id=thread.thread_id,
+                    path=thread.path,
+                    line=thread.line,
+                    body=thread.body,
+                    fixed=False,
+                    status="unverifiable",
+                    evidence="Automatic verification did not complete for this finding.",
+                )
+                for thread in all_bot_threads
+                if not thread.is_resolved and thread.thread_id not in decided_ids
+            ]
+            historical_resolved_threads = [
+                ThreadDecision(
+                    thread_id=thread.thread_id,
+                    path=thread.path,
+                    line=thread.line,
+                    body=thread.body,
+                    fixed=False,
+                    status="resolved_before_audit",
+                    evidence=(
+                        "The review thread was already resolved before this audit; "
+                        "the cause was not re-adjudicated."
+                    ),
+                )
+                for thread in all_bot_threads
+                if thread.is_resolved
+            ]
+            evolution = build_evolution_report(
+                head_sha=report_scope,
+                previous_sha=previous_reviewed_sha,
+                decisions=thread_decisions,
+                new_findings=result.comments,
+                unverifiable_threads=unverifiable_threads,
+                historical_resolved_threads=historical_resolved_threads,
+            )
+            try:
+                await self._publish_sha_report(
+                    pr_info,
+                    make_report_marker("evolution", report_scope),
+                    evolution,
+                )
+            except Exception as exc:
+                logger.warning("Failed to publish finding evolution report: %s", exc)
+
+            blast_radius_paths: list[str] = []
+            impact_store = None
+            try:
+                changed_paths = [file.path for file in parse_diff(full_diff_text).files]
+                impact_store = IndexStore.open(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
+                blast_radius_paths = [
+                    entry.path for entry in impact_store.get_blast_radius(changed_paths)
+                ]
+            except Exception as exc:
+                logger.debug("Static impact blast radius unavailable: %s", exc)
+            finally:
+                if impact_store is not None:
+                    impact_store.close()
+            try:
+                impact = analyze_pr_impact(
+                    full_diff_text,
+                    head_sha=report_scope,
+                    walkthrough=result.walkthrough,
+                    blast_radius_paths=blast_radius_paths,
+                    web_base_urls=self.config.review.web_base_urls,
+                )
+                await self._publish_sha_report(
+                    pr_info,
+                    make_report_marker("impact", report_scope),
+                    impact.to_markdown(),
+                )
+            except Exception as exc:
+                logger.warning("Failed to publish static impact report: %s", exc)
+
         try:
             import json as _json
 
@@ -1046,6 +1166,9 @@ class ReviewEngine:
                 author=pr_info.author,
                 author_avatar_url=pr_info.author_avatar_url,
                 reviewed_paths=reviewed_paths_json,
+                base_sha=pr_info.base_sha,
+                head_sha=pr_info.head_sha,
+                previous_head_sha=previous_reviewed_sha,
             )
             # Persist each comment Mira posted so the dashboard can show the
             # actual review conversation, not just aggregate counts.

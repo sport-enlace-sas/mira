@@ -187,9 +187,7 @@ async def run_pr_review(
                     or "unknown",
                     fallback_used=fallback_used,
                     models_attempted=" -> ".join(attempted_models),
-                    audit_duration_ms=max(
-                        0, int((time.monotonic() - review_started_at) * 1000)
-                    ),
+                    audit_duration_ms=max(0, int((time.monotonic() - review_started_at) * 1000)),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                 )

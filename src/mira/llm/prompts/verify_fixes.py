@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from mira.llm.utils import strip_code_fences, strip_think_blocks
-from mira.models import UnresolvedThread
+from mira.models import FixVerification, UnresolvedThread
 
 # Markers that signal the start of noise sections in formatted review comments.
 # Everything from these markers onward is stripped before inclusion in prompts.
@@ -100,41 +100,74 @@ def build_verify_fixes_prompt(
                 "1. Look at the referenced line number in the current code.\n"
                 "2. Check if the EXACT problematic code pattern described in "
                 "the issue is still present at or near that line.\n"
-                "3. Mark as fixed (true) if ANY of these apply:\n"
-                "   - The problematic pattern has been removed or replaced.\n"
-                "   - The issue description does not match the actual code "
-                "(i.e. the issue was wrong or outdated).\n"
-                "   - The code at the referenced location has changed such "
-                "that the concern no longer applies.\n"
-                "4. Mark as not fixed (false) ONLY if the exact problematic "
-                "pattern described in the issue is still clearly present.\n\n"
-                "Issues tagged [OUTDATED] have been flagged by GitHub as having "
-                "changed code around them — these are very likely fixed.\n\n"
+                "3. Assign exactly one status:\n"
+                "   - fixed_by_code: the problematic behavior was removed or corrected.\n"
+                "   - still_present: the problematic behavior is clearly still present.\n"
+                "   - rejected_false_positive: the original finding was incorrect; the "
+                "code was already safe without a corrective change.\n"
+                "   - outdated_or_moved: the referenced code moved or disappeared and the "
+                "specific concern no longer maps to a current location.\n"
+                "   - unverifiable: the available code is insufficient or ambiguous.\n"
+                "4. Include short, code-specific evidence. Never call a false positive "
+                "fixed_by_code. Never infer a fix only because GitHub marked a line outdated.\n\n"
                 "Respond with ONLY the JSON object below, no other text:\n"
-                '{"results": [{"id": "<thread_id>", "fixed": true/false}, ...]}'
+                '{"results": [{"id": "<thread_id>", "status": "<status>", '
+                '"evidence": "<current-code evidence>"}, ...]}'
             ),
         },
         {"role": "user", "content": user_content},
     ]
 
 
-def parse_verify_fixes_response(raw: str) -> list[str]:
-    """Parse the LLM response and return thread IDs confirmed as fixed."""
+_VALID_STATUSES = {
+    "fixed_by_code",
+    "still_present",
+    "rejected_false_positive",
+    "outdated_or_moved",
+    "unverifiable",
+}
+_RESOLVABLE_STATUSES = {"fixed_by_code", "rejected_false_positive"}
+
+
+def parse_verify_fix_results(raw: str) -> dict[str, FixVerification]:
+    """Parse structured results; malformed or unknown statuses stay unverifiable."""
     import json
 
     try:
         data = json.loads(strip_think_blocks(strip_code_fences(raw)))
     except (json.JSONDecodeError, TypeError):
-        return []
+        return {}
 
     results = data.get("results")
     if not isinstance(results, list):
-        return []
+        return {}
 
-    fixed_ids: list[str] = []
+    parsed: dict[str, FixVerification] = {}
     for entry in results:
         if not isinstance(entry, dict):
             continue
-        if entry.get("fixed") is True and isinstance(entry.get("id"), str):
-            fixed_ids.append(entry["id"])
-    return fixed_ids
+        thread_id = entry.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            continue
+        status = entry.get("status")
+        # Backwards compatibility with cached/older model responses.
+        if status is None and isinstance(entry.get("fixed"), bool):
+            status = "fixed_by_code" if entry["fixed"] else "still_present"
+        if status not in _VALID_STATUSES:
+            status = "unverifiable"
+        evidence = entry.get("evidence")
+        parsed[thread_id] = FixVerification(
+            thread_id=thread_id,
+            status=status,
+            evidence=evidence if isinstance(evidence, str) else "",
+        )
+    return parsed
+
+
+def parse_verify_fixes_response(raw: str) -> list[str]:
+    """Return IDs safe to resolve while preserving the legacy public API."""
+    return [
+        thread_id
+        for thread_id, result in parse_verify_fix_results(raw).items()
+        if result.status in _RESOLVABLE_STATUSES
+    ]

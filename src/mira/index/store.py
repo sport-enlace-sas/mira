@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS review_events (
     categories TEXT NOT NULL DEFAULT '',
     author_avatar_url TEXT NOT NULL DEFAULT '',
     reviewed_paths TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    previous_head_sha TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0
 );
 
@@ -265,6 +268,9 @@ class ReviewEvent:
     created_at: float = 0.0
     author_avatar_url: str = ""
     reviewed_paths: str = ""  # JSON array of filenames reviewed this pass
+    base_sha: str = ""
+    head_sha: str = ""
+    previous_head_sha: str = ""
 
 
 @dataclass
@@ -387,7 +393,14 @@ class IndexStore(_StoreSharedMixin):
             self._conn.execute("ALTER TABLE files ADD COLUMN loc INTEGER NOT NULL DEFAULT 0")
         # Columns added to review_events post-schema (PR author + reviewed files).
         re_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(review_events)").fetchall()}
-        for col in ("author", "author_avatar_url", "reviewed_paths"):
+        for col in (
+            "author",
+            "author_avatar_url",
+            "reviewed_paths",
+            "base_sha",
+            "head_sha",
+            "previous_head_sha",
+        ):
             if col not in re_cols:
                 self._conn.execute(
                     f"ALTER TABLE review_events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
@@ -678,14 +691,18 @@ class IndexStore(_StoreSharedMixin):
         author: str = "",
         author_avatar_url: str = "",
         reviewed_paths: str = "",
+        base_sha: str = "",
+        head_sha: str = "",
+        previous_head_sha: str = "",
     ) -> ReviewEvent:
         now = created_at if created_at is not None else time.time()
         self._conn.execute(
             "INSERT INTO review_events "
             "(pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, author_avatar_url, reviewed_paths, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "categories, author_avatar_url, reviewed_paths, base_sha, head_sha, "
+            "previous_head_sha, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pr_number,
                 pr_title,
@@ -702,6 +719,9 @@ class IndexStore(_StoreSharedMixin):
                 categories,
                 author_avatar_url,
                 reviewed_paths,
+                base_sha,
+                head_sha,
+                previous_head_sha,
                 now,
             ),
         )
@@ -725,13 +745,17 @@ class IndexStore(_StoreSharedMixin):
             created_at=now,
             author_avatar_url=author_avatar_url,
             reviewed_paths=reviewed_paths,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            previous_head_sha=previous_head_sha,
         )
 
     def list_review_events(self, limit: int = 100) -> list[ReviewEvent]:
         rows = self._conn.execute(
             "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author_avatar_url, reviewed_paths "
+            "categories, created_at, author_avatar_url, reviewed_paths, base_sha, head_sha, "
+            "previous_head_sha "
             "FROM review_events ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -754,6 +778,9 @@ class IndexStore(_StoreSharedMixin):
                 created_at=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                base_sha=r[17],
+                head_sha=r[18],
+                previous_head_sha=r[19],
             )
             for r in rows
         ]
@@ -762,7 +789,8 @@ class IndexStore(_StoreSharedMixin):
         rows = self._conn.execute(
             "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author_avatar_url, reviewed_paths "
+            "categories, created_at, author_avatar_url, reviewed_paths, base_sha, head_sha, "
+            "previous_head_sha "
             "FROM review_events WHERE pr_number = ? ORDER BY created_at DESC",
             (pr_number,),
         ).fetchall()
@@ -785,6 +813,9 @@ class IndexStore(_StoreSharedMixin):
                 created_at=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                base_sha=r[17],
+                head_sha=r[18],
+                previous_head_sha=r[19],
             )
             for r in rows
         ]

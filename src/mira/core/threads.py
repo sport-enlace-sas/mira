@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 
-from mira.llm.prompts.verify_fixes import build_verify_fixes_prompt, parse_verify_fixes_response
+from mira.llm.prompts.verify_fixes import (
+    _RESOLVABLE_STATUSES,
+    build_verify_fixes_prompt,
+    parse_verify_fix_results,
+    parse_verify_fixes_response,
+)
 from mira.llm.provider import LLMProvider
-from mira.models import PRInfo, ThreadDecision, UnresolvedThread
+from mira.models import FixVerification, PRInfo, ThreadDecision, UnresolvedThread
 from mira.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -82,6 +87,18 @@ async def verify_fixes(
     return parse_verify_fixes_response(response)
 
 
+async def verify_fix_decisions(
+    llm: LLMProvider,
+    file_groups: list[tuple[str, str, list[UnresolvedThread]]],
+) -> dict[str, FixVerification]:
+    """Ask for structured finding states used by evolution reporting."""
+    prompt = build_verify_fixes_prompt(file_groups)
+    logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
+    response = await llm.complete(prompt, json_mode=True, temperature=0.0)
+    logger.debug("Verify-fixes raw response:\n%s", response)
+    return parse_verify_fix_results(response)
+
+
 async def resolve_verified_threads(
     provider: BaseProvider,
     llm: LLMProvider,
@@ -129,7 +146,12 @@ async def resolve_verified_threads(
                 snippet = _extract_sections(lines, path_threads, _LARGE_FILE_CONTEXT_LINES)
                 file_groups.append((path, snippet, path_threads))
 
-    verified_ids = await verify_fixes(llm, file_groups)
+    verifications = await verify_fix_decisions(llm, file_groups)
+    verified_ids = [
+        thread_id
+        for thread_id, verification in verifications.items()
+        if verification.status in _RESOLVABLE_STATUSES
+    ]
     verified_set = set(verified_ids)
 
     decisions = [
@@ -139,6 +161,16 @@ async def resolve_verified_threads(
             line=t.line,
             body=t.body,
             fixed=t.thread_id in verified_set,
+            status=(
+                verifications[t.thread_id].status
+                if t.thread_id in verifications
+                else "unverifiable"
+            ),
+            evidence=(
+                verifications[t.thread_id].evidence
+                if t.thread_id in verifications
+                else "The verifier did not return a valid decision for this finding."
+            ),
         )
         for t in threads
     ]

@@ -233,9 +233,10 @@ class WalkthroughResult:
         historical_findings: int = 0,
         provider_used: str = "",
         fallback_used: bool = False,
+        marker: str = WALKTHROUGH_MARKER,
     ) -> str:
         """Render as a markdown PR comment."""
-        parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
+        parts = [marker, "## Mira PR Walkthrough", ""]
         parts.append(self.summary)
 
         # One durable summary comment carries the same evidence-first rubric
@@ -443,6 +444,19 @@ class ThreadDecision:
     line: int
     body: str
     fixed: bool
+    # Why the thread was or was not resolved. Kept separate from ``fixed`` so
+    # a correction is never conflated with a rejected false positive.
+    status: str = ""
+    evidence: str = ""
+
+
+@dataclass(frozen=True)
+class FixVerification:
+    """Structured verification result for one historical finding."""
+
+    thread_id: str
+    status: str
+    evidence: str = ""
 
 
 @dataclass

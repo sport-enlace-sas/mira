@@ -200,6 +200,9 @@ class ReviewEventModel(BaseModel):
     duration_ms: int
     categories: str
     created_at: float
+    base_sha: str = ""
+    head_sha: str = ""
+    previous_head_sha: str = ""
 
 
 class ActivityEventModel(ReviewEventModel):
@@ -1371,6 +1374,9 @@ def get_activity_detail(owner: str, repo: str, pr_number: int) -> ActivityDetail
                 duration_ms=e.duration_ms,
                 categories=e.categories,
                 created_at=e.created_at,
+                base_sha=e.base_sha,
+                head_sha=e.head_sha,
+                previous_head_sha=e.previous_head_sha,
                 reviewed_paths=_paths(e.reviewed_paths),
                 comments=comments_by_review.get(e.id, []),
             )
