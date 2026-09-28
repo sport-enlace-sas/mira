@@ -608,6 +608,9 @@ def list_reviews(owner: str, repo: str, limit: int = 50) -> list[ReviewEventMode
                 duration_ms=e.duration_ms,
                 categories=e.categories,
                 created_at=e.created_at,
+                base_sha=e.base_sha,
+                head_sha=e.head_sha,
+                previous_head_sha=e.previous_head_sha,
             )
             for e in events
         ]

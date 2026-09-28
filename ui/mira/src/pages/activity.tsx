@@ -1079,6 +1079,14 @@ function ReviewEntry({
         {plural(review.comments_posted, "comment")} · {review.lines_changed.toLocaleString()} lines ·{" "}
         {review.tokens_used.toLocaleString()} tokens · {(review.duration_ms / 1000).toFixed(1)}s
       </div>
+      {review.head_sha && (
+        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+          SHA {review.head_sha.slice(0, 12)}
+          {review.previous_head_sha
+            ? ` · previous ${review.previous_head_sha.slice(0, 12)}`
+            : " · first recorded audit"}
+        </div>
+      )}
     </>
   )
 }

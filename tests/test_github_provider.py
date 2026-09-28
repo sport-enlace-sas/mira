@@ -67,7 +67,9 @@ class TestGitHubProvider:
         provider = GitHubProvider.__new__(GitHubProvider)
         provider._token_supplier = _async_constant("test-token")
         repo = MagicMock()
-        provider._make_client = MagicMock(return_value=MagicMock(get_repo=MagicMock(return_value=repo)))
+        provider._make_client = MagicMock(
+            return_value=MagicMock(get_repo=MagicMock(return_value=repo))
+        )
         info = _make_pr_info()
         info.head_sha = "abc123"
 

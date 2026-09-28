@@ -130,6 +130,8 @@ def mock_provider(sample_diff_text: str) -> AsyncMock:
         number=1,
         owner="test",
         repo="repo",
+        head_sha="a" * 40,
+        base_sha="b" * 40,
     )
     provider.get_pr_diff.return_value = sample_diff_text
     provider.post_review = AsyncMock()
@@ -552,7 +554,7 @@ class TestReviewEngine:
         mock_provider.post_comment.assert_called_once()
         placeholder_body = mock_provider.post_comment.call_args[0][1]
         assert "Reviewing this PR" in placeholder_body
-        assert "<!-- mira-walkthrough -->" in placeholder_body
+        assert "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->" in placeholder_body
 
         # 2. In-progress walkthrough update (the one triggered by the callback)
         #    and 3. final walkthrough update with stats.
@@ -566,7 +568,11 @@ class TestReviewEngine:
         )
         assert in_progress_update is not None, "expected an in-progress walkthrough update"
         # The final update must contain stats (review comments count).
-        final_update = update_bodies[-1]
+        final_update = next(
+            body
+            for body in update_bodies
+            if "PR walkthrough summary" in body and "Code review in progress" not in body
+        )
         assert "Code review in progress" not in final_update
         assert "PR walkthrough summary" in final_update
 
@@ -574,21 +580,76 @@ class TestReviewEngine:
         mock_provider.post_review.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_walkthrough_upserts_existing_comment(
+    async def test_walkthrough_upserts_existing_comment_for_same_sha(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """Existing walkthrough comment is edited in place for both the
         placeholder and the final walkthrough — no new comment created."""
-        mock_provider.find_bot_comment = AsyncMock(return_value=42)
+        markers_to_ids = {
+            "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->": 42,
+            "<!-- mira-report:evolution:" + ("a" * 40) + " -->": 43,
+            "<!-- mira-report:impact:" + ("a" * 40) + " -->": 44,
+        }
+        mock_provider.find_bot_comment = AsyncMock(
+            side_effect=lambda _pr, marker: markers_to_ids.get(marker)
+        )
 
         engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Placeholder update + final walkthrough update = 2 edits on comment 42
         assert mock_provider.update_comment.call_count >= 2
-        for call in mock_provider.update_comment.call_args_list:
-            assert call[0][1] == 42
+        walkthrough_updates = [
+            call
+            for call in mock_provider.update_comment.call_args_list
+            if "mira-report:walkthrough" in call.args[2]
+        ]
+        assert walkthrough_updates
+        assert all(call.args[1] == 42 for call in walkthrough_updates)
         mock_provider.post_comment.assert_not_called()
+
+        markers = [call.args[1] for call in mock_provider.find_bot_comment.call_args_list]
+        assert markers
+        assert set(markers) == set(markers_to_ids)
+
+    @pytest.mark.asyncio
+    async def test_walkthrough_does_not_lookup_or_edit_legacy_cross_sha_comment(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """The old global marker must never be reused by a SHA-scoped audit."""
+        legacy_id = 42
+
+        async def find_comment(_pr_info, marker):
+            if marker == WALKTHROUGH_MARKER:
+                return legacy_id
+            return None
+
+        mock_provider.find_bot_comment = AsyncMock(side_effect=find_comment)
+
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        looked_up_markers = [call.args[1] for call in mock_provider.find_bot_comment.call_args_list]
+        assert WALKTHROUGH_MARKER not in looked_up_markers
+        assert all(
+            call.args[1] != legacy_id for call in mock_provider.update_comment.call_args_list
+        )
+        assert any(
+            "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->" in call.args[1]
+            for call in mock_provider.post_comment.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_publishes_evolution_and_impact_reports_per_sha(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        posted_bodies = [call.args[1] for call in mock_provider.post_comment.call_args_list]
+        assert any("<!-- mira-report:evolution:" + ("a" * 40) + " -->" in b for b in posted_bodies)
+        assert any("<!-- mira-report:impact:" + ("a" * 40) + " -->" in b for b in posted_bodies)
 
     @pytest.mark.asyncio
     async def test_walkthrough_creates_when_no_existing(
@@ -777,6 +838,7 @@ class TestReviewEngine:
             number=1,
             owner="test",
             repo="repo",
+            head_sha="c" * 40,
         )
         mock_provider.get_pr_info.return_value = pr_info
         mock_provider.get_pr_diff.return_value = sample_diff_text
@@ -796,7 +858,7 @@ class TestReviewEngine:
         call_args = mock_provider.update_comment.call_args
         assert call_args[0][1] == 42, "must update the placeholder comment by ID"
         body = call_args[0][2]
-        assert WALKTHROUGH_MARKER in body
+        assert "<!-- mira-report:walkthrough:" + ("c" * 40) + " -->" in body
         assert "Code review" in body
         assert "ValueError" in body
 
@@ -1491,7 +1553,9 @@ class TestIncrementalDiff:
         monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
         config = MiraConfig()
         config.review.full_revalidation_on_synchronize = True
-        engine = ReviewEngine(config=config, llm=AsyncMock(), provider=mock_provider, bot_name="mira")
+        engine = ReviewEngine(
+            config=config, llm=AsyncMock(), provider=mock_provider, bot_name="mira"
+        )
 
         await engine.review_pr("https://github.com/o/r/pull/1")
 

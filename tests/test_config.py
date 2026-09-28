@@ -203,6 +203,18 @@ class TestWalkthroughConfig:
         assert config.review.walkthrough is True
         assert config.review.walkthrough_sequence_diagram is True
 
+    def test_web_base_urls_are_explicit_and_https(self):
+        from mira.config import ReviewConfig
+
+        config = ReviewConfig(web_base_urls={"apps/frontends/web": "https://app.example.com/"})
+        assert config.web_base_urls == {"apps/frontends/web": "https://app.example.com"}
+
+    def test_web_base_urls_reject_non_http_url(self):
+        from mira.config import ReviewConfig
+
+        with pytest.raises(ValueError):
+            ReviewConfig(web_base_urls={"apps/web": "javascript:alert(1)"})
+
 
 class TestGlobalDefaults:
     """Layered config: deployment-wide global → per-repo `.mira.yaml` → overrides."""

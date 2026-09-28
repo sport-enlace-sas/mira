@@ -197,6 +197,10 @@ class ReviewConfig(BaseModel):
     focus_only_on_problems: bool = False
     walkthrough: bool = True
     walkthrough_sequence_diagram: bool = True
+    # Optional app-root -> deployed base URL mapping for the static impact
+    # report. Mira never guesses domains; without a mapping it reports only
+    # repository-derived route paths.
+    web_base_urls: dict[str, str] = Field(default_factory=dict)
     # Write an AI-generated "Summary by Mira" release-notes block into the
     # PR/MR description body. "disable" (default) = off; "append" = add/update the
     # marked block preserving the author's description; "replace" = set the entire
@@ -308,6 +312,22 @@ class ReviewConfig(BaseModel):
     ocr_rule_path: str = ""
     ocr_timeout_seconds: int = Field(default=90, ge=5, le=600)
     ocr_max_rule_groups: int = Field(default=32, ge=1, le=128)
+
+    @field_validator("web_base_urls")
+    @classmethod
+    def _validate_web_base_urls(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for root, base_url in value.items():
+            clean_root = root.strip().strip("/")
+            parsed = urlparse(base_url.strip())
+            if not clean_root:
+                raise ValueError("review.web_base_urls keys must be non-empty repo paths")
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError(f"review.web_base_urls[{root!r}] must be an http(s) URL")
+            if parsed.scheme == "http" and not _is_local_host(parsed.hostname):
+                raise ValueError(f"review.web_base_urls[{root!r}] uses plain http to a public host")
+            normalized[clean_root] = base_url.strip().rstrip("/")
+        return normalized
 
 
 class IndexConfig(BaseModel):

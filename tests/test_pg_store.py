@@ -125,6 +125,26 @@ def test_add_and_list_review_comments(store):
     ]
 
 
+def test_review_events_persist_sha_lineage(store):
+    event = store.record_review(
+        pr_number=42,
+        pr_title="Fix auth",
+        pr_url="https://github.com/acme/widgets/pull/42",
+        comments_posted=1,
+        blockers=0,
+        warnings=1,
+        base_sha="b" * 40,
+        head_sha="c" * 40,
+        previous_head_sha="a" * 40,
+    )
+
+    assert event.head_sha == "c" * 40
+    loaded = store.list_review_events_for_pr(42)
+    assert loaded[0].base_sha == "b" * 40
+    assert loaded[0].head_sha == "c" * 40
+    assert loaded[0].previous_head_sha == "a" * 40
+
+
 def test_record_and_list_replies(store):
     row = store.record_reply(
         42,

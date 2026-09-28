@@ -192,6 +192,9 @@ export interface ReviewEventModel {
   duration_ms: number
   categories: string
   created_at: number
+  base_sha: string
+  head_sha: string
+  previous_head_sha: string
 }
 
 export interface ActivityEventModel extends ReviewEventModel {

@@ -485,7 +485,9 @@ async def dispatch_github_event(
         head_repo = payload.get("pull_request", {}).get("head", {}).get("repo") or {}
         base_full_name = payload.get("repository", {}).get("full_name", "")
         head_full_name = head_repo.get("full_name", "")
-        if head_repo.get("fork") or (head_full_name and base_full_name and head_full_name != base_full_name):
+        if head_repo.get("fork") or (
+            head_full_name and base_full_name and head_full_name != base_full_name
+        ):
             logger.info("PR from fork skipped for %s", base_full_name or "unknown repository")
             return "ignored"
 

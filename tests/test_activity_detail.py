@@ -42,6 +42,9 @@ def _seed(db: AppDatabase) -> None:
         author="octocat",
         author_avatar_url="https://avatars.example/octocat.png",
         reviewed_paths=json.dumps(["src/auth.ts", "src/session.ts"]),
+        base_sha="b" * 40,
+        head_sha="a" * 40,
+        previous_head_sha="",
     )
     store.add_review_comments(
         r1.id,
@@ -79,6 +82,9 @@ def _seed(db: AppDatabase) -> None:
         author="octocat",
         author_avatar_url="https://avatars.example/octocat.png",
         reviewed_paths=json.dumps(["src/auth.ts"]),
+        base_sha="b" * 40,
+        head_sha="c" * 40,
+        previous_head_sha="a" * 40,
     )
 
     # A human reply on the PR.
@@ -116,6 +122,9 @@ def test_activity_detail_returns_timeline(patched_db: AppDatabase):
     assert len(first.comments) == 2
     assert first.comments[0].body.startswith("Validate the JWT")
     assert first.reviewed_paths == ["src/auth.ts", "src/session.ts"]
+    assert first.head_sha == "a" * 40
+    latest = next(r for r in detail.reviews if r.created_at == 300.0)
+    assert latest.previous_head_sha == "a" * 40
     # Human reply captured for the timeline.
     assert len(detail.replies) == 1
     assert detail.replies[0].author == "alice"

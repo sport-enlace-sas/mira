@@ -7,6 +7,7 @@ import json
 from mira.llm.prompts.verify_fixes import (
     _extract_issue_description,
     build_verify_fixes_prompt,
+    parse_verify_fix_results,
     parse_verify_fixes_response,
 )
 from mira.models import UnresolvedThread
@@ -140,13 +141,15 @@ class TestBuildVerifyFixesPrompt:
         messages = build_verify_fixes_prompt([("src/app.py", "code", [_make_thread()])])
         system = messages[0]["content"]
         assert "JSON" in system
-        assert '"fixed"' in system
+        assert '"status"' in system
+        assert "rejected_false_positive" in system
+        assert "unverifiable" in system
 
     def test_system_prompt_not_overly_conservative(self):
         messages = build_verify_fixes_prompt([("src/app.py", "code", [_make_thread()])])
         system = messages[0]["content"]
         assert "if you are unsure" not in system.lower()
-        assert "mark as fixed" in system.lower()
+        assert "fixed_by_code" in system.lower()
 
     def test_formatted_body_cleaned_in_prompt(self):
         """Formatted review comment body is cleaned before inclusion in prompt."""
@@ -161,6 +164,52 @@ class TestBuildVerifyFixesPrompt:
 
 
 class TestParseVerifyFixesResponse:
+    def test_structured_statuses_preserve_why_thread_was_resolved(self):
+        raw = json.dumps(
+            {
+                "results": [
+                    {
+                        "id": "T1",
+                        "status": "fixed_by_code",
+                        "evidence": "The unsafe call was replaced.",
+                    },
+                    {
+                        "id": "T2",
+                        "status": "rejected_false_positive",
+                        "evidence": "The guard already covered this path.",
+                    },
+                    {
+                        "id": "T3",
+                        "status": "still_present",
+                        "evidence": "The unsafe call remains.",
+                    },
+                    {
+                        "id": "T4",
+                        "status": "outdated_or_moved",
+                        "evidence": "The location moved and needs a new review.",
+                    },
+                ]
+            }
+        )
+
+        results = parse_verify_fix_results(raw)
+
+        assert results["T1"].status == "fixed_by_code"
+        assert results["T2"].status == "rejected_false_positive"
+        assert results["T3"].status == "still_present"
+        assert results["T4"].status == "outdated_or_moved"
+        assert parse_verify_fixes_response(raw) == ["T1", "T2"]
+
+    def test_unknown_status_is_unverifiable_and_never_auto_resolved(self):
+        raw = json.dumps(
+            {"results": [{"id": "T1", "status": "probably_fixed", "evidence": "guess"}]}
+        )
+
+        results = parse_verify_fix_results(raw)
+
+        assert results["T1"].status == "unverifiable"
+        assert parse_verify_fixes_response(raw) == []
+
     def test_valid_response_all_fixed(self):
         raw = json.dumps(
             {

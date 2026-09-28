@@ -81,6 +81,10 @@ review:
   walkthrough: true
   # Include a Mermaid sequence diagram in the walkthrough
   walkthrough_sequence_diagram: true
+  # Optional app root -> deployed URL mapping used by the static impact report.
+  # Mira never guesses domains; without this it reports route paths only.
+  # web_base_urls:
+  #   apps/frontends/web: https://app.example.com
   # Write an AI-generated "Summary by Mira" block into the PR/MR description body.
   # disable (default) = off; append = add/update the marked block, preserving the
   #   author's description; replace = set the entire body to the summary block.
