@@ -556,11 +556,10 @@ class TestReviewEngine:
         assert wt.confidence_score is None
 
     @pytest.mark.asyncio
-    async def test_streaming_walkthrough_three_stages(
+    async def test_walkthrough_placeholder_then_single_compact_final(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
-        """End-to-end streaming flow: placeholder → in-progress walkthrough
-        → final walkthrough + inline review, in that order."""
+        """A new SHA goes from placeholder directly to one compact final report."""
         # Simulate GitHub: first lookup returns None (no existing comment),
         # subsequent lookups return the newly-created placeholder ID.
         mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7, 7, 7, 7])
@@ -574,27 +573,15 @@ class TestReviewEngine:
         assert "Reviewing this PR" in placeholder_body
         assert "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->" in placeholder_body
 
-        # 2. In-progress walkthrough update (the one triggered by the callback)
-        #    and 3. final walkthrough update with stats.
+        # 2. Exactly one final update; no transient full walkthrough is posted.
         update_bodies = [c[0][2] for c in mock_provider.update_comment.call_args_list]
-        assert len(update_bodies) >= 2
+        assert len(update_bodies) == 1
+        assert "Code review in progress" not in update_bodies[0]
+        assert "## Mira PR Walkthrough" not in update_bodies[0]
+        assert "## Mira Audit · `aaaaaaaaaaaa`" in update_bodies[0]
+        assert "PR walkthrough summary" in update_bodies[0]
 
-        # One of the updates must have "Code review in progress" (in-progress mode)
-        in_progress_update = next(
-            (b for b in update_bodies if "Code review in progress" in b),
-            None,
-        )
-        assert in_progress_update is not None, "expected an in-progress walkthrough update"
-        # The final update must contain stats (review comments count).
-        final_update = next(
-            body
-            for body in update_bodies
-            if "PR walkthrough summary" in body and "Code review in progress" not in body
-        )
-        assert "Code review in progress" not in final_update
-        assert "PR walkthrough summary" in final_update
-
-        # 4. Inline comments post fires once, at the end.
+        # 3. Inline comments post fires once, at the end.
         mock_provider.post_review.assert_called_once()
 
     @pytest.mark.asyncio
@@ -935,14 +922,12 @@ class TestReviewEngine:
         assert "ValueError" in body
 
     @pytest.mark.asyncio
-    async def test_review_failure_re_renders_walkthrough_without_in_progress(
+    async def test_review_failure_renders_captured_walkthrough_once(
         self,
         mock_provider: AsyncMock,
         sample_diff_text: str,
     ):
-        """When the walkthrough already landed in-progress, a subsequent
-        review failure must re-render it without the in-progress banner and
-        append the failure notice — not wipe it, not leave it stuck."""
+        """A failure renders the captured walkthrough without a transient update."""
         llm = MagicMock(spec=LLMProvider)
         llm.count_tokens = MagicMock(return_value=50)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -978,19 +963,13 @@ class TestReviewEngine:
         with pytest.raises(ValueError, match="LLM broke"):
             await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        # update_comment called twice: once for in-progress, once for failure
-        assert mock_provider.update_comment.call_count == 2
-        # First call: in-progress banner present
-        first_body = mock_provider.update_comment.call_args_list[0][0][2]
-        assert "in progress" in first_body.lower()
-        # Second call: no in-progress banner, walkthrough content preserved,
-        # failure notice appended
-        second_body = mock_provider.update_comment.call_args_list[1][0][2]
-        assert "in progress" not in second_body.lower()
-        assert "Walkthrough summary" in second_body
-        assert "<details>" in second_body
-        assert "Review failed" in second_body
-        assert "ValueError" in second_body
+        assert mock_provider.update_comment.call_count == 1
+        body = mock_provider.update_comment.call_args_list[0][0][2]
+        assert "in progress" not in body.lower()
+        assert "Walkthrough summary" in body
+        assert "<details>" in body
+        assert "Review failed" in body
+        assert "ValueError" in body
 
 
 class TestDryRun:

@@ -6,6 +6,7 @@ import sqlite3
 
 from mira.core.review_reports import (
     ImpactMagnitude,
+    ImpactReport,
     analyze_pr_impact,
     build_compact_audit_report,
     build_evolution_report,
@@ -14,6 +15,7 @@ from mira.core.review_reports import (
 from mira.index.store import IndexStore
 from mira.models import (
     FileChangeType,
+    OverlapFinding,
     ReviewComment,
     Severity,
     ThreadDecision,
@@ -337,6 +339,7 @@ diff --git a/apps/api/src/workers/measurement-delivery.worker.ts b/apps/api/src/
             label="Safe with minor fixes",
             reason="The behavior is covered by focused tests.",
         ),
+        sequence_diagram="sequenceDiagram\n    User->>Web: close dialog\n    Web-->>User: restore focus",
     )
     impact = analyze_pr_impact(diff, head_sha="b" * 40, walkthrough=walkthrough)
 
@@ -364,6 +367,16 @@ diff --git a/apps/api/src/workers/measurement-delivery.worker.ts b/apps/api/src/
         provider_used="claude-cli",
         full_pr_revalidation=True,
         bot_name="mira",
+        overlaps=[
+            OverlapFinding(
+                pr_number=42,
+                url="https://github.com/acme/repo/pull/42",
+                title="Related change",
+                kind="merge_conflict",
+                reason="Both PRs modify the same focus restoration flow.",
+                confidence=0.9,
+            )
+        ],
     )
 
     assert markdown.startswith("<!-- mira-report:walkthrough:")
@@ -371,12 +384,47 @@ diff --git a/apps/api/src/workers/measurement-delivery.worker.ts b/apps/api/src/
     assert "/casino/[gameCode]" in markdown
     assert "POST https://www.google-analytics.com/mp/collect" in markdown
     assert "change scope **moderate**" in markdown
+    assert "<summary>Flow diagram</summary>" in markdown
+    assert "```mermaid" in markdown
+    assert "sequenceDiagram" in markdown
+    assert "Potential overlap with other open PRs" in markdown
+    assert "[#42](https://github.com/acme/repo/pull/42)" in markdown
     assert "**Fixed by code:** 1" in markdown
     assert "**New:**" not in markdown
     assert "Before:" not in markdown
     assert "After:" not in markdown
     assert "<details>" in markdown
-    assert len(markdown.splitlines()) < 45
+    assert len(markdown.splitlines()) < 65
+
+
+def test_compact_audit_report_omits_invalid_sequence_diagram():
+    walkthrough = WalkthroughResult(
+        summary="Changes.",
+        sequence_diagram="this is not valid Mermaid",
+    )
+    impact = ImpactReport(
+        head_sha="c" * 40,
+        magnitude=ImpactMagnitude.MINIMAL,
+    )
+
+    markdown = build_compact_audit_report(
+        head_sha="c" * 40,
+        previous_sha="",
+        walkthrough=walkthrough,
+        impact=impact,
+        decisions=[],
+        new_findings=[],
+        unverifiable_threads=[],
+        reviewed_files=1,
+        total_comments=0,
+        existing_issues=0,
+        provider_used="claude-cli",
+        full_pr_revalidation=True,
+        bot_name="mira",
+    )
+
+    assert "Flow diagram" not in markdown
+    assert "```mermaid" not in markdown
 
 
 def test_sqlite_store_migrates_legacy_review_events_with_empty_sha_lineage(tmp_path):
