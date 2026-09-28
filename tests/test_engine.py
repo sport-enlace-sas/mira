@@ -18,11 +18,13 @@ from mira.core.engine import (
     _drop_unanchorable_comments,
     _restrict_diff_to_paths,
     _security_relevant_files,
+    _select_review_lineage,
 )
 from mira.core.threads import _extract_sections
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
+    BotThreadRecord,
     FileChangeType,
     FileDiff,
     KeyIssue,
@@ -139,10 +141,26 @@ def mock_provider(sample_diff_text: str) -> AsyncMock:
     provider.find_bot_comment = AsyncMock(return_value=None)
     provider.update_comment = AsyncMock()
     provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+    provider.get_all_bot_threads = AsyncMock(return_value=[])
     return provider
 
 
 class TestReviewEngine:
+    def test_review_lineage_uses_previous_distinct_sha_on_same_sha_retry(self):
+        events = [
+            SimpleNamespace(head_sha="new", previous_head_sha="old"),
+            SimpleNamespace(head_sha="old", previous_head_sha="older"),
+        ]
+
+        previous_sha, current_seen = _select_review_lineage(
+            events,
+            current_sha="new",
+            fallback_sha="new",
+        )
+
+        assert previous_sha == "old"
+        assert current_seen is True
+
     @pytest.mark.asyncio
     async def test_review_diff(self, mock_llm: LLMProvider, sample_diff_text: str):
         engine = ReviewEngine(config=MiraConfig(), llm=mock_llm)
@@ -587,8 +605,6 @@ class TestReviewEngine:
         placeholder and the final walkthrough — no new comment created."""
         markers_to_ids = {
             "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->": 42,
-            "<!-- mira-report:evolution:" + ("a" * 40) + " -->": 43,
-            "<!-- mira-report:impact:" + ("a" * 40) + " -->": 44,
         }
         mock_provider.find_bot_comment = AsyncMock(
             side_effect=lambda _pr, marker: markers_to_ids.get(marker)
@@ -611,6 +627,58 @@ class TestReviewEngine:
         markers = [call.args[1] for call in mock_provider.find_bot_comment.call_args_list]
         assert markers
         assert set(markers) == set(markers_to_ids)
+
+    @pytest.mark.asyncio
+    async def test_completed_same_sha_report_is_not_downgraded_by_review_rest(
+        self,
+        mock_llm: LLMProvider,
+        mock_provider: AsyncMock,
+        monkeypatch,
+    ):
+        marker = "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->"
+        mock_provider.find_bot_comment = AsyncMock(
+            side_effect=lambda _pr, requested_marker: 42 if requested_marker == marker else None
+        )
+        monkeypatch.setattr(
+            "mira.core.engine._load_review_lineage",
+            lambda _pr_info: ("b" * 40, True),
+        )
+
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine._review_only_paths = {"large-generated-file.json"}
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        walkthrough_updates = [
+            call.args[2]
+            for call in mock_provider.update_comment.call_args_list
+            if "mira-report:walkthrough" in call.args[2]
+        ]
+        assert walkthrough_updates == []
+
+    @pytest.mark.asyncio
+    async def test_completed_same_sha_without_comment_does_not_leave_placeholder(
+        self,
+        mock_llm: LLMProvider,
+        mock_provider: AsyncMock,
+        monkeypatch,
+    ):
+        mock_provider.find_bot_comment = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "mira.core.engine._load_review_lineage",
+            lambda _pr_info: ("b" * 40, True),
+        )
+
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine._review_only_paths = {"large-generated-file.json"}
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.post_comment.assert_not_called()
+        walkthrough_updates = [
+            call.args[2]
+            for call in mock_provider.update_comment.call_args_list
+            if "mira-report:walkthrough" in call.args[2]
+        ]
+        assert walkthrough_updates == []
 
     @pytest.mark.asyncio
     async def test_walkthrough_does_not_lookup_or_edit_legacy_cross_sha_comment(
@@ -640,7 +708,7 @@ class TestReviewEngine:
         )
 
     @pytest.mark.asyncio
-    async def test_review_publishes_evolution_and_impact_reports_per_sha(
+    async def test_review_publishes_one_compact_report_per_sha(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
@@ -648,8 +716,12 @@ class TestReviewEngine:
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         posted_bodies = [call.args[1] for call in mock_provider.post_comment.call_args_list]
-        assert any("<!-- mira-report:evolution:" + ("a" * 40) + " -->" in b for b in posted_bodies)
-        assert any("<!-- mira-report:impact:" + ("a" * 40) + " -->" in b for b in posted_bodies)
+        updated_bodies = [call.args[2] for call in mock_provider.update_comment.call_args_list]
+        all_bodies = [*posted_bodies, *updated_bodies]
+
+        assert any("## Mira Audit · `aaaaaaaaaaaa`" in body for body in all_bodies)
+        assert not any("mira-report:evolution" in body for body in all_bodies)
+        assert not any("mira-report:impact" in body for body in all_bodies)
 
     @pytest.mark.asyncio
     async def test_walkthrough_creates_when_no_existing(
@@ -1062,6 +1134,19 @@ class TestThreadResolution:
         provider.find_bot_comment = AsyncMock(return_value=None)
         provider.update_comment = AsyncMock()
         provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+        provider.get_all_bot_threads = AsyncMock(
+            return_value=[
+                BotThreadRecord(
+                    thread_id=thread.thread_id,
+                    path=thread.path,
+                    line=thread.line,
+                    body=thread.body,
+                    is_resolved=False,
+                    is_outdated=thread.is_outdated,
+                )
+                for thread in threads
+            ]
+        )
         provider.get_file_content = AsyncMock(return_value="line1\n" * 30)
         provider.resolve_threads = AsyncMock(return_value=1)
         return provider
@@ -1093,7 +1178,7 @@ class TestThreadResolution:
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        provider_with_threads.get_unresolved_bot_threads.assert_awaited_once()
+        provider_with_threads.get_all_bot_threads.assert_awaited()
         provider_with_threads.get_file_content.assert_awaited()
         # Only T1 was fixed
         provider_with_threads.resolve_threads.assert_awaited_once()
@@ -1101,12 +1186,12 @@ class TestThreadResolution:
         assert resolved_ids == ["T1"]
 
     @pytest.mark.asyncio
-    async def test_auto_resolve_disabled_skips_resolution(
+    async def test_auto_resolve_disabled_still_verifies_without_mutating_threads(
         self,
         sample_llm_response_text: str,
         provider_with_threads: AsyncMock,
     ):
-        """With auto_resolve_conversations off, no threads are fetched or resolved."""
+        """Evolution remains accurate when automatic thread mutation is disabled."""
         llm = MagicMock(spec=LLMProvider)
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1123,12 +1208,60 @@ class TestThreadResolution:
         )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        # The verified-fix resolution path is short-circuited entirely.
-        provider_with_threads.get_unresolved_bot_threads.assert_not_awaited()
+        provider_with_threads.get_all_bot_threads.assert_awaited()
         provider_with_threads.resolve_threads.assert_not_awaited()
-        assert result.thread_decisions == []
+        assert len(result.thread_decisions) == 2
         # Review itself still completed.
         provider_with_threads.post_review.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolved_thread_is_reverified_and_classified_as_fixed_by_code(
+        self,
+        sample_llm_response_text: str,
+        provider_with_threads: AsyncMock,
+    ):
+        provider_with_threads.get_all_bot_threads = AsyncMock(
+            return_value=[
+                BotThreadRecord(
+                    thread_id="T1",
+                    path="src/app.py",
+                    line=10,
+                    body="**Missing edge-case coverage**",
+                    is_resolved=True,
+                )
+            ]
+        )
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        llm.complete = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "results": [
+                        {
+                            "id": "T1",
+                            "status": "fixed_by_code",
+                            "evidence": "Negative validator branches now have tests.",
+                        }
+                    ]
+                }
+            )
+        )
+        llm.walkthrough = AsyncMock(
+            return_value=json.dumps({"summary": "walkthrough", "change_groups": []})
+        )
+        llm.review = AsyncMock(return_value=sample_llm_response_text)
+
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
+        )
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result.thread_decisions[0].status == "fixed_by_code"
+        assert result.thread_decisions[0].evidence == (
+            "Negative validator branches now have tests."
+        )
+        provider_with_threads.resolve_threads.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_full_flow_passes_full_file_for_small_files(
@@ -1212,14 +1345,14 @@ class TestThreadResolution:
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """No LLM call or resolve when no unresolved threads exist."""
-        mock_provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=mock_llm, provider=mock_provider, bot_name="mira"
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        mock_provider.get_unresolved_bot_threads.assert_awaited_once()
+        mock_provider.get_all_bot_threads.assert_awaited()
         mock_provider.resolve_threads.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1227,9 +1360,7 @@ class TestThreadResolution:
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """Review continues even if thread resolution fails."""
-        mock_provider.get_unresolved_bot_threads = AsyncMock(
-            side_effect=RuntimeError("GraphQL exploded")
-        )
+        mock_provider.get_all_bot_threads = AsyncMock(side_effect=RuntimeError("GraphQL exploded"))
 
         engine = ReviewEngine(
             config=MiraConfig(), llm=mock_llm, provider=mock_provider, bot_name="mira"

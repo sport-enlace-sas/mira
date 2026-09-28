@@ -46,6 +46,23 @@ class TestBuildReviewPrompt:
         assert "submit_review" in system
         assert "blocker" in system
 
+    def test_test_coverage_instruction_distinguishes_absent_from_incomplete_tests(self):
+        files = [
+            FileDiff(
+                path="src/validator.ts",
+                change_type=FileChangeType.MODIFIED,
+                hunks=[HunkInfo(1, 5, 1, 5, "content")],
+                language="typescript",
+                added_lines=1,
+                deleted_lines=0,
+            )
+        ]
+
+        system = build_review_prompt(files, MiraConfig())[0]["content"]
+
+        assert 'title "Incomplete test coverage"' in system
+        assert "never claim that no unit tests exist" in system
+
     def test_includes_file_paths(self):
         files = [
             FileDiff(

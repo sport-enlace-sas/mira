@@ -7,11 +7,20 @@ import sqlite3
 from mira.core.review_reports import (
     ImpactMagnitude,
     analyze_pr_impact,
+    build_compact_audit_report,
     build_evolution_report,
     make_report_marker,
 )
 from mira.index.store import IndexStore
-from mira.models import ReviewComment, Severity, ThreadDecision
+from mira.models import (
+    FileChangeType,
+    ReviewComment,
+    Severity,
+    ThreadDecision,
+    WalkthroughConfidenceScore,
+    WalkthroughFileEntry,
+    WalkthroughResult,
+)
 
 
 def _comment(path: str = "src/auth.py", title: str = "Unsafe token") -> ReviewComment:
@@ -44,7 +53,8 @@ def test_evolution_report_marks_first_audit_and_new_findings():
 
     assert make_report_marker("evolution", "a" * 40) in markdown
     assert "First recorded audit" in markdown
-    assert "| New | 1 |" in markdown
+    assert "**New:** 1" in markdown
+    assert "Regressed" not in markdown
     assert "`src/auth.py:12` — Unsafe token" in markdown
 
 
@@ -98,10 +108,10 @@ def test_evolution_report_keeps_resolution_reasons_distinct():
         unverifiable_threads=unverifiable,
     )
 
-    assert "| Fixed by code | 1 |" in markdown
-    assert "| Still present | 1 |" in markdown
-    assert "| Rejected false positive | 1 |" in markdown
-    assert "| Unverifiable | 1 |" in markdown
+    assert "**Fixed by code:** 1" in markdown
+    assert "**Still present:** 1" in markdown
+    assert "**Rejected false positive:** 1" in markdown
+    assert "**Unverifiable:** 1" in markdown
     assert "validation added" in markdown
     assert "guard already existed" in markdown
 
@@ -137,9 +147,9 @@ def test_evolution_report_recognizes_regression_without_using_line_number():
         historical_resolved_threads=historical,
     )
 
-    assert "| Regressed | 1 |" in markdown
-    assert "| Resolved before this audit | 1 |" in markdown
-    assert "| New | 0 |" in markdown
+    assert "**Regressed:** 1" in markdown
+    assert "**Resolved before this audit:** 1" in markdown
+    assert "**New:**" not in markdown
 
 
 def test_impact_report_detects_next_route_nest_endpoint_and_before_after():
@@ -164,9 +174,60 @@ diff --git a/apps/api/src/users.controller.ts b/apps/api/src/users.controller.ts
     assert report.magnitude is ImpactMagnitude.MODERATE
     assert "/settings" in report.visual_routes
     assert "GET /users/:id" in report.endpoints
-    assert "`return <OldSettings />`" in markdown
-    assert "`return <NewSettings />`" in markdown
+    assert "Before:" not in markdown
+    assert "After:" not in markdown
     assert "runtime-unverified" in markdown
+
+
+def test_impact_report_maps_nested_next_component_to_its_route():
+    diff = """diff --git a/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx b/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
+--- a/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
++++ b/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
+@@ -1 +1 @@
+-export const Dialog = Old
++export const Dialog = New
+"""
+
+    report = analyze_pr_impact(diff, head_sha="a" * 40)
+
+    assert report.visual_routes == ["/casino/[gameCode]"]
+    assert report.route_evidence["/casino/[gameCode]"] == "direct route component change"
+
+
+def test_impact_report_maps_root_level_next_component_to_its_route():
+    diff = """diff --git a/app/account/_components/form.tsx b/app/account/_components/form.tsx
+--- a/app/account/_components/form.tsx
++++ b/app/account/_components/form.tsx
+@@ -1 +1 @@
+-export const Form = Old
++export const Form = New
+"""
+
+    report = analyze_pr_impact(diff, head_sha="a" * 40)
+
+    assert report.visual_routes == ["/account"]
+
+
+def test_impact_report_surfaces_outbound_integration_without_calling_it_a_public_api():
+    diff = """diff --git a/apps/api/src/modules/marketing/adapters/ga4.ts b/apps/api/src/modules/marketing/adapters/ga4.ts
+--- a/apps/api/src/modules/marketing/adapters/ga4.ts
++++ b/apps/api/src/modules/marketing/adapters/ga4.ts
+@@ -1 +1,4 @@
+-const endpoint = config.url
++const endpoint = 'https://www.google-analytics.com/mp/collect'
++fetch(endpoint, {
++  method: 'POST',
++})
+"""
+
+    report = analyze_pr_impact(diff, head_sha="a" * 40)
+    markdown = report.to_markdown()
+
+    assert report.endpoints == []
+    assert report.external_integrations == ["POST https://www.google-analytics.com/mp/collect"]
+    assert report.magnitude == ImpactMagnitude.MODERATE
+    assert "External integration" in markdown
+    assert "POST https://www.google-analytics.com/mp/collect" in markdown
 
 
 def test_impact_report_maps_indirect_next_page_from_blast_radius():
@@ -219,7 +280,103 @@ def test_impact_report_handles_backend_only_change():
     report = analyze_pr_impact(diff, head_sha="e" * 40)
 
     assert report.visual_routes == []
-    assert "No web view was identified" in report.to_markdown()
+    assert report.background_processes == ["cleanup.py"]
+    assert "Background processing" in report.to_markdown()
+
+
+def test_impact_report_hides_empty_technical_evidence_for_test_only_diff():
+    diff = """diff --git a/tests/test_worker.py b/tests/test_worker.py
+--- a/tests/test_worker.py
++++ b/tests/test_worker.py
+@@ -1 +1 @@
+-def test_old(): pass
++def test_new(): pass
+"""
+
+    report = analyze_pr_impact(diff, head_sha="e" * 40)
+    markdown = report.to_markdown()
+
+    assert "Technical evidence" not in markdown
+    assert "<details>" not in markdown
+
+
+def test_compact_audit_report_groups_surfaces_and_hides_diff_noise():
+    diff = """diff --git a/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx b/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
+--- a/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
++++ b/apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx
+@@ -1 +1 @@
+-import { Old } from './old'
++import { New } from './new'
+diff --git a/apps/api/src/workers/measurement-delivery.worker.ts b/apps/api/src/workers/measurement-delivery.worker.ts
+--- a/apps/api/src/workers/measurement-delivery.worker.ts
++++ b/apps/api/src/workers/measurement-delivery.worker.ts
+@@ -1 +1,2 @@
+-const endpoint = config.url
++const endpoint = 'https://www.google-analytics.com/mp/collect'
++fetch(endpoint, { method: 'POST' })
+"""
+    walkthrough = WalkthroughResult(
+        summary=(
+            "The casino return flow now reports unexpected failures, while the measurement "
+            "worker sends events directly to GA4."
+        ),
+        file_changes=[
+            WalkthroughFileEntry(
+                path=("apps/web/src/app/(main)/casino/[gameCode]/_components/dialog.tsx"),
+                change_type=FileChangeType.MODIFIED,
+                description="Reports unexpected return-flow errors without swallowing them.",
+            ),
+            WalkthroughFileEntry(
+                path="apps/api/src/workers/measurement-delivery.worker.ts",
+                change_type=FileChangeType.MODIFIED,
+                description="Sends queued measurements directly to GA4.",
+            ),
+        ],
+        confidence_score=WalkthroughConfidenceScore(
+            score=4,
+            label="Safe with minor fixes",
+            reason="The behavior is covered by focused tests.",
+        ),
+    )
+    impact = analyze_pr_impact(diff, head_sha="b" * 40, walkthrough=walkthrough)
+
+    markdown = build_compact_audit_report(
+        head_sha="b" * 40,
+        previous_sha="a" * 40,
+        walkthrough=walkthrough,
+        impact=impact,
+        decisions=[
+            ThreadDecision(
+                thread_id="old",
+                path="apps/api/src/ga4.ts",
+                line=10,
+                body="**Missing edge-case coverage**",
+                fixed=True,
+                status="fixed_by_code",
+                evidence="Negative validator branches now have tests.",
+            )
+        ],
+        new_findings=[],
+        unverifiable_threads=[],
+        reviewed_files=2,
+        total_comments=0,
+        existing_issues=0,
+        provider_used="claude-cli",
+        full_pr_revalidation=True,
+        bot_name="mira",
+    )
+
+    assert markdown.startswith("<!-- mira-report:walkthrough:")
+    assert "## Mira Audit · `bbbbbbbbbbbb`" in markdown
+    assert "/casino/[gameCode]" in markdown
+    assert "POST https://www.google-analytics.com/mp/collect" in markdown
+    assert "change scope **moderate**" in markdown
+    assert "**Fixed by code:** 1" in markdown
+    assert "**New:**" not in markdown
+    assert "Before:" not in markdown
+    assert "After:" not in markdown
+    assert "<details>" in markdown
+    assert len(markdown.splitlines()) < 45
 
 
 def test_sqlite_store_migrates_legacy_review_events_with_empty_sha_lineage(tmp_path):

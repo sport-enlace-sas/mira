@@ -31,14 +31,14 @@ from mira.core.passes import (
 from mira.core.priority import rank_files
 from mira.core.review_reports import (
     analyze_pr_impact,
-    build_evolution_report,
+    build_compact_audit_report,
     make_report_marker,
 )
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.exceptions import MiraError, ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
-from mira.index.store import IndexStore
+from mira.index.store import IndexStore, ReviewEvent
 from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
@@ -71,6 +71,62 @@ from mira.providers.base import BaseProvider
 from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
+
+
+def _select_review_lineage(
+    events: list[ReviewEvent],
+    *,
+    current_sha: str,
+    fallback_sha: str = "",
+) -> tuple[str, bool]:
+    """Return the prior distinct SHA and whether this SHA already completed."""
+    current = current_sha.strip().lower()
+    current_seen = False
+    for event in events:
+        head = event.head_sha.strip().lower()
+        previous = event.previous_head_sha.strip().lower()
+        if head == current and head:
+            current_seen = True
+            if previous and previous != current:
+                return previous, True
+            continue
+        if head and head != current:
+            return head, current_seen
+    fallback = fallback_sha.strip().lower()
+    if fallback and fallback != current:
+        return fallback, current_seen
+    return "", current_seen
+
+
+def _load_review_lineage(pr_info: PRInfo) -> tuple[str, bool]:
+    events: list[ReviewEvent] = []
+    store = None
+    try:
+        store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+        events = store.list_review_events_for_pr(pr_info.number)
+    except Exception as exc:
+        logger.debug("Failed to load review-event lineage: %s", exc)
+    finally:
+        if store is not None:
+            store.close()
+
+    fallback_sha = ""
+    try:
+        from mira.dashboard.api import _app_db
+
+        fallback_sha = _app_db.get_last_reviewed_sha(
+            pr_info.owner,
+            pr_info.repo,
+            pr_info.number,
+            platform=pr_info.platform,
+        )
+    except Exception as exc:
+        logger.debug("Failed to load review-progress lineage: %s", exc)
+    return _select_review_lineage(
+        events,
+        current_sha=pr_info.head_sha,
+        fallback_sha=fallback_sha,
+    )
 
 
 def _audit_drop(c: ReviewComment, stage: str, reason: str = "") -> dict:
@@ -441,30 +497,32 @@ class ReviewEngine:
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
 
-    async def _post_placeholder_comment(self, pr_info: PRInfo, marker: str) -> int | None:
+    async def _post_placeholder_comment(
+        self,
+        pr_info: PRInfo,
+        marker: str,
+        *,
+        preserve_existing: bool = False,
+    ) -> tuple[int | None, bool]:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
 
         Uses the exact SHA-scoped marker so only this audit can be updated.
         """
         if not self.provider or not self._can_publish():
-            return None
+            return None, False
         placeholder = f"{marker}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
         existing_id = await self.provider.find_bot_comment(pr_info, marker)
         if existing_id is not None:
-            await self.provider.update_comment(pr_info, existing_id, placeholder)
-            return existing_id
+            if not preserve_existing:
+                await self.provider.update_comment(pr_info, existing_id, placeholder)
+            return existing_id, False
+        if preserve_existing:
+            # A completed event for this SHA is authoritative.  If its comment
+            # was removed manually, a retry must not replace it with a new
+            # placeholder that will intentionally never be finalized.
+            return None, False
         await self.provider.post_comment(pr_info, placeholder)
-        return await self.provider.find_bot_comment(pr_info, marker)
-
-    async def _publish_sha_report(self, pr_info: PRInfo, marker: str, body: str) -> None:
-        """Create a report, or replace only the same kind from the same SHA."""
-        if not self.provider or not self._can_publish() or self.dry_run:
-            return
-        existing_id = await self.provider.find_bot_comment(pr_info, marker)
-        if existing_id is not None:
-            await self.provider.update_comment(pr_info, existing_id, body)
-        else:
-            await self.provider.post_comment(pr_info, body)
+        return await self.provider.find_bot_comment(pr_info, marker), True
 
     @staticmethod
     def _format_failure_notice(exc: BaseException) -> str:
@@ -578,38 +636,24 @@ class ReviewEngine:
         )
         walkthrough_marker = make_report_marker("walkthrough", report_scope)
 
-        previous_reviewed_sha = ""
-        try:
-            from mira.dashboard.api import _app_db
-
-            previous_reviewed_sha = (
-                _app_db.get_last_reviewed_sha(
-                    pr_info.owner,
-                    pr_info.repo,
-                    pr_info.number,
-                    platform=pr_info.platform,
-                )
-                or ""
-            )
-        except Exception as exc:
-            logger.debug("Failed to load previous reviewed SHA: %s", exc)
+        previous_reviewed_sha, current_sha_already_recorded = _load_review_lineage(pr_info)
 
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
         ]:
-            # When auto-resolve is off we skip the thread-resolution path
-            # entirely — no fetch, no verify, no resolve. Round detection is
-            # unaffected; it runs off the separate get_all_bot_threads call below.
-            if (
-                not self.bot_name
-                or not self.config.review.auto_resolve_conversations
-                or not self._can_publish()
-            ):
+            # Evolution verification is read-only and always runs when Mira can
+            # publish. auto_resolve_conversations controls only the mutation.
+            if not self.bot_name or not self._can_publish():
                 return 0, 0, [], []
             try:
                 assert self.provider is not None
                 return await resolve_verified_threads(
-                    self.provider, self.llm, pr_info, self.bot_name, self.dry_run
+                    self.provider,
+                    self.llm,
+                    pr_info,
+                    self.bot_name,
+                    self.dry_run,
+                    allow_resolution=self.config.review.auto_resolve_conversations,
                 )
             except Exception as exc:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
@@ -627,16 +671,27 @@ class ReviewEngine:
         )
 
         placeholder_id: int | None = None
+        placeholder_created = False
         if not self.dry_run:
             try:
-                placeholder_id = await self._post_placeholder_comment(pr_info, walkthrough_marker)
+                placeholder_id, placeholder_created = await self._post_placeholder_comment(
+                    pr_info,
+                    walkthrough_marker,
+                    preserve_existing=current_sha_already_recorded,
+                )
             except Exception as exc:
                 logger.warning("Failed to post walkthrough placeholder: %s", exc)
 
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
         async def _on_walkthrough_ready(wt: WalkthroughResult | None) -> None:
-            if self.dry_run or wt is None or placeholder_id is None or not self._can_publish():
+            if (
+                self.dry_run
+                or wt is None
+                or placeholder_id is None
+                or not self._can_publish()
+                or current_sha_already_recorded
+            ):
                 return
             try:
                 markdown = wt.to_markdown(
@@ -898,7 +953,7 @@ class ReviewEngine:
                 if result.key_issues:
                     result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
 
-        if result.walkthrough and self._can_publish():
+        if result.walkthrough and self._can_publish() and not current_sha_already_recorded:
             _clamp_confidence_to_findings(result.walkthrough, result.comments)
             if self.dry_run:
                 logger.info("Dry run: skipping walkthrough comment posting")
@@ -1001,7 +1056,7 @@ class ReviewEngine:
                         await self.provider.post_comment(pr_info, markdown)
                 except Exception as exc:
                     logger.warning("Failed to post walkthrough comment: %s", exc)
-        elif placeholder_id is not None and self._can_publish():
+        elif placeholder_id is not None and placeholder_created and self._can_publish():
             # No walkthrough (all files excluded, empty diff, or generation
             # failed) — finalize the placeholder so it doesn't sit on
             # "Reviewing this PR…" forever.
@@ -1055,9 +1110,15 @@ class ReviewEngine:
 
         result.thread_decisions = thread_decisions
 
-        # Publish two immutable companion reports after inline findings so the
-        # PR reads chronologically: audit, finding evolution, then impact.
-        if not self.dry_run and self._can_publish():
+        # Finalize one high-signal report per SHA. Inline findings stay native
+        # GitHub/GitLab comments; evolution and impact are compact sections in
+        # this same immutable audit comment instead of two diff-like companions.
+        if (
+            not self.dry_run
+            and self._can_publish()
+            and result.walkthrough is not None
+            and not current_sha_already_recorded
+        ):
             decided_ids = {decision.thread_id for decision in thread_decisions}
             unverifiable_threads = [
                 ThreadDecision(
@@ -1086,25 +1147,8 @@ class ReviewEngine:
                     ),
                 )
                 for thread in all_bot_threads
-                if thread.is_resolved
+                if thread.is_resolved and thread.thread_id not in decided_ids
             ]
-            evolution = build_evolution_report(
-                head_sha=report_scope,
-                previous_sha=previous_reviewed_sha,
-                decisions=thread_decisions,
-                new_findings=result.comments,
-                unverifiable_threads=unverifiable_threads,
-                historical_resolved_threads=historical_resolved_threads,
-            )
-            try:
-                await self._publish_sha_report(
-                    pr_info,
-                    make_report_marker("evolution", report_scope),
-                    evolution,
-                )
-            except Exception as exc:
-                logger.warning("Failed to publish finding evolution report: %s", exc)
-
             blast_radius_paths: list[str] = []
             impact_store = None
             try:
@@ -1128,13 +1172,43 @@ class ReviewEngine:
                     blast_radius_paths=blast_radius_paths,
                     web_base_urls=self.config.review.web_base_urls,
                 )
-                await self._publish_sha_report(
-                    pr_info,
-                    make_report_marker("impact", report_scope),
-                    impact.to_markdown(),
+                provider_chains = (self.llm, self.indexing_llm, self.security_llm)
+                fallback_used = any(
+                    getattr(candidate, "last_provider", "primary") == "fallback"
+                    for candidate in provider_chains
                 )
+                provider_used = (
+                    self.config.llm.fallback_provider if fallback_used else self.config.llm.provider
+                ) or "unknown"
+                markdown = build_compact_audit_report(
+                    head_sha=report_scope,
+                    previous_sha=previous_reviewed_sha,
+                    walkthrough=result.walkthrough,
+                    impact=impact,
+                    decisions=thread_decisions,
+                    new_findings=result.comments,
+                    unverifiable_threads=unverifiable_threads,
+                    historical_resolved_threads=historical_resolved_threads,
+                    reviewed_files=result.reviewed_files,
+                    total_comments=len(result.comments),
+                    existing_issues=len(unresolved_threads),
+                    skipped_paths=result.skipped_paths or None,
+                    total_paths=result.total_paths or None,
+                    provider_used=provider_used,
+                    fallback_used=fallback_used,
+                    full_pr_revalidation=self.config.review.full_revalidation_on_synchronize,
+                    index_was_empty=getattr(self, "_index_was_empty", False),
+                    bot_name=self.bot_name or "miracodeai",
+                )
+                comment_id = placeholder_id
+                if comment_id is None:
+                    comment_id = await self.provider.find_bot_comment(pr_info, walkthrough_marker)
+                if comment_id is not None:
+                    await self.provider.update_comment(pr_info, comment_id, markdown)
+                else:
+                    await self.provider.post_comment(pr_info, markdown)
             except Exception as exc:
-                logger.warning("Failed to publish static impact report: %s", exc)
+                logger.warning("Failed to publish compact audit report: %s", exc)
 
         try:
             import json as _json
