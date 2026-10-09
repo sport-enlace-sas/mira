@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from mira.config import MiraConfig
+from mira.config import LLMConfig, MiraConfig
+from mira.exceptions import LLMError
 from mira.index.indexer import (
     _build_file_summary,
     _content_hash,
@@ -18,6 +19,8 @@ from mira.index.indexer import (
     index_repo,
 )
 from mira.index.store import IndexStore
+from mira.llm import create_llm
+from mira.llm.provider_chain import ProviderChain
 
 
 class TestShouldIndex:
@@ -207,6 +210,52 @@ class _FakeFetcher:
 
 @pytest.mark.asyncio
 class TestIndexRepo:
+    @pytest.mark.parametrize("use_fallback", [False, True])
+    async def test_provider_chain_persists_file_summary(self, tmp_path, use_fallback):
+        config = MiraConfig(
+            llm=LLMConfig(
+                provider="claude-cli",
+                model="claude-haiku-4-5",
+                fallback_provider="codex-cli",
+                fallback_model="gpt-5.6-sol",
+            )
+        )
+        chain = create_llm(config.llm)
+        assert isinstance(chain, ProviderChain)
+        response = json.dumps(
+            {"files": [{"path": "src/main.py", "language": "python", "summary": "Entry point."}]}
+        )
+        chain.primary.complete = AsyncMock(
+            side_effect=LLMError("claude_timeout", seconds=1) if use_fallback else None,
+            return_value=response,
+        )
+        chain.fallback.complete = AsyncMock(return_value=response)
+        content = "# entry point\n" + "print('hello')\n" * 100
+        fetcher = _FakeFetcher(tree=["src/main.py"], tarball={"src/main.py": content})
+        store = IndexStore(str(tmp_path / "test.db"))
+        try:
+            count = await index_repo(
+                owner="test",
+                repo="repo",
+                config=config,
+                store=store,
+                llm=chain,
+                full=True,
+                fetcher=fetcher,
+            )
+
+            assert count == 1
+            summary = store.get_summary("src/main.py")
+            assert summary is not None
+            assert summary.summary == "Entry point."
+            assert chain.primary.complete.await_count >= 1
+            if use_fallback:
+                assert chain.fallback.complete.await_count == chain.primary.complete.await_count
+            else:
+                chain.fallback.complete.assert_not_awaited()
+        finally:
+            store.close()
+
     async def test_index_repo_basic(self, tmp_path):
         """Test full repo indexing with mocked GitHub API and LLM."""
         store = IndexStore(str(tmp_path / "test.db"))
