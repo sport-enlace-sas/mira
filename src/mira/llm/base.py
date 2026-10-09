@@ -35,6 +35,9 @@ class LLMProviderProtocol(Protocol):
     total_prompt_tokens: int
     total_completion_tokens: int
 
+    @property
+    def config(self) -> LLMConfig: ...
+
     async def complete(
         self,
         messages: list[dict[str, str]],

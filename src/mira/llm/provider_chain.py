@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm.base import LLMProviderProtocol
 
@@ -28,6 +29,11 @@ class ProviderChain:
         self.attempted_models: list[str] = []
         self.attempted_providers: list[str] = []
         self.fallback_attempted = False
+
+    @property
+    def config(self) -> LLMConfig:
+        """Expose the primary configuration for pre-call request budgeting."""
+        return self.primary.config
 
     @staticmethod
     def _provider_name(provider: LLMProviderProtocol) -> str:
@@ -76,12 +82,15 @@ class ProviderChain:
             return await getattr(self.primary, method)(*args, **kwargs)
         except NonRetriableLLMError:
             raise
-        except LLMError:
+        except LLMError as exc:
             # Providers deliberately raise LLMError only for transient
             # transport/provider conditions here (timeouts, 429 and 5xx).
             # Configuration, auth and parsing failures are non-retriable and
             # must remain visible instead of consuming the fallback account.
-            logger.warning("Primary review provider failed transiently; using configured fallback")
+            logger.warning(
+                "Primary review provider failed transiently (%s); using configured fallback",
+                exc.safe_message,
+            )
             try:
                 self.last_provider = "fallback"
                 self.fallback_attempted = True

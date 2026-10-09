@@ -128,6 +128,10 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Claude Code CLI timed out after {seconds}s",
         safe="Claude Code CLI timed out",
     ),
+    "claude_usage_limit": ErrorMessage(
+        full="Claude Code model usage limit reached for {model}",
+        safe="Claude Code model usage limit reached",
+    ),
     "claude_exit_failed": ErrorMessage(
         full="Claude Code CLI failed with exit {exit_code}: {detail}",
         safe="Claude Code CLI failed",

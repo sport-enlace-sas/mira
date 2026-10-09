@@ -322,18 +322,82 @@ class TestClaudeAndFallbackProvider:
         assert command[model_index + 1] == "claude-fable-5-1"
         assert provider.effective_model == "claude-fable-5-1"
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "You've hit your limit",
+            "You've reached your Fable limit. Switch to another model to continue.",
+            "You've reached your Sonnet limit. Switch to another model to continue.",
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_claude_quota_exhaustion_is_eligible_for_codex_fallback(self, monkeypatch):
+    async def test_claude_quota_exhaustion_is_eligible_for_codex_fallback(
+        self, monkeypatch, message
+    ):
         proc = AsyncMock()
         proc.returncode = 1
-        proc.communicate.return_value = (b"You've hit your limit", b"")
+        proc.communicate.return_value = (message.encode(), b"")
         monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
         provider = ClaudeCLIProvider(LLMConfig(provider="claude-cli"))
 
-        with pytest.raises(LLMError, match="You've hit your limit") as error:
+        with pytest.raises(LLMError, match="usage limit reached") as error:
             await provider._run_codex("review")
-        assert error.value.code == "claude_exit_failed"
+        assert not isinstance(error.value, NonRetriableLLMError)
+        assert error.value.code == "claude_usage_limit"
+        assert error.value.safe_message == "Claude Code model usage limit reached"
+
+    @pytest.mark.parametrize("stderr", [b"", b"Warning: optional update check failed"])
+    @pytest.mark.asyncio
+    async def test_fable_limit_calls_codex_fallback(self, monkeypatch, caplog, stderr):
+        proc = AsyncMock()
+        proc.returncode = 1
+        proc.communicate.return_value = (
+            b"You've reached your Fable limit. Switch to another model to continue.",
+            stderr,
+        )
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+        chain = create_llm(
+            LLMConfig(
+                provider="claude-cli",
+                model="anthropic/claude-fable-5.1",
+                fallback_provider="codex-cli",
+                fallback_model="gpt-5.6-sol",
+            )
+        )
+        assert isinstance(chain, ProviderChain)
+        chain.fallback.complete = AsyncMock(return_value='{"comments": []}')
+
+        assert await chain.complete([{"role": "user", "content": "review"}]) == '{"comments": []}'
+        chain.fallback.complete.assert_awaited_once()
+        assert chain.attempted_models == ["claude-fable-5-1", "gpt-5.6-sol"]
+        assert chain.fallback_attempted is True
+        assert "Claude Code model usage limit reached" in caplog.text
+
+    @pytest.mark.parametrize("detail", [b"Invalid token", b"Error: unknown option '--unsupported'"])
+    @pytest.mark.asyncio
+    async def test_claude_auth_and_configuration_failures_do_not_call_codex(
+        self, monkeypatch, detail
+    ):
+        proc = AsyncMock()
+        proc.returncode = 1
+        proc.communicate.return_value = (b"", detail)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=proc))
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+        chain = create_llm(
+            LLMConfig(
+                provider="claude-cli",
+                fallback_provider="codex-cli",
+                fallback_model="gpt-5.6-sol",
+            )
+        )
+        assert isinstance(chain, ProviderChain)
+        chain.fallback.complete = AsyncMock()
+
+        with pytest.raises(NonRetriableLLMError):
+            await chain.complete([{"role": "user", "content": "review"}])
+        chain.fallback.complete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cli_review_and_walkthrough_use_exported_tool_schemas(self):

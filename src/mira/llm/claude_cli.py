@@ -94,10 +94,14 @@ class ClaudeCLIProvider(CodexCLIProvider):
                     "claude_timeout", seconds=self.config.claude_timeout_seconds
                 ) from exc
             if proc.returncode != 0:
-                detail = (
-                    stderr.decode("utf-8", errors="replace")
-                    or stdout.decode("utf-8", errors="replace")
-                ).strip()
+                detail = "\n".join(
+                    text.strip()
+                    for text in (
+                        stderr.decode("utf-8", errors="replace"),
+                        stdout.decode("utf-8", errors="replace"),
+                    )
+                    if text.strip()
+                )
                 lowered = detail.lower()
                 if any(
                     text in lowered
@@ -108,6 +112,8 @@ class ClaudeCLIProvider(CodexCLIProvider):
                         exit_code=proc.returncode,
                         detail="authentication failed",
                     )
+                if re.search(r"\b(?:hit|reached) your(?: [a-z0-9._-]+)? limit\b", lowered):
+                    raise LLMError("claude_usage_limit", model=self.effective_model)
                 # Only known service-side/transient conditions may cross the
                 # Claude → Codex boundary.  Bad flags, unsupported models and
                 # other client failures stay operationally visible.
@@ -116,7 +122,6 @@ class ClaudeCLIProvider(CodexCLIProvider):
                     for text in (
                         "429",
                         "rate limit",
-                        "hit your limit",
                         "usage limit",
                         "quota",
                         "timeout",
