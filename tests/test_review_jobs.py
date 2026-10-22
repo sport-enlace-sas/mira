@@ -102,6 +102,83 @@ def test_manual_retry_reschedules_failed_job_but_not_superseded_sha(tmp_path) ->
     assert not db.retry_review_job(failed.id)
 
 
+def test_manual_retry_starts_a_fresh_attempt_budget_and_clears_provider(
+    tmp_path, monkeypatch
+) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    assert db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=10,
+        head_sha="a" * 40,
+        pr_url="https://github.com/o/r/pull/10",
+        pr_title="retry",
+        installation_id=1,
+        is_private=True,
+    )
+    for expected_attempt in range(1, 4):
+        job = db.claim_next_review_job()
+        assert job is not None
+        assert job.attempts == expected_attempt
+        db.set_review_job_execution(
+            job.id,
+            provider_used="codex-cli",
+            fallback_used=True,
+            models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+            input_tokens=10,
+        )
+        db.finish_review_job(job.id, error="both_models_failed", retry=expected_attempt < 3)
+        now += 300
+
+    assert db.retry_review_job(job.id)
+    [pending] = db.list_review_jobs()
+    assert pending.attempts == 0
+    assert pending.provider_used == ""
+    assert pending.fallback_used is False
+    assert pending.models_attempted == ""
+    assert pending.input_tokens == 30
+    retried = db.claim_next_review_job()
+    assert retried is not None
+    assert retried.attempts == 1
+
+
+def test_automatic_retry_clears_previous_provider_when_claimed(tmp_path, monkeypatch) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    assert db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=11,
+        head_sha="b" * 40,
+        pr_url="https://github.com/o/r/pull/11",
+        pr_title="retry",
+        installation_id=1,
+        is_private=True,
+    )
+    first = db.claim_next_review_job()
+    assert first is not None
+    db.set_review_job_execution(
+        first.id,
+        provider_used="codex-cli",
+        fallback_used=True,
+        models_attempted="claude-fable-5-1 -> gpt-5.6-sol",
+    )
+    db.finish_review_job(first.id, error="provider timeout", retry=True)
+    now += 10
+
+    second = db.claim_next_review_job()
+    assert second is not None
+    assert second.attempts == 2
+    [running] = db.list_review_jobs()
+    assert running.error == ""
+    assert running.provider_used == ""
+    assert running.fallback_used is False
+    assert running.models_attempted == ""
+
+
 def test_dashboard_job_list_includes_provider_provenance(tmp_path) -> None:
     db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
     assert db.enqueue_review_job(

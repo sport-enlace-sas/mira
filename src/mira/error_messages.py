@@ -95,6 +95,10 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex auth file not found: {path}",
         safe="Codex auth file not found",
     ),
+    "codex_auth_failed": ErrorMessage(
+        full="Codex CLI authentication failed; replace the configured Codex credentials",
+        safe="Codex CLI authentication failed; refresh credentials",
+    ),
     "codex_command_not_found": ErrorMessage(
         full="Codex CLI command not found: {command!r}. Install @openai/codex or set llm.codex_command.",
         safe="Codex CLI command not found — install @openai/codex or set llm.codex_command",

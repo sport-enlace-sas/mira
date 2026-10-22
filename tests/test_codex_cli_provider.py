@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -15,6 +17,111 @@ from mira.llm.provider_chain import ProviderChain
 
 
 class TestCodexCLIProvider:
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    @pytest.mark.asyncio
+    async def test_expired_refresh_token_is_not_retried(self, monkeypatch, stream):
+        message = (
+            b"Your access token could not be refreshed because your refresh token was already "
+            b"used. Please log out and sign in again."
+        )
+        proc = AsyncMock()
+        proc.returncode = 1
+        proc.communicate.return_value = (
+            message if stream == "stdout" else b"",
+            message if stream == "stderr" else b"Warning: optional update check failed",
+        )
+        spawn = AsyncMock(return_value=proc)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
+
+        with pytest.raises(NonRetriableLLMError) as error:
+            await provider._run_codex("return JSON")
+
+        assert error.value.code == "codex_auth_failed"
+        spawn.assert_awaited_once()
+        assert "refresh token was already used" not in str(error.value)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_invocations_read_the_latest_refreshed_auth(
+        self, monkeypatch, tmp_path
+    ):
+        persistent_home = tmp_path / "codex-home"
+        persistent_home.mkdir()
+        old = {"last_refresh": "2026-10-21T10:00:00Z", "tokens": {"refresh_token": "old"}}
+        fresh = {"last_refresh": "2026-10-22T10:00:00Z", "tokens": {"refresh_token": "fresh"}}
+        (persistent_home / "auth.json").write_text(json.dumps(old))
+        config = LLMConfig(provider="codex-cli", codex_home=str(persistent_home))
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        snapshots = []
+
+        def spawn(*args, **kwargs):
+            auth_path = Path(kwargs["env"]["CODEX_HOME"]) / "auth.json"
+            position = len(snapshots)
+            snapshots.append(json.loads(auth_path.read_text()))
+            proc = AsyncMock()
+            proc.returncode = 0
+
+            async def communicate(prompt):
+                if position == 0:
+                    first_started.set()
+                    await release_first.wait()
+                    auth_path.write_text(json.dumps(fresh))
+                return b'{"ok": true}', b""
+
+            proc.communicate.side_effect = communicate
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(side_effect=spawn))
+        first = asyncio.create_task(CodexCLIProvider(config)._run_codex("first"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second = asyncio.create_task(CodexCLIProvider(config)._run_codex("second"))
+        try:
+            await asyncio.sleep(0)
+            assert len(snapshots) == 1
+        finally:
+            release_first.set()
+            results = await asyncio.gather(first, second)
+
+        assert results == ['{"ok": true}', '{"ok": true}']
+        assert snapshots == [old, fresh]
+        assert json.loads((persistent_home / "auth.json").read_text()) == fresh
+
+    @pytest.mark.asyncio
+    async def test_cancelled_invocations_release_the_auth_session(self, monkeypatch):
+        started = asyncio.Event()
+        never_finishes = asyncio.Event()
+        blocked = AsyncMock()
+        blocked.returncode = None
+
+        async def communicate(prompt):
+            started.set()
+            await never_finishes.wait()
+
+        blocked.communicate.side_effect = communicate
+        healthy = AsyncMock()
+        healthy.returncode = 0
+        healthy.communicate.return_value = (b'{"ok": true}', b"")
+        spawn = AsyncMock(side_effect=[blocked, healthy])
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        provider = CodexCLIProvider(LLMConfig(provider="codex-cli"))
+        provider._terminate_process_tree = AsyncMock()
+
+        running = asyncio.create_task(provider._run_codex("running"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        waiting = asyncio.create_task(provider._run_codex("waiting"))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        assert await asyncio.wait_for(provider._run_codex("healthy"), timeout=1) == '{"ok": true}'
+        provider._terminate_process_tree.assert_awaited_once_with(blocked)
+        assert spawn.await_count == 2
+
     def test_factory_selects_codex_cli_provider(self):
         provider = create_llm(LLMConfig(provider="codex-cli", model="gpt-5-codex"))
         assert isinstance(provider, CodexCLIProvider)
@@ -286,6 +393,49 @@ class TestCodexCLIProvider:
 
 
 class TestClaudeAndFallbackProvider:
+    @pytest.mark.parametrize("method", ["complete", "review", "walkthrough"])
+    @pytest.mark.asyncio
+    async def test_next_call_starts_with_primary_after_fallback(self, method):
+        chain = create_llm(
+            LLMConfig(
+                provider="claude-cli", fallback_provider="codex-cli", fallback_model="gpt-5.6-sol"
+            )
+        )
+        assert isinstance(chain, ProviderChain)
+        primary = AsyncMock(
+            side_effect=[LLMError("claude_usage_limit", model="fable"), "recovered"]
+        )
+        fallback = AsyncMock(return_value="fallback response")
+        setattr(chain.primary, method, primary)
+        setattr(chain.fallback, method, fallback)
+        messages = [{"role": "user", "content": "review"}]
+
+        assert await getattr(chain, method)(messages) == "fallback response"
+        assert await getattr(chain, method)(messages) == "recovered"
+
+        assert primary.await_count == 2
+        fallback.assert_awaited_once()
+        assert chain.last_provider == "primary"
+
+    @pytest.mark.asyncio
+    async def test_fallback_auth_failure_keeps_its_non_retriable_error(self):
+        chain = create_llm(
+            LLMConfig(
+                provider="claude-cli", fallback_provider="codex-cli", fallback_model="gpt-5.6-sol"
+            )
+        )
+        assert isinstance(chain, ProviderChain)
+        chain.primary.complete = AsyncMock(side_effect=LLMError("claude_timeout", seconds=1))
+        chain.fallback.complete = AsyncMock(
+            side_effect=NonRetriableLLMError("codex_auth_file_missing", path="test-auth.json")
+        )
+
+        with pytest.raises(NonRetriableLLMError) as error:
+            await chain.complete([{"role": "user", "content": "review"}])
+
+        assert error.value.code == "codex_auth_file_missing"
+        chain.fallback.complete.assert_awaited_once()
+
     def test_factory_builds_claude_to_codex_chain(self):
         provider = create_llm(
             LLMConfig(
