@@ -16,11 +16,18 @@ import os
 import shlex
 import signal
 import tempfile
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from threading import Lock
 
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
@@ -44,6 +51,7 @@ _SAFE_ENV_KEYS = frozenset(
 )
 
 _AUTH_SYNC_LOCK = Lock()
+_AUTH_SESSION_LOCK = Lock()
 
 
 class CodexCLIProvider:
@@ -221,13 +229,28 @@ class CodexCLIProvider:
         if proc.returncode is None:
             await proc.wait()
 
+    @asynccontextmanager
+    async def _auth_session(self) -> AsyncIterator[None]:
+        # A refresh token can rotate during execution. The next invocation
+        # must read its snapshot only after the previous one persists it.
+        while not _AUTH_SESSION_LOCK.acquire(blocking=False):
+            await asyncio.sleep(0.05)
+        try:
+            yield
+        finally:
+            _AUTH_SESSION_LOCK.release()
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=1, max=5),
-        retry=retry_if_exception_type(LLMError),
+        retry=retry_if_exception_type(LLMError) & retry_if_not_exception_type(NonRetriableLLMError),
         reraise=True,
     )
     async def _run_codex(self, prompt: str) -> str:
+        async with self._auth_session():
+            return await self._run_codex_once(prompt)
+
+    async def _run_codex_once(self, prompt: str) -> str:
         with tempfile.TemporaryDirectory(prefix="mira-codex-") as tmpdir:
             output_path = str(Path(tmpdir) / "last-message.txt")
             runtime_home = str(Path(tmpdir) / "runtime")
@@ -272,7 +295,25 @@ class CodexCLIProvider:
             last_message = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
 
             if proc.returncode != 0:
-                detail = (stderr_text or stdout_text or last_message).strip()
+                detail = "\n".join(
+                    text.strip()
+                    for text in (stderr_text, stdout_text, last_message)
+                    if text.strip()
+                )
+                if any(
+                    text in detail.lower()
+                    for text in (
+                        "refresh token was already used",
+                        "refresh_token_reused",
+                        "refresh_token_expired",
+                        "refresh_token_invalidated",
+                        "please log out and sign in again",
+                        "401 unauthorized",
+                        "not logged in",
+                        "authentication failed",
+                    )
+                ):
+                    raise NonRetriableLLMError("codex_auth_failed")
                 raise LLMError(
                     "codex_exit_failed",
                     exit_code=proc.returncode,

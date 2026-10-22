@@ -96,11 +96,13 @@ class ProviderChain:
                 self.fallback_attempted = True
                 self._record_attempt(self.fallback)
                 return await getattr(self.fallback, method)(*args, **kwargs)
+            except NonRetriableLLMError:
+                raise
             except Exception as fallback_error:
                 raise LLMError(
                     "both_models_failed",
-                    primary_model="primary",
-                    fallback_model="fallback",
+                    primary_model=self._model_name(self.primary),
+                    fallback_model=self._model_name(self.fallback),
                     error=fallback_error,
                 ) from fallback_error
 

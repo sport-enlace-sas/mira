@@ -1577,7 +1577,8 @@ class AppDatabase:
             if row is None:
                 return None
             cur = self._sqlite_conn.execute(
-                "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, updated_at=? "
+                "UPDATE mira_review_jobs SET status='running', attempts=attempts+1, error='', "
+                "provider_used='', fallback_used=0, models_attempted='', updated_at=? "
                 "WHERE id=? AND status='pending' AND next_attempt_at<=?",
                 (now, row[0], now),
             )
@@ -1590,7 +1591,8 @@ class AppDatabase:
                 "WITH next_job AS (SELECT id FROM mira_review_jobs "
                 "WHERE status='pending' AND next_attempt_at<=%s "
                 "ORDER BY next_attempt_at, created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
-                "UPDATE mira_review_jobs j SET status='running', attempts=j.attempts+1, updated_at=%s "
+                "UPDATE mira_review_jobs j SET status='running', attempts=j.attempts+1, error='', "
+                "provider_used='', fallback_used=FALSE, models_attempted='', updated_at=%s "
                 "FROM next_job WHERE j.id=next_job.id "
                 "RETURNING j.id,j.platform,j.owner,j.repo,j.pr_number,j.head_sha,j.pr_url,j.pr_title,"
                 "j.installation_id,j.is_private,j.attempts",
@@ -1681,7 +1683,7 @@ class AppDatabase:
             self._pg_commit()
 
     def retry_review_job(self, job_id: int) -> bool:
-        """Make a failed/current pending review eligible for immediate retry.
+        """Restart a failed/current pending review with a fresh retry budget.
 
         Superseded SHA jobs are intentionally excluded: a manual action must
         never resurrect an older commit and publish a stale advisory review.
@@ -1690,7 +1692,8 @@ class AppDatabase:
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             cur = self._sqlite_conn.execute(
-                "UPDATE mira_review_jobs SET status='pending', error='', next_attempt_at=?, updated_at=? "
+                "UPDATE mira_review_jobs SET status='pending', attempts=0, error='', "
+                "provider_used='', fallback_used=0, models_attempted='', next_attempt_at=?, updated_at=? "
                 "WHERE id=? AND status IN ('failed','pending')",
                 (now, now, job_id),
             )
@@ -1698,7 +1701,9 @@ class AppDatabase:
             return cur.rowcount > 0
         with self._pg_cursor() as cur:
             cur.execute(
-                "UPDATE mira_review_jobs SET status='pending', error='', next_attempt_at=%s, updated_at=%s "
+                "UPDATE mira_review_jobs SET status='pending', attempts=0, error='', "
+                "provider_used='', fallback_used=FALSE, models_attempted='', "
+                "next_attempt_at=%s, updated_at=%s "
                 "WHERE id=%s AND status IN ('failed','pending') RETURNING id",
                 (now, now, job_id),
             )
