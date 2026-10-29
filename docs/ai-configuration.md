@@ -22,6 +22,9 @@ client's updated authentication file under a distributed lock with revision CAS.
 Use **Validar / rotar credencial**: only a valid real inference activates the
 candidate. A failed check preserves the previous active credential. Diagnostic
 and model-discovery operations use the same per-credential lock as production.
+Imports of an already known renewable session are rejected, including stale
+snapshots from before renewal. Reuse its connection or connect a new session;
+separate credential records must not compete for the same rotating token.
 
 Model lists are scoped to credential versions. `listed` means the provider
 returned the model; `verified` additionally requires a successful inference with

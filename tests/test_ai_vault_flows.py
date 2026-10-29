@@ -732,6 +732,49 @@ def test_provider_error_classification_survives_missing_or_malformed_rate_header
     assert caught.value.status == status
 
 
+def test_bedrock_throttling_history_and_logs_do_not_contain_provider_secrets(caplog):
+    from mira.ai.runtime import classify
+    from mira.llm.bedrock import BedrockProvider, _BedrockThrottlingError
+
+    provider = BedrockProvider(LLMConfig(ai_managed=True), client=SimpleNamespace())
+    error = type("ThrottlingException", (Exception,), {})("SENSITIVE_PROVIDER_TEST_VALUE")
+    with pytest.raises(_BedrockThrottlingError) as caught:
+        provider._handle_api_error(error, "model")
+    assert "SENSITIVE_PROVIDER_TEST_VALUE" not in caplog.text
+    assert classify(caught.value)[0] == "quota"
+
+
+async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credential(store):
+    cid, credential = connection(store)
+    chain(store, cid, ("invalid", "valid"))
+    runtime = AIRuntime(store)
+
+    async def invoke(config):
+        return (
+            '{"detail":"authentication failure described in the PR"}'
+            if config.model == "invalid"
+            else '{"answer":"valid"}'
+        )
+
+    mock_broker(runtime, invoke)
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
+    assert (
+        await runtime.provider(LLMConfig()).complete_with_tools([], [tool]) == '{"answer":"valid"}'
+    )
+    assert store.runs()[0]["steps"][0]["cause"] == "invalid"
+    assert store.credential_metadata(credential)["status"] == "ready"
+
+
 @pytest.mark.skipif(
     not os.environ.get("AI_TEST_DATABASE_URL"), reason="Postgres coverage runs in GitHub Actions"
 )

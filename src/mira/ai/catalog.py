@@ -103,8 +103,13 @@ def curated(provider: str) -> list[dict]:
     ids = list(registry.all_models())
     if provider == "claude-cli":
         ids = [m for m in ids if m.startswith("anthropic/")]
+        ids = list(dict.fromkeys([*ids, "anthropic/claude-fable-5-1"]))
     elif provider == "codex-cli":
         ids = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-5.6-sol"]
+    elif provider == "bedrock":
+        # OpenRouter IDs are not valid Bedrock IDs. Discovery remains available
+        # with AWS credentials; imported flows preserve their original IDs.
+        ids = []
     return [
         {
             "id": m.split("/", 1)[-1] if provider in {"codex-cli", "claude-cli"} else m,

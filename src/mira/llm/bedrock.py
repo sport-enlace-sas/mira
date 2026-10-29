@@ -216,11 +216,19 @@ class BedrockProvider:
 
         # Throttling — retryable
         if error_name in ("ThrottlingException", "ServiceUnavailableException"):
-            logger.warning("Bedrock throttled: model=%s, error=%s", model, error_msg)
+            logger.warning(
+                "Bedrock throttled: model=%s, error=%s",
+                model,
+                error_name if self.config.ai_managed else error_msg,
+            )
             raise _BedrockThrottlingError(error_msg) from error
 
         if "ThrottlingException" in error_msg or "Too many requests" in error_msg:
-            logger.warning("Bedrock throttled: model=%s, error=%s", model, error_msg)
+            logger.warning(
+                "Bedrock throttled: model=%s, error=%s",
+                model,
+                error_name if self.config.ai_managed else error_msg,
+            )
             raise _BedrockThrottlingError(error_msg) from error
 
         # Access denied — not retryable, clear message

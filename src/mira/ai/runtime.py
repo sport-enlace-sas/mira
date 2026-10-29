@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from jsonschema import validate
+from jsonschema.exceptions import ValidationError as SchemaValidationError
 
 from mira.ai.credentials import CredentialBroker
 from mira.ai.models import SCENARIOS, FlowInput
@@ -54,7 +55,9 @@ def classify(error: Exception) -> tuple[str, str]:
     """Return only fixed codes/actions; upstream text can contain tokens."""
     if isinstance(error, TimeoutError):
         return "timeout", "Revisar timeout o proveedor"
-    if isinstance(error, json.JSONDecodeError):
+    if isinstance(error, (json.JSONDecodeError, SchemaValidationError)) or str(error).startswith(
+        "invalid_response"
+    ):
         return "invalid", "Elegir un modelo compatible con el contrato"
     chain: list[str] = []
     seen: set[int] = set()
@@ -66,7 +69,17 @@ def classify(error: Exception) -> tuple[str, str]:
             "bedrock_model_not_found",
         }:
             return "access", "Elegir un modelo disponible para esta cuenta"
-        chain.extend((str(cursor).lower(), str(getattr(cursor, "code", ""))))
+        if getattr(cursor, "code", "") in {
+            "codex_malformed_json",
+            "codex_non_object_json",
+            "codex_no_json_object",
+            "codex_empty_response",
+            "no_tool_call",
+        }:
+            return "invalid", "Elegir un modelo compatible con el contrato"
+        chain.extend(
+            (str(cursor).lower(), str(getattr(cursor, "code", "")), type(cursor).__name__.lower())
+        )
         cursor = cursor.__cause__ or cursor.__context__
     text = " ".join(chain)
     if any(word in text for word in ("almacén", "recuperación", "vault")):
@@ -84,7 +97,16 @@ def classify(error: Exception) -> tuple[str, str]:
     if any(x in text for x in ("auth", "401", "403", "token_expired", "credential", "no_api_key")):
         return "auth", "Reconectar o rotar la credencial"
     if any(
-        x in text for x in ("quota", "429", "usage_limit", "rate limit", "hit your", "reached your")
+        x in text
+        for x in (
+            "quota",
+            "429",
+            "usage_limit",
+            "rate limit",
+            "hit your",
+            "reached your",
+            "throttl",
+        )
     ):
         return "quota", "Esperar el reinicio de cuota o elegir otro modelo"
     if "timeout" in text or "timed out" in text:
