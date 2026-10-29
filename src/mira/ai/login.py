@@ -50,7 +50,7 @@ def _login_url(candidate: str, provider: str) -> str | None:
         and parsed.hostname in {"claude.com", "claude.ai", "console.anthropic.com"}
         and parsed.path in {"/cai/oauth/authorize", "/oauth/authorize"}
         and query.get("code") == ["true"]
-        and query.get("response_type") == ["code"]
+        and set(query.get("response_type", [])) == {"code"}
     ):
         query.pop("code")
     if set(query) & {"code", "access_token", "refresh_token", "id_token", "token"}:

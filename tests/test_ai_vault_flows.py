@@ -789,6 +789,16 @@ async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credenti
             "https://claude.ai/oauth/authorize?code=true&response_type=code",
             True,
         ),
+        (
+            "claude-cli",
+            "https://claude.com/cai/oauth/authorize?code=true&response_type=code&response_type=code",
+            True,
+        ),
+        (
+            "claude-cli",
+            "https://claude.com/cai/oauth/authorize?code=true&response_type=code&response_type=token",
+            False,
+        ),
         ("codex-cli", "https://auth.openai.com/codex/device", True),
         ("claude-cli", "https://claude.com/cai/oauth/authorize?code=PRIVATE_TEST", False),
         ("claude-cli", "https://claude.com/cai/oauth/authorize?code=", False),
