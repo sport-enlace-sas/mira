@@ -837,3 +837,25 @@ async def test_postgres_versions_encryption_and_cross_process_locks(tmp_path):
         assert not acquired.is_set()
     await asyncio.wait_for(task, 2)
     assert acquired.is_set()
+
+
+def test_connection_transport_cannot_redirect_opaque_credentials_but_metadata_can_change(store):
+    cid, credential = connection(store, "responses", "opaque-provider-key")
+    original = {key: store.connection(cid)[key] for key in ConnectionInput.model_fields}
+    with api_client(store, SimpleNamespace(id=1, is_admin=True)) as client:
+        for field, value in (
+            ("base_url", "https://untrusted.invalid/v1"),
+            ("region", "eu-west-1"),
+            ("provider", "openai"),
+        ):
+            response = client.put(f"/api/ai/connections/{cid}", json={**original, field: value})
+            assert response.status_code == 400
+            assert "opaque-provider-key" not in response.text
+            assert store.connection(cid)[field] == original[field]
+            assert store.connection(cid)["active_credential"] == credential
+        response = client.put(
+            f"/api/ai/connections/{cid}", json={**original, "name": "Renamed", "enabled": False}
+        )
+        assert response.status_code == 200
+        assert store.connection(cid)["name"] == "Renamed"
+        assert store.connection(cid)["enabled"] is False
