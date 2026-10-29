@@ -82,7 +82,11 @@ async def verify_fixes(
     """Ask the LLM which previously-filed review issues are now fixed."""
     prompt = build_verify_fixes_prompt(file_groups)
     logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
-    response = await llm.complete(prompt, json_mode=True, temperature=0.0)
+    from mira.ai.runtime import for_scenario
+
+    response = await for_scenario(llm, "fix_verification").complete(
+        prompt, json_mode=True, temperature=0.0
+    )
     logger.debug("Verify-fixes raw response:\n%s", response)
     return parse_verify_fixes_response(response)
 
@@ -94,7 +98,11 @@ async def verify_fix_decisions(
     """Ask for structured finding states used by evolution reporting."""
     prompt = build_verify_fixes_prompt(file_groups)
     logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
-    response = await llm.complete(prompt, json_mode=True, temperature=0.0)
+    from mira.ai.runtime import for_scenario
+
+    response = await for_scenario(llm, "fix_verification").complete(
+        prompt, json_mode=True, temperature=0.0
+    )
     logger.debug("Verify-fixes raw response:\n%s", response)
     return parse_verify_fix_results(response)
 

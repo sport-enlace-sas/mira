@@ -113,18 +113,17 @@ class BedrockProvider:
     supports_json_mode: ClassVar[bool] = False
     supports_tool_calling: ClassVar[bool] = True
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(self, config: LLMConfig, *, client=None) -> None:
         try:
             import boto3
         except ImportError as e:
             raise LLMError("bedrock_no_boto3") from e
 
         self.config = config
-        session = boto3.Session(
-            profile_name=config.aws_profile,
-            region_name=config.region,
-        )
-        self._client = session.client("bedrock-runtime")
+        if client is None:
+            session = boto3.Session(profile_name=config.aws_profile, region_name=config.region)
+            client = session.client("bedrock-runtime")
+        self._client = client
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         logger.info(

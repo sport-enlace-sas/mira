@@ -262,6 +262,11 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
 @router.put("/api/settings/models")
 def set_models(body: ModelsUpdate, request: Request) -> dict:
     _require_admin(request)
+    from mira.ai.runtime import current
+
+    runtime = current()
+    if runtime is not None and runtime.managed():
+        raise HTTPException(409, "Los modelos se configuran en Configuración → IA → Flujos")
     from mira.dashboard.models_config import API_STYLE_VALUES, THINKING_MODE_VALUES
 
     if body.review_thinking_mode not in THINKING_MODE_VALUES:

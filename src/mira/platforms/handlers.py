@@ -111,6 +111,12 @@ async def run_pr_review(
     llm = create_llm(llm_config_for("review", config.llm))
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))
     security_llm = create_llm(llm_config_for("security", config.llm))
+    from mira.ai.runtime import FlowProvider
+
+    if isinstance(llm, FlowProvider):
+        llm.shared["job_id"] = str(job_id or "")
+        indexing_llm = llm.for_scenario("indexing")
+        security_llm = llm.for_scenario("security")
     engine = ReviewEngine(
         config=config,
         llm=llm,
@@ -159,6 +165,8 @@ async def run_pr_review(
                         error=ocr_plan.error,
                     )
                 chains = (llm, indexing_llm, security_llm)
+                if isinstance(llm, FlowProvider):
+                    chains = (llm,)
                 fallback_used = any(
                     bool(getattr(candidate, "fallback_attempted", False))
                     or getattr(candidate, "last_provider", "primary") == "fallback"
@@ -182,7 +190,11 @@ async def run_pr_review(
                 _app_db.set_review_job_execution(
                     job_id,
                     provider_used=(
-                        config.llm.fallback_provider if fallback_used else config.llm.provider
+                        llm.shared.get("last_success_provider", "unknown")
+                        if isinstance(llm, FlowProvider)
+                        else config.llm.fallback_provider
+                        if fallback_used
+                        else config.llm.provider
                     )
                     or "unknown",
                     fallback_used=fallback_used,
@@ -348,7 +360,9 @@ async def run_pr_command(
             pr_title=pr_info.title,
             pr_description=pr_info.description,
         )
-        response = await llm.complete(messages, json_mode=False)
+        from mira.ai.runtime import for_scenario
+
+        response = await for_scenario(llm, "conversation").complete(messages, json_mode=False)
         await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
         logger.info("Replied to comment on %s", pr_url)
 
@@ -377,6 +391,9 @@ async def run_thread_reply(
     """
     config = load_config()
     llm = create_llm(llm_config_for("indexing", config.llm))
+    from mira.ai.runtime import for_scenario
+
+    llm = for_scenario(llm, "thread_reply")
     prompt = _THREAD_REPLY_TEMPLATE.render(
         user_reply=human_reply or "(empty)",
         original_suggestion=original_suggestion,

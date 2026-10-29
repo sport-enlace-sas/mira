@@ -39,6 +39,11 @@ def _create_single_llm(config: LLMConfig) -> LLMProviderProtocol:
 
 def create_llm(config: LLMConfig) -> LLMProviderProtocol:
     """Create one provider or an explicit cross-provider fallback chain."""
+    from mira.ai.runtime import current
+
+    runtime = current()
+    if runtime is not None and runtime.managed():
+        return runtime.provider(config)
     if not config.fallback_provider:
         return _create_single_llm(config)
 

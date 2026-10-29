@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import time
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import ClassVar, Protocol, runtime_checkable
 
 import httpx
@@ -192,7 +196,8 @@ class OpenAICompatibleProvider:
             return
         if body.get("model") in self._no_reasoning:
             return
-        effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
+        if not self.config.ai_managed:
+            effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
         body["reasoning"] = {"effort": effort}
         body.pop("temperature", None)
 
@@ -211,9 +216,27 @@ class OpenAICompatibleProvider:
     def _handle_error(resp: httpx.Response) -> None:
         """Raise LLMError or NonRetriableLLMError on non-200 responses."""
         if resp.status_code != 200:
-            if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                raise NonRetriableLLMError("api_error", status=resp.status_code, body=resp.text)
-            raise LLMError("api_error", status=resp.status_code, body=resp.text)
+            cls = (
+                NonRetriableLLMError
+                if 400 <= resp.status_code < 500 and resp.status_code != 429
+                else LLMError
+            )
+            error = cls("api_error", status=resp.status_code, body=resp.text)
+            error.status = resp.status_code
+            retry_after = resp.headers.get("retry-after", "")
+            try:
+                error.retry_at = time.time() + float(retry_after)
+            except ValueError:
+                if retry_after:
+                    with contextlib.suppress(ValueError, TypeError):
+                        error.retry_at = parsedate_to_datetime(retry_after).timestamp()
+            reset = resp.headers.get("anthropic-ratelimit-requests-reset", "")
+            if reset:
+                with contextlib.suppress(ValueError):
+                    error.reset_at = datetime.fromisoformat(
+                        reset.replace("Z", "+00:00")
+                    ).timestamp()
+            raise error
 
     # ── Subclass hooks (abstract) ──────────────────────────────────
 

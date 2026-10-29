@@ -43,6 +43,9 @@ def register_dashboard(app: FastAPI) -> None:
     )
     app.add_middleware(AuthMiddleware, db=_app_db)
     app.include_router(create_auth_router(_app_db))
+    from mira.ai.api import create_ai_router
+
+    app.include_router(create_ai_router(_app_db))
     app.include_router(router)
 
 

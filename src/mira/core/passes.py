@@ -134,6 +134,10 @@ async def agentic_review_loop(
 
 def _indexing_llm(fallback: LLMProviderProtocol) -> LLMProviderProtocol:
     """Build an indexing-tier provider, falling back to ``fallback`` on error."""
+    from mira.ai.runtime import FlowProvider
+
+    if isinstance(fallback, FlowProvider):
+        return fallback.for_scenario("indexing")
     try:
         return create_llm(llm_config_for("indexing", load_config().llm))
     except Exception:
@@ -142,6 +146,10 @@ def _indexing_llm(fallback: LLMProviderProtocol) -> LLMProviderProtocol:
 
 def _security_llm(fallback: LLMProviderProtocol) -> LLMProviderProtocol:
     """Build a security-tier provider, falling back to ``fallback`` on error."""
+    from mira.ai.runtime import FlowProvider
+
+    if isinstance(fallback, FlowProvider):
+        return fallback.for_scenario("security")
     try:
         return create_llm(llm_config_for("security", load_config().llm))
     except Exception:
@@ -254,7 +262,7 @@ async def _security_scan_once(
             )
     except Exception as exc:
         # Retry on the main LLM rather than drop the security pass entirely.
-        if sec_llm is not fallback_llm:
+        if sec_llm is not fallback_llm and getattr(sec_llm.config, "ai_managed", False) is not True:
             logger.warning(
                 "Security pass on security tier failed (%s); retrying on review LLM",
                 exc,
@@ -311,7 +319,9 @@ async def dependency_review_pass(
     if not manifest_files:
         return []
 
-    dep_llm = indexing_llm or _indexing_llm(llm)
+    from mira.ai.runtime import for_scenario
+
+    dep_llm = for_scenario(indexing_llm or _indexing_llm(llm), "dependencies")
 
     messages = build_dependency_review_prompt(
         files=manifest_files,
@@ -326,7 +336,7 @@ async def dependency_review_pass(
         )
     except Exception as exc:
         # Retry on the main LLM rather than drop the pass entirely.
-        if dep_llm is not llm:
+        if dep_llm is not llm and getattr(dep_llm.config, "ai_managed", False) is not True:
             logger.warning(
                 "Dependency pass on indexing tier failed (%s); retrying on review LLM",
                 exc,
@@ -477,7 +487,9 @@ async def self_critique(
         "it anyway.\n\n" + rules_block + "## Draft comments\n\n" + "\n".join(draft_lines)
     )
 
-    critic_llm = indexing_llm or _indexing_llm(llm)
+    from mira.ai.runtime import for_scenario
+
+    critic_llm = for_scenario(indexing_llm or _indexing_llm(llm), "self_critique")
 
     try:
         raw = await critic_llm.complete_with_tools(
@@ -579,7 +591,9 @@ async def regenerate_summary(
         + "\n\nReturn just the summary text — no preamble, no quotes."
     )
 
-    summary_llm = indexing_llm or _indexing_llm(llm)
+    from mira.ai.runtime import for_scenario
+
+    summary_llm = for_scenario(indexing_llm or _indexing_llm(llm), "summary")
 
     try:
         text = await summary_llm.complete(
@@ -634,7 +648,9 @@ async def generate_pr_summary(
         + "\n\nReturn just the grouped bullets — no preamble, no quotes."
     )
 
-    summary_llm = indexing_llm or _indexing_llm(llm)
+    from mira.ai.runtime import for_scenario
+
+    summary_llm = for_scenario(indexing_llm or _indexing_llm(llm), "summary")
     try:
         text = await summary_llm.complete(
             messages=[{"role": "user", "content": prompt}],

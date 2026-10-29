@@ -27,7 +27,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 COPY . /app
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
  && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "/app[serve,bedrock]"
 

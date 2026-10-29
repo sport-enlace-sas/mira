@@ -1067,6 +1067,11 @@ class ReviewEngine:
                 provider_used = (
                     self.config.llm.fallback_provider if fallback_used else self.config.llm.provider
                 ) or "unknown"
+                from mira.ai.runtime import FlowProvider
+
+                if isinstance(self.llm, FlowProvider):
+                    fallback_used = self.llm.fallback_attempted
+                    provider_used = self.llm.shared.get("last_success_provider", "unknown")
                 markdown = build_compact_audit_report(
                     head_sha=report_scope,
                     previous_sha=previous_reviewed_sha,

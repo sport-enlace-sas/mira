@@ -170,7 +170,9 @@ async def detect_overlaps(
     # Stage 2 — one batched LLM judgment over the shortlist.
     messages = build_overlap_prompt(pr_info, current, survivors)
     try:
-        raw = await llm.complete(messages, json_mode=True)
+        from mira.ai.runtime import for_scenario
+
+        raw = await for_scenario(llm, "overlap").complete(messages, json_mode=True)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Overlap LLM judgment failed, skipping: %s", exc)
         return []
