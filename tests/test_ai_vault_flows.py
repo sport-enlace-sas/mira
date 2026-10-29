@@ -694,6 +694,44 @@ async def test_migration_is_staged_idempotent_and_contains_sol_max_template(stor
     assert "legacy-token" not in json.dumps(store.connections())
 
 
+def test_imported_renewable_sessions_cannot_be_forked_or_reintroduced_after_refresh(store):
+    cid = store.save_connection(ConnectionInput(name="Codex", provider="codex-cli").model_dump(), 1)
+    old = {"tokens": {"access_token": "old-access", "refresh_token": "old-refresh"}}
+    fresh = {"tokens": {"access_token": "new-access", "refresh_token": "new-refresh"}}
+    credential = Vault(store).stage(cid, "session", old, 1)
+    secret, revision = Vault(store).read(credential)
+    secret["auth"] = fresh
+    Vault(store).update(credential, revision, secret)
+    for duplicate in (old, fresh):
+        with pytest.raises(ConflictError, match="sesión ya existe"):
+            Vault(store).stage(cid, "session", duplicate, 1)
+    assert len(store.credentials(cid)) == 1
+    assert Vault(store).read(credential)[0]["auth"] == fresh
+    other = {"tokens": {"access_token": "other-access", "refresh_token": "other-refresh"}}
+    assert Vault(store).stage(cid, "session", other, 1)
+    assert "fingerprint" not in json.dumps(store.credentials(cid))
+
+
+@pytest.mark.parametrize("status", [400, 429, 503])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"retry-after": "not-a-date", "anthropic-ratelimit-requests-reset": "invalid"},
+        MagicMock(),
+    ],
+)
+def test_provider_error_classification_survives_missing_or_malformed_rate_headers(status, headers):
+    from mira.exceptions import LLMError
+    from mira.llm.base import OpenAICompatibleProvider
+
+    response = SimpleNamespace(status_code=status, text="provider failure", headers=headers)
+    with pytest.raises(LLMError) as caught:
+        OpenAICompatibleProvider._handle_error(response)
+    assert isinstance(caught.value, NonRetriableLLMError) == (status == 400)
+    assert caught.value.status == status
+
+
 @pytest.mark.skipif(
     not os.environ.get("AI_TEST_DATABASE_URL"), reason="Postgres coverage runs in GitHub Actions"
 )

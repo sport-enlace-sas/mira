@@ -11,6 +11,7 @@ import asyncio
 import base64
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -36,6 +37,9 @@ CREATE TABLE IF NOT EXISTS ai_credentials (
  revision INTEGER NOT NULL, ciphertext TEXT NOT NULL, data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ai_credentials_connection ON ai_credentials(connection_id);
+CREATE TABLE IF NOT EXISTS ai_session_aliases (
+ fingerprint TEXT PRIMARY KEY, credential_id TEXT NOT NULL REFERENCES ai_credentials(id)
+);
 CREATE TABLE IF NOT EXISTS ai_flows (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0
 );
@@ -408,6 +412,36 @@ class Vault:
         )
         return base64.b64encode(nonce + encrypted).decode()
 
+    def _session_alias(self, secret: dict) -> str | None:
+        auth = secret.get("auth", {})
+        token = auth.get("tokens", {}).get("refresh_token")
+        provider = "codex"
+        if not token:
+            token = auth.get("claudeAiOauth", {}).get("refreshToken")
+            provider = "claude"
+        if not isinstance(token, str) or not token:
+            return None
+        return hmac.new(self._key(), (provider + ":" + token).encode(), hashlib.sha256).hexdigest()
+
+    def _register_session(self, cursor: Any, alias: str | None, credential_id: str) -> None:
+        if alias is None:
+            return
+        cursor.execute(
+            self.store.sql(
+                "INSERT INTO ai_session_aliases VALUES(?,?) ON CONFLICT(fingerprint) DO NOTHING"
+            ),
+            (alias, credential_id),
+        )
+        if cursor.rowcount == 0:
+            cursor.execute(
+                self.store.sql("SELECT credential_id FROM ai_session_aliases WHERE fingerprint=?"),
+                (alias,),
+            )
+            if cursor.fetchone()[0] != credential_id:
+                raise ConflictError(
+                    "Esta sesión ya existe en MIRA; reutiliza su conexión o inicia una sesión nueva"
+                )
+
     def read(self, credential_id: str) -> tuple[dict, int]:
         rows = self.store.rows(
             "SELECT ciphertext,revision FROM ai_credentials WHERE id=?", (credential_id,)
@@ -441,10 +475,13 @@ class Vault:
             "checked_at": None,
             "expires_at": reported_expiry(data),
         }
-        self.store.execute(
-            "INSERT INTO ai_credentials VALUES(?,?,1,?,?)",
-            (credential_id, connection_id, ciphertext, json.dumps(metadata)),
-        )
+        alias = self._session_alias(data)
+        with self.store.transaction() as cur:
+            cur.execute(
+                self.store.sql("INSERT INTO ai_credentials VALUES(?,?,1,?,?)"),
+                (credential_id, connection_id, ciphertext, json.dumps(metadata)),
+            )
+            self._register_session(cur, alias, credential_id)
         self.store.audit(actor, "credential.staged", credential_id)
         return credential_id
 
@@ -455,16 +492,19 @@ class Vault:
         data = {k: v for k, v in current.items() if k not in {"id", "revision", "connection_id"}}
         data.update(metadata or {})
         data["expires_at"] = reported_expiry(secret)
-        if (
-            self.store.execute(
-                "UPDATE ai_credentials SET ciphertext=?,data=?,revision=revision+1 WHERE id=? AND revision=?",
-                (self.seal(credential_id, secret), json.dumps(data), credential_id, revision),
+        ciphertext, alias = self.seal(credential_id, secret), self._session_alias(secret)
+        with self.store.transaction() as cur:
+            cur.execute(
+                self.store.sql(
+                    "UPDATE ai_credentials SET ciphertext=?,data=?,revision=revision+1 WHERE id=? AND revision=?"
+                ),
+                (ciphertext, json.dumps(data), credential_id, revision),
             )
-            != 1
-        ):
-            raise ConflictError(
-                "La credencial fue renovada por otra operación; se descartó la escritura antigua"
-            )
+            if cur.rowcount != 1:
+                raise ConflictError(
+                    "La credencial fue renovada por otra operación; se descartó la escritura antigua"
+                )
+            self._register_session(cur, alias, credential_id)
 
     def activate(
         self, connection_id: str, credential_id: str, actor: int, expected_active: str | None = None

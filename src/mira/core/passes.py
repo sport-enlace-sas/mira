@@ -262,7 +262,10 @@ async def _security_scan_once(
             )
     except Exception as exc:
         # Retry on the main LLM rather than drop the security pass entirely.
-        if sec_llm is not fallback_llm and getattr(sec_llm.config, "ai_managed", False) is not True:
+        if (
+            sec_llm is not fallback_llm
+            and getattr(getattr(sec_llm, "config", None), "ai_managed", False) is not True
+        ):
             logger.warning(
                 "Security pass on security tier failed (%s); retrying on review LLM",
                 exc,
@@ -336,7 +339,10 @@ async def dependency_review_pass(
         )
     except Exception as exc:
         # Retry on the main LLM rather than drop the pass entirely.
-        if dep_llm is not llm and getattr(dep_llm.config, "ai_managed", False) is not True:
+        if (
+            dep_llm is not llm
+            and getattr(getattr(dep_llm, "config", None), "ai_managed", False) is not True
+        ):
             logger.warning(
                 "Dependency pass on indexing tier failed (%s); retrying on review LLM",
                 exc,

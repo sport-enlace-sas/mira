@@ -224,6 +224,8 @@ class OpenAICompatibleProvider:
             error = cls("api_error", status=resp.status_code, body=resp.text)
             error.status = resp.status_code
             retry_after = resp.headers.get("retry-after", "")
+            if not isinstance(retry_after, str):
+                retry_after = ""
             try:
                 error.retry_at = time.time() + float(retry_after)
             except ValueError:
@@ -231,7 +233,7 @@ class OpenAICompatibleProvider:
                     with contextlib.suppress(ValueError, TypeError):
                         error.retry_at = parsedate_to_datetime(retry_after).timestamp()
             reset = resp.headers.get("anthropic-ratelimit-requests-reset", "")
-            if reset:
+            if isinstance(reset, str) and reset:
                 with contextlib.suppress(ValueError):
                     error.reset_at = datetime.fromisoformat(
                         reset.replace("Z", "+00:00")
