@@ -776,6 +776,42 @@ async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credenti
     assert store.credential_metadata(credential)["status"] == "ready"
 
 
+@pytest.mark.parametrize(
+    ("provider", "url", "expected"),
+    [
+        (
+            "claude-cli",
+            "https://claude.com/cai/oauth/authorize?code=true&response_type=code&state=test&code_challenge=test",
+            True,
+        ),
+        (
+            "claude-cli",
+            "https://claude.ai/oauth/authorize?code=true&response_type=code",
+            True,
+        ),
+        ("codex-cli", "https://auth.openai.com/codex/device", True),
+        ("claude-cli", "https://claude.com/cai/oauth/authorize?code=PRIVATE_TEST", False),
+        ("claude-cli", "https://claude.com/cai/oauth/authorize?code=", False),
+        (
+            "claude-cli",
+            "https://claude.com/cai/oauth/authorize?code=true&response_type=code&access_token=PRIVATE_TEST",
+            False,
+        ),
+        (
+            "codex-cli",
+            "https://claude.com/cai/oauth/authorize?code=true&response_type=code",
+            False,
+        ),
+        ("claude-cli", "https://claude.com/callback#access_token=PRIVATE_TEST", False),
+        ("claude-cli", "https://claude.com.attacker.test/cai/oauth/authorize", False),
+    ],
+)
+def test_native_login_links_allow_claude_display_flag_but_reject_result_tokens(provider, url, expected):
+    from mira.ai.login import _login_url
+
+    assert _login_url(url, provider) == (url if expected else None)
+
+
 def test_resuming_login_is_owner_bound_and_does_not_return_credentials(store):
     from mira.ai.login import LoginManager
 
