@@ -20,11 +20,42 @@ _ALLOWED = {
     "auth.openai.com",
     "chatgpt.com",
     "platform.openai.com",
+    "claude.com",
     "claude.ai",
     "console.anthropic.com",
     "platform.claude.com",
     "auth.claude.com",
 }
+
+
+def _login_url(candidate: str, provider: str) -> str | None:
+    candidate = candidate.rstrip(".,)")
+    try:
+        parsed = urlsplit(candidate)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _ALLOWED
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        return None
+    # Claude's native authorization URL uses code=true to request manual code
+    # display. This is a boolean option, not an authorization result or token.
+    if (
+        provider == "claude-cli"
+        and parsed.hostname in {"claude.com", "claude.ai", "console.anthropic.com"}
+        and parsed.path in {"/cai/oauth/authorize", "/oauth/authorize"}
+        and query.get("code") == ["true"]
+        and query.get("response_type") == ["code"]
+    ):
+        query.pop("code")
+    if set(query) & {"code", "access_token", "refresh_token", "id_token", "token"}:
+        return None
+    return candidate
 
 
 class LoginManager:
@@ -153,11 +184,8 @@ class LoginManager:
                             buffer = (buffer + chunk.decode(errors="replace"))[-32768:]
                             clean = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", buffer)
                             for url in re.findall(r"https://[^\s\x1b<>]+", clean):
-                                parsed = urlsplit(url)
-                                if parsed.hostname in _ALLOWED and not set(
-                                    parse_qs(parsed.query)
-                                ) & {"code", "access_token", "refresh_token", "token"}:
-                                    session["url"] = url.rstrip(".,)")
+                                if public_url := _login_url(url, provider):
+                                    session["url"] = public_url
                             if provider == "codex-cli":
                                 match = re.search(r"\b[A-Z0-9]{4,5}-[A-Z0-9]{4,5}\b", clean)
                                 if match:
