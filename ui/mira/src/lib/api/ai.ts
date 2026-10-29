@@ -137,6 +137,8 @@ export const aiApi = {
       {}
     ),
   login: (id: string) => postJson<Login>(`/api/ai/connections/${id}/login`, {}),
+  resumeLogin: (id: string) =>
+    fetchJson<Login | null>(`/api/ai/connections/${id}/login`),
   loginStatus: (id: string) => fetchJson<Login>(`/api/ai/logins/${id}`),
   loginCode: (id: string, code: string) =>
     postJson<Login>(`/api/ai/logins/${id}/code`, { code }),

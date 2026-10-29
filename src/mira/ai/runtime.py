@@ -183,6 +183,16 @@ class FlowProvider:
         shared: dict | None = None,
     ) -> None:
         self.runtime, self.scenario, self.snapshot = runtime, scenario, snapshot
+        node_connections = [
+            runtime.store.connection(n["connection_id"])
+            for n in snapshot.get(scenario, {}).get("nodes", [])
+        ]
+        api_only = bool(node_connections) and all(
+            c["provider"] not in {"claude-cli", "codex-cli"} for c in node_connections
+        )
+        self.supports_tool_calling = api_only
+        self.supports_temperature = api_only
+        self.supports_max_tokens = api_only
         self.config = config.model_copy(update={"ai_managed": True, "ai_scenario": scenario})
         if snapshot.get(scenario, {}).get("nodes"):
             first = FlowInput.model_validate(

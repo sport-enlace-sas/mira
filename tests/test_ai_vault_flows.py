@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import tomllib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -773,6 +774,42 @@ async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credenti
     )
     assert store.runs()[0]["steps"][0]["cause"] == "invalid"
     assert store.credential_metadata(credential)["status"] == "ready"
+
+
+def test_resuming_login_is_owner_bound_and_does_not_return_credentials(store):
+    from mira.ai.login import LoginManager
+
+    manager = LoginManager(store)
+    manager.sessions["login"] = {
+        "id": "login",
+        "connection_id": "connection",
+        "actor": 1,
+        "status": "pending",
+        "expires_at": time.time() + 600,
+        "secret": "PRIVATE_TEST_VALUE",
+    }
+    assert manager.latest("connection", 1)["id"] == "login"
+    assert manager.latest("connection", 2) is None
+    assert "PRIVATE_TEST_VALUE" not in json.dumps(manager.latest("connection", 1))
+    with pytest.raises(ValueError):
+        manager.public("login", 2)
+    manager.sessions["login"]["expires_at"] = 0
+    assert manager.latest("connection", 1) is None
+
+
+def test_api_flows_preserve_agentic_tools_and_cli_flows_preserve_prompt_contract(store):
+    api_id, _ = connection(store, "responses")
+    chain(store, api_id, ("model",))
+    api = AIRuntime(store).provider(LLMConfig())
+    assert api.supports_tool_calling and api.supports_temperature and api.supports_max_tokens
+    cli_id, _ = connection(store)
+    chain(store, cli_id, ("claude",))
+    cli = AIRuntime(store).provider(LLMConfig())
+    assert (
+        not cli.supports_tool_calling
+        and not cli.supports_temperature
+        and not cli.supports_max_tokens
+    )
 
 
 @pytest.mark.skipif(

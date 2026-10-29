@@ -49,13 +49,29 @@ class LoginManager:
             )
         }
 
+    def latest(self, connection_id: str, actor: int) -> dict | None:
+        matches = [
+            s
+            for s in self.sessions.values()
+            if s["connection_id"] == connection_id
+            and s["actor"] == actor
+            and s["expires_at"] > time.time()
+        ]
+        return (
+            self.public(max(matches, key=lambda s: s["expires_at"])["id"], actor)
+            if matches
+            else None
+        )
+
     async def start(self, connection_id: str, actor: int) -> dict:
         connection = self.store.connection(connection_id)
         provider = connection["provider"]
         if provider not in {"codex-cli", "claude-cli"}:
             raise ValueError("Este proveedor requiere importar una clave")
         if any(
-            s["connection_id"] == connection_id and s["status"] == "pending"
+            s["connection_id"] == connection_id
+            and s["status"] == "pending"
+            and s["expires_at"] > time.time()
             for s in self.sessions.values()
         ):
             raise ValueError("Ya hay una conexión en curso para esta cuenta")

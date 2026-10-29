@@ -154,6 +154,13 @@ function ConnectionCard({
   const [busy, setBusy] = useState(false)
   const [now] = useState(() => Date.now() / 1000)
   useEffect(() => {
+    if (canManage)
+      void aiApi
+        .resumeLogin(connection.id)
+        .then(setLogin)
+        .catch(() => {})
+  }, [connection.id, canManage])
+  useEffect(() => {
     aiApi
       .models(connection.id)
       .then((data) => setModels(data.models))

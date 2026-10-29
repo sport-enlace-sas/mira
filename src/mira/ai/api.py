@@ -175,6 +175,11 @@ def create_ai_router(db: Any) -> APIRouter:
     def login_status(login_id: str, user: Any = manage_credentials) -> dict:
         return logins.public(login_id, user.id)
 
+    @router.get("/connections/{connection_id}/login")
+    def resume_login(connection_id: str, user: Any = manage_credentials) -> dict | None:
+        store.connection(connection_id)
+        return logins.latest(connection_id, user.id)
+
     @router.post("/logins/{login_id}/code")
     async def login_code(login_id: str, body: LoginCode, user: Any = manage_credentials) -> dict:
         return await logins.submit(login_id, user.id, body.code)
