@@ -211,6 +211,10 @@ class AIStore:
                 action = "connection.enabled" if data["enabled"] else "connection.disabled"
             if previous["provider"] != data["provider"]:
                 raise ValueError("El proveedor de una conexión existente no puede cambiar")
+            if any(previous[field] != data[field] for field in ("base_url", "region")):
+                raise ValueError(
+                    "El destino de una conexión existente no puede cambiar; crea una conexión nueva"
+                )
         self.execute(
             "INSERT INTO ai_connections(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             (connection_id, json.dumps(data)),
