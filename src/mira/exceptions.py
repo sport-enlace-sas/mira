@@ -39,6 +39,10 @@ class LLMError(MiraError):
         raise LLMError("tool_call_failed", model="glm-5.2", error=primary_err)
     """
 
+    status: int = 0
+    retry_at: float
+    reset_at: float
+
     def __init__(self, code: str, **kwargs: object) -> None:
         self._code = code
         self._full, self._safe = get_error_message(code, **kwargs)

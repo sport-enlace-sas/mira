@@ -25,6 +25,23 @@ class ErrorMessage:
 # Templates use {placeholder} syntax for .format() — not f-strings — so they
 # can be reused at both raise and display sites without evaluation.
 LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
+    "ai_flow_exhausted": ErrorMessage(
+        full="AI flow exhausted; diagnostic run {run_id}",
+        safe="Todos los nodos fallaron; consulta el recorrido de IA",
+    ),
+    "ai_scenario_unassigned": ErrorMessage(
+        full="AI scenario {scenario} has no assigned flow",
+        safe="El escenario no tiene un flujo de IA asignado",
+    ),
+    "ai_auth_required": ErrorMessage(
+        full="AI connection requires authentication", safe="Reconecta la cuenta de IA"
+    ),
+    "ai_provider_failed": ErrorMessage(
+        full="AI provider request failed", safe="Falló la solicitud al proveedor de IA"
+    ),
+    "claude_auth_failed": ErrorMessage(
+        full="Claude session authentication failed", safe="La sesión Claude requiere reconexión"
+    ),
     "no_api_key": ErrorMessage(
         full=(
             "No API key found. Set {api_key_env} (or OPENROUTER_API_KEY / "

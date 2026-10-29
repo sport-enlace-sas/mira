@@ -20,6 +20,7 @@ import { RelationshipsPage } from "@/pages/relationships"
 import { ReposPage } from "@/pages/repos"
 import { ReviewJobsPage } from "@/pages/review-jobs"
 import { SettingsPage } from "@/pages/settings"
+import { AIPage } from "@/pages/ai"
 import { SetupPage } from "@/pages/setup"
 import { RulesPage } from "@/pages/rules"
 import { ChangePasswordPage } from "@/pages/change-password"
@@ -207,7 +208,10 @@ export function App() {
           <Route path="repos" element={<ReposPage />} />
           <Route path="repos/:owner/:repo" element={<RepoDetailPage />} />
           <Route path="contributors" element={<ContributorsPage />} />
-          <Route path="contributors/:login" element={<ContributorDetailPage />} />
+          <Route
+            path="contributors/:login"
+            element={<ContributorDetailPage />}
+          />
           <Route path="packages" element={<PackagesPage />} />
           <Route path="relationships" element={<RelationshipsPage />} />
           <Route path="rules" element={<RulesPage />} />
@@ -227,6 +231,7 @@ export function App() {
             element={<Navigate to="/settings/models" replace />}
           />
           <Route path="settings/webhooks" element={<WebhooksPage />} />
+          <Route path="settings/ai" element={<AIPage />} />
           <Route path="settings/webhooks/new" element={<WebhookFormPage />} />
           <Route path="settings/webhooks/:id" element={<WebhookFormPage />} />
           <Route path="settings/:section" element={<SettingsPage />} />

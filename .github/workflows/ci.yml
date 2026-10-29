@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -15,6 +16,19 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: mira_test
+          POSTGRES_USER: mira_test
+          POSTGRES_PASSWORD: ci-test-only
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U mira_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +59,11 @@ jobs:
 
       - name: Test
         run: uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
+
+      - name: AI vault PostgreSQL persistence and locking
+        env:
+          AI_TEST_DATABASE_URL: postgresql://mira_test:ci-test-only@localhost:5432/mira_test
+        run: uv run pytest tests/test_ai_vault_flows.py::test_postgres_versions_encryption_and_cross_process_locks -v
 
   ui:
     runs-on: ubuntu-latest

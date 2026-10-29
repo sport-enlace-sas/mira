@@ -145,6 +145,12 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     Logs the effective model and where it came from, so a dashboard override
     shadowing mira.yaml is visible instead of silent (issue #124).
     """
+    from mira.ai.runtime import current
+
+    base = base.model_copy(update={"ai_scenario": purpose})
+    runtime = current()
+    if runtime is not None and runtime.managed():
+        return base
     db_model: str | None = None
     db_thinking: str | None = None
     db_review: str | None = None

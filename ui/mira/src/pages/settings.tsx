@@ -18,9 +18,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { useParams } from "react-router"
+import { useNavigate, useParams } from "react-router"
 
 import { api } from "@/lib/api"
+import { aiApi } from "@/lib/api/ai"
 import { useAuth } from "@/lib/auth"
 import { useDocumentTitle } from "@/lib/hooks"
 
@@ -28,6 +29,18 @@ export function SettingsPage() {
   useDocumentTitle("Settings")
   const { user: currentUser } = useAuth()
   const { section = "models" } = useParams()
+  const navigate = useNavigate()
+  useEffect(() => {
+    if (section === "models" && currentUser?.is_admin) {
+      void aiApi
+        .status()
+        .then((status) => {
+          if (status.mode === "managed")
+            navigate("/settings/ai", { replace: true })
+        })
+        .catch(() => {})
+    }
+  }, [section, currentUser, navigate])
 
   // "" = inherit from deployment config; anything else is a model id.
   const [indexingModel, setIndexingModel] = useState("")

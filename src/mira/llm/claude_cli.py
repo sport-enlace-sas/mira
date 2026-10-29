@@ -34,7 +34,7 @@ class ClaudeCLIProvider(CodexCLIProvider):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
         return env
 
-    def _command(self) -> list[str]:
+    def _command(self, output_path: str = "") -> list[str]:
         command = self.config.claude_command or "claude"
         if any(char in command for char in (" ", "\t", "\n", ";", "|", "&")):
             raise ValueError(

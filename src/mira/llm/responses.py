@@ -267,7 +267,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 json=body,
             )
             if (
-                resp.status_code == 400
+                not self.config.ai_managed
+                and resp.status_code == 400
                 and body["tool_choice"] != "auto"
                 and "tool_choice" in resp.text.lower()
             ):
@@ -275,7 +276,12 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
                 resp = await client.post(self._url, headers=self._build_headers(), json=body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                not self.config.ai_managed
+                and resp.status_code == 400
+                and "reasoning" in body
+                and "reasoning" in resp.text.lower()
+            ):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
                 body.pop("reasoning", None)
@@ -332,7 +338,12 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 headers=self._build_headers(),
                 json=body,
             )
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                not self.config.ai_managed
+                and resp.status_code == 400
+                and "reasoning" in body
+                and "reasoning" in resp.text.lower()
+            ):
                 api_model = _strip_model_prefix(model, self.config.base_url)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)

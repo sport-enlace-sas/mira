@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/tooltip"
 import { UserAvatar } from "@/components/ui/user-avatar"
 import { api } from "@/lib/api"
+import { aiApi } from "@/lib/api/ai"
 import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
@@ -110,6 +111,7 @@ export function UsersPage() {
                 <TableHead>User</TableHead>
                 <TableHead>Role</TableHead>
                 <TableHead>Last seen</TableHead>
+                <TableHead>Permisos de IA</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -143,6 +145,41 @@ export function UsersPage() {
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
                     {lastSeen(u.last_login_at)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        "ai.view",
+                        "ai.credentials.manage",
+                        "ai.flows.manage",
+                        "ai.diagnostics.run",
+                      ].map((permission) => (
+                        <label
+                          key={permission}
+                          className="flex items-center gap-1 text-xs"
+                        >
+                          <input
+                            type="checkbox"
+                            disabled={u.is_admin}
+                            checked={
+                              u.is_admin || u.permissions?.includes(permission)
+                            }
+                            onChange={(event) => {
+                              const next = event.target.checked
+                                ? [...(u.permissions || []), permission]
+                                : (u.permissions || []).filter(
+                                    (p) => p !== permission
+                                  )
+                              void aiApi
+                                .permissions(u.id, next)
+                                .then(() => setRefreshKey((k) => k + 1))
+                                .catch((e) => setDeleteError(String(e)))
+                            }}
+                          />
+                          {permission}
+                        </label>
+                      ))}
+                    </div>
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">

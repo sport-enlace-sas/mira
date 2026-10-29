@@ -209,10 +209,13 @@ class CodexCLIProvider:
         ]
         if self.config.model not in {"", "default", "codex-default"}:
             cmd.extend(["-m", self.config.model])
+        if self.config.reasoning_effort and self.config.reasoning_effort != "off":
+            cmd.extend(["-c", f'model_reasoning_effort="{self.config.reasoning_effort}"'])
         cmd.append("-")
         return cmd
 
-    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+    @staticmethod
+    async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
         """Terminate Codex and model-spawned descendants before returning."""
         if os.name == "posix":
             try:
@@ -290,6 +293,7 @@ class CodexCLIProvider:
             self._persist_codex_auth(runtime_codex_home)
 
             stdout_text = stdout.decode("utf-8", errors="replace")
+            self._account_cli_output(stdout_text)
             stderr_text = stderr.decode("utf-8", errors="replace")
             output_file = Path(output_path)
             last_message = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
@@ -321,6 +325,9 @@ class CodexCLIProvider:
                 )
 
             return (last_message or stdout_text).strip()
+
+    def _account_cli_output(self, output: str) -> None:
+        """Optional structured usage hook for managed native clients."""
 
     def _messages_prompt(self, messages: list[dict]) -> str:
         parts = [
@@ -409,9 +416,11 @@ class CodexCLIProvider:
                 "Return ONLY one valid JSON object. No markdown fences or explanatory text."
             )
         raw = await self._run_codex(prompt)
-        self.total_prompt_tokens += self.count_tokens(prompt)
+        if not self.config.ai_managed:
+            self.total_prompt_tokens += self.count_tokens(prompt)
         result = self._extract_json_object(raw) if json_mode else raw
-        self.total_completion_tokens += self.count_tokens(result)
+        if not self.config.ai_managed:
+            self.total_completion_tokens += self.count_tokens(result)
         return result
 
     async def complete_with_tools(
@@ -422,9 +431,11 @@ class CodexCLIProvider:
     ) -> str:
         prompt = self._tool_prompt(messages, tools)
         raw = await self._run_codex(prompt)
-        self.total_prompt_tokens += self.count_tokens(prompt)
+        if not self.config.ai_managed:
+            self.total_prompt_tokens += self.count_tokens(prompt)
         result = self._extract_json_object(raw)
-        self.total_completion_tokens += self.count_tokens(result)
+        if not self.config.ai_managed:
+            self.total_completion_tokens += self.count_tokens(result)
         return result
 
     async def complete_agentic(

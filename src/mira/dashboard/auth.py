@@ -7,7 +7,7 @@ import re
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from mira.dashboard.db import AppDatabase
@@ -33,6 +33,7 @@ class UserResponse(BaseModel):
     is_admin: bool
     theme: str = "dark"
     last_login_at: float = 0
+    permissions: list[str] = Field(default_factory=list)
 
 
 class SetThemeRequest(BaseModel):
@@ -56,6 +57,11 @@ class ResetPasswordRequest(BaseModel):
 
 def create_auth_router(db: AppDatabase) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+    def effective_permissions(user) -> list[str]:
+        from mira.ai.api import get_store
+
+        return get_store(db).permissions(user)
 
     @router.post("/login")
     def login(body: LoginRequest, request: Request, response: Response) -> dict:
@@ -82,6 +88,7 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
                 "username": user.username,
                 "is_admin": user.is_admin,
                 "theme": user.theme,
+                "permissions": effective_permissions(user),
             },
         }
 
@@ -103,6 +110,7 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
             "username": user.username,
             "is_admin": user.is_admin,
             "theme": user.theme,
+            "permissions": effective_permissions(user),
         }
 
     @router.put("/theme")
@@ -143,6 +151,7 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
                 "username": u.username,
                 "is_admin": u.is_admin,
                 "last_login_at": u.last_login_at,
+                "permissions": effective_permissions(u),
             }
             for u in db.list_users()
         ]
@@ -166,6 +175,9 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
         if user_id == user.id:
             return JSONResponse(status_code=400, content={"error": "Cannot delete yourself"})
         db.delete_user(user_id)
+        from mira.ai.api import get_store
+
+        get_store(db).execute("DELETE FROM ai_permissions WHERE user_id=?", (user_id,))
         return {"ok": True}
 
     @router.post("/users/{user_id}/password")

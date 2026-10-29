@@ -1,4 +1,10 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react"
 
 const API_BASE = import.meta.env.VITE_API_URL || ""
 
@@ -7,6 +13,7 @@ export interface AuthUser {
   username: string
   is_admin: boolean
   theme: "dark" | "light"
+  permissions?: string[]
 }
 
 interface AuthContextType {
@@ -45,7 +52,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false))
   }, [])
 
-  const login = async (username: string, password: string): Promise<string | null> => {
+  const login = async (
+    username: string,
+    password: string
+  ): Promise<string | null> => {
     const res = await fetch(`${API_BASE}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

@@ -167,7 +167,9 @@ async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type:
     prompt = template.render(comments=comments, max_rules=_MAX_LLM_RULES)
 
     try:
-        raw = await llm.complete(
+        from mira.ai.runtime import for_scenario
+
+        raw = await for_scenario(llm, "learning").complete(
             messages=[{"role": "user", "content": prompt}],
             json_mode=True,
             temperature=0.0,

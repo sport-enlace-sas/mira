@@ -35,6 +35,9 @@ def _is_local_host(host: str) -> bool:
 
 
 class LLMConfig(BaseModel):
+    # Internal routing metadata; no credentials are stored in config objects.
+    ai_scenario: str = Field(default="review", exclude=True)
+    ai_managed: bool = Field(default=False, exclude=True)
     model: str = "anthropic/claude-sonnet-4-6"
     fallback_model: str | None = None
     # Optional per-purpose overrides. Fall back to `model` if not set.

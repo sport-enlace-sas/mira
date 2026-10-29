@@ -72,7 +72,12 @@ import { UserAvatar } from "@/components/ui/user-avatar"
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/activity", icon: Activity, label: "Activity" },
-  { to: "/advisory-jobs", icon: ClipboardList, label: "Advisory jobs", adminOnly: true },
+  {
+    to: "/advisory-jobs",
+    icon: ClipboardList,
+    label: "Advisory jobs",
+    adminOnly: true,
+  },
   { to: "/repos", icon: Database, label: "Repositories" },
   { to: "/contributors", icon: Users2, label: "Reviewers", adminOnly: true },
   { to: "/packages", icon: Package, label: "Packages" },
@@ -86,6 +91,7 @@ const navItems = [
 // Settings is rendered as a collapsible group (admin-only) with these
 // children rather than a flat nav item.
 const settingsSubItems = [
+  { to: "/settings/ai", label: "IA · conexiones y fallbacks" },
   { to: "/settings/models", label: "Models" },
   { to: "/settings/review", label: "Review" },
   { to: "/settings/webhooks", label: "Webhooks" },
@@ -108,6 +114,7 @@ const PAGE_LABELS: Record<string, string> = {
   account: "Account",
   password: "Password",
   models: "Models",
+  ai: "IA",
   review: "Review",
   webhooks: "Webhooks",
 }
@@ -269,7 +276,7 @@ export function DashboardLayout() {
                   </SidebarMenuItem>
                 ))}
 
-                {user?.is_admin && (
+                {(user?.is_admin || user?.permissions?.includes("ai.view")) && (
                   <Collapsible
                     asChild
                     defaultOpen={onSettings}
@@ -285,18 +292,23 @@ export function DashboardLayout() {
                       </CollapsibleTrigger>
                       <CollapsibleContent>
                         <SidebarMenuSub>
-                          {settingsSubItems.map((sub) => (
-                            <SidebarMenuSubItem key={sub.to}>
-                              <SidebarMenuSubButton
-                                asChild
-                                className={navActive}
-                              >
-                                <NavLink to={sub.to}>
-                                  <span>{sub.label}</span>
-                                </NavLink>
-                              </SidebarMenuSubButton>
-                            </SidebarMenuSubItem>
-                          ))}
+                          {settingsSubItems
+                            .filter(
+                              (sub) =>
+                                user?.is_admin || sub.to === "/settings/ai"
+                            )
+                            .map((sub) => (
+                              <SidebarMenuSubItem key={sub.to}>
+                                <SidebarMenuSubButton
+                                  asChild
+                                  className={navActive}
+                                >
+                                  <NavLink to={sub.to}>
+                                    <span>{sub.label}</span>
+                                  </NavLink>
+                                </SidebarMenuSubButton>
+                              </SidebarMenuSubItem>
+                            ))}
                         </SidebarMenuSub>
                       </CollapsibleContent>
                     </SidebarMenuItem>

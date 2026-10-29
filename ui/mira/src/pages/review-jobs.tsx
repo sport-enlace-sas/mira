@@ -1,4 +1,5 @@
 import { ExternalLink, RefreshCw } from "lucide-react"
+import { Link } from "react-router"
 import {
   useState,
   type KeyboardEvent,
@@ -353,6 +354,12 @@ export function ReviewJobsPage() {
                           {retrying === job.id ? "Scheduling…" : "Retry"}
                         </Button>
                       )}
+                      <Link
+                        className="block text-xs text-primary underline"
+                        to={`/settings/ai?job=${job.id}`}
+                      >
+                        Recorrido de IA
+                      </Link>
                     </TableCell>
                     <TableCell className="overflow-hidden text-sm text-muted-foreground">
                       {relativeTime(job.updated_at)}
