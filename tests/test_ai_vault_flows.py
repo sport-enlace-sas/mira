@@ -806,7 +806,9 @@ async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credenti
         ("claude-cli", "https://claude.com.attacker.test/cai/oauth/authorize", False),
     ],
 )
-def test_native_login_links_allow_claude_display_flag_but_reject_result_tokens(provider, url, expected):
+def test_native_login_links_allow_claude_display_flag_but_reject_result_tokens(
+    provider, url, expected
+):
     from mira.ai.login import _login_url
 
     assert _login_url(url, provider) == (url if expected else None)
