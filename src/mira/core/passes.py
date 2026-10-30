@@ -99,13 +99,25 @@ async def agentic_review_loop(
             )
             return ""
 
-        convo.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            }
-        )
+        assistant_message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        }
+        # Providers that think with tools require their reasoning payload to be
+        # replayed unchanged on the next turn (DeepSeek, MiniMax, OpenRouter,
+        # Responses reasoning items, Bedrock reasoningContent blocks).
+        for key in (
+            "reasoning_content",
+            "reasoning",
+            "reasoning_details",
+            "reasoning_items",
+            "reasoning_blocks",
+        ):
+            value = msg.get(key)
+            if value:
+                assistant_message[key] = value
+        convo.append(assistant_message)
 
         for call in tool_calls:
             fn = call.get("function") or {}
@@ -516,10 +528,15 @@ async def self_critique(
 
     keep_indices: set[int] = set()
     verdict_by_idx: dict[int, dict] = {}
-    for v in verdicts:
+    # The schema asks for verdicts in input order; some models then omit `index`.
+    # Position is only trustworthy when no verdict has an index and none are missing.
+    positional_ok = len(verdicts) == len(comments) and not any(
+        isinstance(v, dict) and "index" in v for v in verdicts
+    )
+    for pos, v in enumerate(verdicts):
         try:
-            idx = int(v.get("index", -1))
-        except (TypeError, ValueError):
+            idx = int(v.get("index", pos if positional_ok else -1))
+        except (AttributeError, TypeError, ValueError):
             continue
         if not 0 <= idx < len(comments):
             continue

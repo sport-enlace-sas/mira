@@ -183,22 +183,60 @@ class OpenAICompatibleProvider:
         self._cached_headers = headers
         return dict(headers)
 
-    def _apply_reasoning(self, body: dict) -> None:
-        """Enable extended thinking when a reasoning effort is configured.
+    def _max_tokens_field(self) -> str:
+        """Name of the Chat Completions output-token field for this profile."""
+        return self.profile.get("max_tokens_field", "max_tokens")
 
-        The effort is passed via the unified ``reasoning.effort`` knob, after
-        any per-provider remap from the profile. Anthropic models reject a
-        custom ``temperature`` while thinking is on, so we drop it.
-        No-op when reasoning is off, keeping the request unchanged.
+    @staticmethod
+    def _remove_reasoning(body: dict) -> None:
+        """Drop every reasoning-shaped field Mira may have added."""
+        for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking"):
+            body.pop(key, None)
+
+    @staticmethod
+    def _has_reasoning(body: dict) -> bool:
+        return any(
+            key in body for key in ("reasoning", "reasoning_effort", "thinking", "enable_thinking")
+        )
+
+    def _apply_reasoning_off(self, body: dict, protocol: str = "chat") -> None:
+        """Apply a profile's explicit "thinking off" payload, if it has one.
+
+        Chat and Responses disable thinking differently, so the Responses
+        payload is separate. Providers with no documented disable remain a
+        no-op (their default applies).
+        """
+        key = (
+            "reasoning_off_payload_responses"
+            if protocol == "responses"
+            else "reasoning_off_payload"
+        )
+        body.update(self.profile.get(key, {}))
+
+    def _apply_reasoning(self, body: dict, protocol: str = "chat") -> None:
+        """Add the provider's documented reasoning toggle and effort field.
+
+        Chat Completions uses the top-level ``reasoning_effort`` field on
+        OpenAI and most compatible endpoints; OpenRouter accepts that same
+        shorthand. Responses API uses ``reasoning.effort``. Providers that
+        need a separate toggle (DeepSeek) get it from the profile.
+
+        Anthropic-style models reject a custom ``temperature`` while thinking
+        is on, so we drop it when reasoning is applied. When reasoning is off
+        or was previously rejected for this model, the profile's explicit off
+        payload is applied instead.
         """
         effort = self.config.reasoning_effort
-        if not effort or effort == "off":
-            return
-        if body.get("model") in self._no_reasoning:
+        if not effort or effort == "off" or body.get("model") in self._no_reasoning:
+            self._apply_reasoning_off(body, protocol)
             return
         if not self.config.ai_managed:
             effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
-        body["reasoning"] = {"effort": effort}
+        if protocol == "responses":
+            body["reasoning"] = {"effort": effort}
+        else:
+            body["reasoning_effort"] = effort
+            body.update(self.profile.get("reasoning_on_payload", {}))
         body.pop("temperature", None)
 
     def _account_usage(self, data: dict) -> None:

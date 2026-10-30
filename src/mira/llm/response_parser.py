@@ -388,10 +388,14 @@ def _validate_change_groups(raw_groups: list) -> list[LLMWalkthroughChangeGroup]
         if not isinstance(item, dict):
             logger.warning("Skipping malformed walkthrough change group: %r", item)
             continue
+        # Models sometimes capitalize keys ("Label"); field names are lowercase.
+        item = {str(k).lower(): v for k, v in item.items()}
         raw_files = item.get("files")
         if isinstance(raw_files, list):
             files = []
             for f in raw_files:
+                if isinstance(f, dict):
+                    f = {str(k).lower(): v for k, v in f.items()}
                 try:
                     files.append(LLMWalkthroughFileChange.model_validate(f))
                 except Exception as exc:
@@ -426,6 +430,14 @@ def parse_walkthrough_response(raw_text: str) -> LLMWalkthroughResponse:
         raise ResponseParseError(f"Expected JSON object, got {type(data).__name__}")
 
     data = _unstring_nested_json(data)
+
+    # An empty/mis-shaped tool response otherwise validates using every field's
+    # default and gets posted as a successful walkthrough with only stats.
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ResponseParseError("Walkthrough response must contain a non-empty summary")
+    if re.search(r"</?(?:invoke|function_calls|parameter|arg_key|arg_value)\b", summary):
+        raise ResponseParseError("Walkthrough summary contains leaked tool-call XML")
 
     # Rebuild any fields that arrived as leaked XML fragments (issue #162)
     for key, model in _WALKTHROUGH_FIELD_MODELS.items():

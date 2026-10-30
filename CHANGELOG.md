@@ -4,6 +4,81 @@ All notable changes to Mira are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.1] — 2026-10-28
+
+### Fixed
+
+- **Dashboard charts include the complete review history.** Time-series metrics no longer stop at the newest 500 reviews per repository, so older dates, categories, and totals remain visible.
+- **Activity search finds older reviews.** Search scans persisted history before applying the 500-match limit per repository; the unfiltered recent-activity feed is unchanged.
+- **SQLite vulnerability summaries report persisted alerts.** Organization-wide severity counts now include alerts from repository databases, matching the vulnerability listing.
+- **Invalid walkthroughs are retried once.** Empty summaries and leaked tool-call XML are rejected; if the retry also fails, the PR placeholder reports that the walkthrough could not be generated.
+- **Repository file requests preserve refs and paths.** GitHub, GitLab, and Forgejo correctly encode refs containing query delimiters or literal percent sequences, and GitHub content paths preserve filename delimiters.
+- **Repository tree requests preserve branch names.** GitHub, GitLab, and Forgejo correctly encode refs containing slashes, query delimiters, or literal percent sequences so indexing reads the intended tree.
+- **Repository archive requests preserve refs.** Tarball downloads on GitHub, GitLab, and Forgejo correctly encode branch and tag refs instead of treating special characters as URL paths, queries, or fragments.
+- **GitLab and Forgejo archive fetches honor path filters.** Excluded files are discarded during tarball extraction instead of being decoded and retained in memory.
+- **Incomplete repository trees are rejected.** Truncated GitHub trees and incomplete GitLab or Forgejo pagination no longer silently produce partial indexes.
+- **PR vulnerability scans preserve package identity and comment origins.** Internal ecosystem kinds remain intact, findings use the matching manifest location, and repeated occurrences of the same package and version produce one OSV query and finding per scan.
+- **LLM requests follow provider-specific reasoning and token settings.** Chat and Responses requests use the appropriate reasoning controls and output-token fields, including compatible-provider fallbacks.
+- **Agentic tool turns retain reasoning context.** Chat and Responses conversations preserve reasoning data and tool-call identifiers across turns.
+- **Bedrock thinking and tools use compatible request shapes.** Thinking settings, forced tool choice, and tool specifications now follow model requirements.
+- **Codex CLI receives the configured reasoning effort.** Review invocations now pass the selected reasoning setting to the CLI.
+
+## [0.10.0] — 2026-10-26
+
+### Security
+
+- **Breaking: comment commands require repository write access by default.** GitHub, GitLab, and Forgejo now check permissions before running `review`, `review-rest`, `help`, `pause`, `resume`, `reject`, or free-form questions. Permission lookup failures deny access. To retain access for read-only users, add them to `commands.allowed_users` or a per-command `commands.<name>.allowed_users` list; `commands.blocked_users` always wins.
+- **Free-form disagreements respect the reject policy.** A reply classified as disagreement resolves the thread and records rejected feedback only when its author can run `reject`; answering the reply also requires `ask` permission.
+- **Malformed outbound webhook URLs are contained.** Invalid URLs are rejected during validation and cannot escape delivery error handling. HTTP redirects and other non-success delivery statuses are reported as failures.
+
+### Added
+
+- **Broader source and configuration file support.** Review and indexing recognize more languages, templates, build files, and configuration formats, while documentation remains excluded from indexing.
+- **Configurable indexing concurrency.** `index.llm_concurrency` controls concurrent LLM summarization batches for full and incremental indexing. The default is 8, with a supported range of 1–32, so deployments can respect provider concurrency limits.
+
+### Fixed
+
+- **Nested GitLab namespaces work throughout the dashboard.** Repository details, setup, rules, learnings, and vulnerability routes accept nested groups, validate repository keys, and render useful breadcrumbs.
+- **GitHub Enterprise uses the configured API URL.** Review and PR-description helpers now build clients against the deployment's configured GitHub endpoint.
+- **Indexing fetches files omitted from tarball caches.** Conventions and package manifests fall back to individual source fetches when the cached archive does not contain them.
+- **Failed initial indexing updates repository status.** Setup failures mark affected repositories as failed instead of leaving them pending indefinitely.
+- **PostgreSQL contributor quality matches SQLite.** Per-author review and feedback quality is available when using the PostgreSQL index store.
+- **Walkthrough parsing accepts capitalized keys.** Capitalized file and change-group keys from model output no longer cause valid walkthrough content to be lost.
+- **Self-critique handles missing verdict indexes.** Positional matching is used only for a complete list of unindexed verdicts, preventing partial results from being assigned to the wrong findings.
+- **JSON output instructions survive provider routing.** Chat Completions and Responses requests keep the required JSON instruction in user input, including when a proxy moves system content into separate instructions.
+- **DeepSeek respects disabled reasoning.** Requests explicitly disable DeepSeek thinking when reasoning is set to `off`.
+- **Codex CLI loads review schemas correctly.** Review schema imports use the shared tool-schema module.
+- **Dependency polling retains distinct npm resolutions.** Multiple installed versions of the same package are preserved during vulnerability polling.
+- **Weekly review metrics use ISO week years.** Reviews around New Year are grouped into the correct ISO week.
+- **React and React DOM stay aligned at 19.3.0.** Matching runtime and type packages prevent the version mismatch that could leave the dashboard blank.
+
+### Changed
+
+- **Clearer review diagnostics.** GitHub webhook filter decisions are logged at INFO level, and LLM failures include transport timing or response-shape details without logging reasoning text.
+- **Dashboard dependencies refreshed.** UI libraries and development tools have been updated, including Vite, ESLint, TypeScript tooling, and formatting utilities.
+
+## [0.9.1] — 2026-09-23
+
+### Added
+
+- **Layered security review.** A dedicated security-model tier combines a focused LLM pass, optional agentic `read_file`/`grep_repo` verification, a deterministic regex-and-entropy secrets scan, and review-time OSV checks for dependencies added or upgraded by a PR.
+- **OpenAI Responses API support.** OpenAI-compatible providers can set `llm.api_style: responses` to use the `/responses` protocol instead of Chat Completions, including JSON output, tool calling, reasoning, fallback models, and usage accounting.
+- **Broader indexing support.** A shared file-type registry keeps review and indexing language detection consistent and adds Lua to the indexed languages.
+- **Agentic tools on indexed repositories.** The main reviewer can use `read_file` and `grep_repo` even when an index already exists, allowing it to verify callers and dispatch paths beyond pre-fetched context.
+
+### Fixed
+
+- **Very large GitHub PRs remain reviewable.** When GitHub rejects the complete diff with HTTP 406, Mira reconstructs a unified diff from per-file patches, including valid added, removed, and renamed-file headers.
+- **Walkthrough parsing tolerates malformed model output**, including leaked tool-call XML, malformed optional fields, and incomplete JSON structures.
+- **Review failures update the in-progress placeholder comment** instead of leaving a PR appearing permanently stuck.
+- **Repository indexes remain platform-isolated** when the same owner/repository name exists on more than one provider.
+- **Incremental indexing reports the stored repository total** rather than only the number of files processed in the latest update.
+- **Large repository tarballs avoid out-of-memory extraction** by discarding non-indexable and oversized files before loading their contents.
+- **Contributor backfill uses PyGithub's current rate-limit API.**
+- **Responses JSON mode includes the required object-output hint**, preventing compatible endpoints from rejecting walkthrough and review requests.
+
 ## [0.8.0] — 2026-07-27
 
 ### Added
@@ -298,6 +373,9 @@ Initial public release.
 - `handle_push_index` now updates `updated_at` after incremental re-indexing
   so the "Indexed X ago" timestamp tracks reality.
 
+[0.10.1]: https://github.com/miracodeai/mira/releases/tag/v0.10.1
+[0.10.0]: https://github.com/miracodeai/mira/releases/tag/v0.10.0
+[0.9.1]: https://github.com/miracodeai/mira/releases/tag/v0.9.1
 [0.6.0]: https://github.com/miracodeai/mira/releases/tag/v0.6.0
 [0.5.1]: https://github.com/miracodeai/mira/releases/tag/v0.5.1
 [0.5.0]: https://github.com/miracodeai/mira/releases/tag/v0.5.0

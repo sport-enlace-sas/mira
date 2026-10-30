@@ -414,6 +414,43 @@ class TestReviewEngine:
         assert result.walkthrough.summary != ""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_response", ["{}", '{"summary":"Changes.</invoke>"}'])
+    async def test_walkthrough_retries_invalid_content(
+        self, mock_llm: LLMProvider, sample_diff_text: str, bad_response: str
+    ):
+        mock_llm.walkthrough.side_effect = [bad_response, _WALKTHROUGH_LLM_RESPONSE]
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm)
+
+        result = await engine.review_diff(sample_diff_text)
+
+        assert result.walkthrough is not None
+        assert result.walkthrough.summary == "PR walkthrough summary."
+        assert mock_llm.walkthrough.await_count == 2
+        retry_messages = mock_llm.walkthrough.call_args.args[0]
+        assert retry_messages[-1]["role"] == "user"
+        assert "non-empty summary" in retry_messages[-1]["content"]
+        assert result.reviewed_files > 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_walkthrough_finalizes_placeholder_with_notice(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        mock_llm.walkthrough.return_value = "{}"
+        mock_provider.find_bot_comment.side_effect = lambda *_: (
+            42 if mock_provider.post_comment.called else None
+        )
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+
+        result = await engine.review_pr("https://github.com/owner/repo/pull/42")
+
+        assert mock_llm.walkthrough.await_count == 2
+        assert result.walkthrough is None
+        assert result.reviewed_files > 0
+        bodies = [c.args[2] for c in mock_provider.update_comment.call_args_list]
+        assert any("Walkthrough was not generated." in body for body in bodies)
+        assert not any("files reviewed" in body for body in bodies)
+
+    @pytest.mark.asyncio
     async def test_walkthrough_disabled(self, sample_llm_response_text: str, sample_diff_text: str):
         """Walkthrough is skipped when disabled."""
         llm = MagicMock(spec=LLMProvider)

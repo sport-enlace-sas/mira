@@ -15,7 +15,7 @@ from mira.dashboard.api import (
 
 
 @router.get(
-    "/api/repos/{owner}/{repo}/vulnerabilities",
+    "/api/repos/{owner:path}/{repo}/vulnerabilities",
     response_model=list[VulnerabilityModel],
 )
 def get_repo_vulnerabilities(owner: str, repo: str) -> list[VulnerabilityModel]:
@@ -42,12 +42,14 @@ def get_repo_vulnerabilities(owner: str, repo: str) -> list[VulnerabilityModel]:
 def get_vulnerabilities_summary() -> VulnerabilitySummary:
     """Org-wide vulnerability count by severity, for the dashboard widget."""
     db_url = os.environ.get("DATABASE_URL", "")
-    if not (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
-        # SQLite single-repo deployments don't support org-wide aggregation.
-        return VulnerabilitySummary()
-    from mira.index.pg_store import count_vulnerabilities_org_wide
+    if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+        from mira.index.pg_store import count_vulnerabilities_org_wide
 
-    counts = count_vulnerabilities_org_wide(db_url)
+        counts = count_vulnerabilities_org_wide(db_url)
+    else:
+        from mira.index.store import count_vulnerabilities_org_wide_sqlite
+
+        counts = count_vulnerabilities_org_wide_sqlite()
     return VulnerabilitySummary(
         total=sum(counts.values()),
         critical=counts.get("critical", 0),
