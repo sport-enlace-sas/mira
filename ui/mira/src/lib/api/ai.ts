@@ -46,6 +46,7 @@ export type Step = {
   reasoning_effort: string
   provider: string
   result: string
+  phase?: string
   cause: string
   action: string
   duration_ms: number
