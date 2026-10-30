@@ -23,7 +23,7 @@ def get_relationships() -> RelationshipsResponse:
     """Get all cross-repo edges and groups."""
     with _open_relationships() as rs:
         edges = rs.resolve_edges()
-        groups = rs.group_repos(rs.repos)
+        groups = rs.group_repos(rs.repos, edges=edges)
 
         return RelationshipsResponse(
             edges=[

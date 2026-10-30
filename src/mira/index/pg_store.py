@@ -1312,6 +1312,30 @@ class PgIndexStore(_StoreSharedMixin):
         )
         return [ExternalRef(file_path=r[0], kind=r[1], target=r[2], description=r[3]) for r in rows]
 
+    def get_all_external_refs(self) -> list[ExternalRef]:
+        """Load this repository's indexed refs in one scoped query."""
+        rows = self._fetchall(
+            "SELECT r.file_path, r.kind, r.target, r.description FROM external_refs r "
+            "JOIN files f ON f.owner=r.owner AND f.repo=r.repo AND f.path=r.file_path "
+            "WHERE r.owner=%s AND r.repo=%s ORDER BY r.file_path, r.kind, r.target",
+            (self._owner, self._repo),
+        )
+        return [ExternalRef(file_path=r[0], kind=r[1], target=r[2], description=r[3]) for r in rows]
+
+    def get_summary_texts_and_symbol_names(self) -> tuple[list[str], list[str]]:
+        """Read only the text needed for repository similarity, in bulk."""
+        texts = self._fetchall(
+            "SELECT summary FROM files WHERE owner=%s AND repo=%s AND summary != ''",
+            (self._owner, self._repo),
+        )
+        names = self._fetchall(
+            "SELECT s.name FROM symbols s "
+            "JOIN files f ON f.owner=s.owner AND f.repo=s.repo AND f.path=s.file_path "
+            "WHERE s.owner=%s AND s.repo=%s AND f.summary != ''",
+            (self._owner, self._repo),
+        )
+        return [r[0] for r in texts], [r[0] for r in names]
+
     def _load_symbols(self, path: str) -> list[SymbolInfo]:
         rows = self._fetchall(
             "SELECT name, kind, signature, description FROM symbols "
