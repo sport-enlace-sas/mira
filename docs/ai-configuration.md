@@ -38,6 +38,24 @@ separately. Native inference always uses an isolated temporary directory; Codex
 tools have a deny-by-default filesystem profile and no network, and Claude's
 tools, external MCP configuration and session persistence are disabled.
 
+Native clients can omit a working model from their model list. The UI preserves
+registry entries and successful probes separately: an unlisted Sol model may
+still show verified `max` access. Refreshing discovery does not erase that
+evidence. Claude's API namespace and dotted CLI aliases share one catalog row,
+while access remains scoped to the active credential version.
+
+Connection cards distinguish authorization, a successful probe and activation.
+**Probar modelo** tests without switching credentials; **Probar y activar** tests
+a candidate and activates it only on success. Results stay beside the account;
+the full sequence is available through **Ver recorrido**. Login links and device
+codes disappear from the card after authorization completes.
+
+The flow context budget includes the complete request and reserved output, not
+just the diff chunk. Native Claude Fable 5.1 and Opus 4.7+ support 1M context;
+Sol 6.1 defaults to 500K in Codex ([Claude context documentation](https://code.claude.com/docs/en/model-config#extended-context), [Sol specifications](https://developers.openai.com/api/docs/models/gpt-6.1-sol)). Use a supported capacity on published nodes
+instead of inheriting Mira's 120K diff-chunk budget. Skipped steps record their
+estimated input, reserved output and effective limit, without storing prompts.
+
 ## Flows and diagnostics
 
 The React Flow editor accepts one connected linear chain with no branches or
