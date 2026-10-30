@@ -297,6 +297,7 @@ class FlowProvider:
         active_id: str,
         metadata: dict,
         step: dict,
+        run: dict,
     ) -> Any:
         config = self.config.model_copy(
             update={
@@ -319,7 +320,11 @@ class FlowProvider:
         )
         for renewal in range(2):
             try:
+                step["phase"] = "waiting_for_session"
+                self.runtime.store.save_run(run)
                 async with self.runtime.broker.provider(connection, config, active_id) as provider:
+                    step["phase"] = "requesting"
+                    self.runtime.store.save_run(run)
                     try:
                         async with asyncio.timeout(node.timeout):
                             result = await getattr(provider, method)(messages, **kwargs)
@@ -413,7 +418,8 @@ class FlowProvider:
                         "model": node.model,
                         "reasoning_effort": node.reasoning_effort,
                         "attempt": attempt + 1,
-                        "result": "failed",
+                        "result": "running",
+                        "phase": "preparing",
                         "cause": "",
                         "action": "",
                         "duration_ms": 0,
@@ -492,24 +498,29 @@ class FlowProvider:
                                 active_id,
                                 metadata,
                                 step,
+                                run,
                             )
+                            step["phase"] = "saving"
+                            self.runtime.store.save_run(run)
                             await self.runtime.broker.health(active_id, "ready")
                             self.runtime.store.set_state(
                                 f"access:{active_id}:{node.model}:{node.reasoning_effort}",
                                 {"status": "verified", "checked_at": time.time()},
                             )
                         step.update(
-                            result="success", duration_ms=int((time.monotonic() - started) * 1000)
+                            result="success",
+                            phase="finished",
+                            duration_ms=int((time.monotonic() - started) * 1000),
                         )
                         self.shared["last_success_provider"] = connection["provider"]
                         run["status"] = "success"
                         return result
                     except asyncio.CancelledError:
-                        step.update(result="cancelled", cause="cancelled")
+                        step.update(result="cancelled", phase="finished", cause="cancelled")
                         raise
                     except Exception as error:
                         cause, action = classify(error)
-                        step.update(cause=cause, action=action)
+                        step.update(result="failed", phase="finished", cause=cause, action=action)
                         if mode == "real":
                             if cause == "auth":
                                 await self.runtime.broker.health(active_id, "auth_blocked")

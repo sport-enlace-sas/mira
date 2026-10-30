@@ -86,6 +86,11 @@ const statusLabel: Record<string, string> = {
   cancelled: "Cancelado",
   running: "En curso",
 }
+const phaseNames: Record<string, string> = {
+  waiting_for_session: "Esperando disponibilidad de la cuenta",
+  requesting: "Proveedor procesando la solicitud",
+  saving: "Guardando el estado de la conexión",
+}
 
 const scenarioNames: Record<string, string> = {
   review: "Revisión de PR",
@@ -181,9 +186,11 @@ export function RunTrace({ run }: { run: Run }) {
                 <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
                   <span>Intento {step.attempt}</span>
                   <span>
-                    {step.result === "skipped"
-                      ? "Sin ejecutar"
-                      : `${(step.duration_ms / 1000).toFixed(1)} s`}
+                    {step.result === "running"
+                      ? phaseNames[step.phase || ""] || "Preparando solicitud"
+                      : step.result === "skipped"
+                        ? "Sin ejecutar"
+                        : `${(step.duration_ms / 1000).toFixed(1)} s`}
                   </span>
                   <span>
                     Entrada:{" "}

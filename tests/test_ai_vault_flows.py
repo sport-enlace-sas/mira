@@ -309,6 +309,57 @@ async def test_snapshot_and_scenario_bindings_are_independent(store):
     assert fresh.for_scenario("summary").snapshot["summary"]["nodes"][0]["model"] == "summary-model"
 
 
+async def test_live_trace_records_failed_and_running_nodes_before_provider_finishes(store):
+    cid, _ = connection(store)
+    chain(store, cid, ("invalid", "working"))
+    runtime = AIRuntime(store)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def invoke(config):
+        if config.model == "invalid":
+            raise ValueError("invalid_response")
+        started.set()
+        await release.wait()
+        return '{"ok":true}'
+
+    mock_broker(runtime, invoke)
+    task = asyncio.create_task(runtime.provider(LLMConfig()).complete([]))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    run = store.runs()[0]
+    assert run["status"] == "running"
+    assert run["steps"][0]["result"] == "failed"
+    assert run["steps"][1]["result"] == "running"
+    assert run["steps"][1]["phase"] == "requesting"
+    release.set()
+    assert await task == '{"ok":true}'
+    assert store.runs()[0]["steps"][1]["phase"] == "finished"
+
+
+async def test_live_trace_distinguishes_session_wait_and_persists_cancellation(store):
+    cid, _ = connection(store)
+    chain(store, cid, ("waiting",))
+    runtime = AIRuntime(store)
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    @asynccontextmanager
+    async def provider(*args, **kwargs):
+        waiting.set()
+        await release.wait()
+        yield FakeProvider(AsyncMock(return_value='{"ok":true}'))
+
+    runtime.broker.provider = provider
+    task = asyncio.create_task(runtime.provider(LLMConfig()).complete([]))
+    await asyncio.wait_for(waiting.wait(), timeout=5)
+    assert store.runs()[0]["steps"][0]["phase"] == "waiting_for_session"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run = store.runs()[0]
+    assert run["status"] == "cancelled"
+    assert run["steps"][0]["result"] == "cancelled"
+    assert run["steps"][0]["phase"] == "finished"
+
+
 async def test_incompatible_context_is_skipped_without_truncation(store):
     cid, _ = connection(store)
     fid = chain(store, cid, ("small", "large"))
