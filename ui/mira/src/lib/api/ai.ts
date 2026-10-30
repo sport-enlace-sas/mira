@@ -3,6 +3,7 @@ import { deleteJson, fetchJson, postJson, putJson } from "./http"
 export type Credential = {
   id: string
   revision: number
+  created_at?: number
   kind: string
   status: string
   renewable: boolean

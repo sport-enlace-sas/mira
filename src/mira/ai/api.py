@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from mira.ai.catalog import curated, discover
+from mira.ai.catalog import catalog_view, discover
 from mira.ai.login import LoginManager
 from mira.ai.models import (
     SCENARIOS,
@@ -23,7 +23,7 @@ from mira.ai.models import (
     FlowInput,
     FlowNode,
 )
-from mira.ai.runtime import FlowExhaustedError, FlowProvider, configure, quota_key
+from mira.ai.runtime import FlowExhaustedError, FlowProvider, configure
 from mira.ai.store import AIStore, ConflictError, Vault
 from mira.config import LLMConfig
 
@@ -143,29 +143,13 @@ def create_ai_router(db: Any) -> APIRouter:
 
     @router.get("/connections/{connection_id}/models")
     def models(connection_id: str, user: Any = view) -> dict:
-        connection = store.connection(connection_id)
-        result = store.state(
-            f"catalog:{connection['active_credential']}",
-            {"models": curated(connection["provider"]), "status": "unverified", "checked_at": None},
-        )
-        for model in result["models"]:
-            model["access"] = {
-                effort: store.state(
-                    f"access:{connection['active_credential']}:{model['id']}:{effort}", {}
-                )
-                for effort in ("off", "low", "medium", "high", "xhigh", "max")
-            }
-            model["quota"] = store.state(
-                f"quota:{connection['active_credential']}:{quota_key(connection['provider'], model['id'])}",
-                {},
-            )
-        return result
+        return catalog_view(store, connection_id)
 
     @router.post("/connections/{connection_id}/models/refresh")
     async def refresh_models(connection_id: str, user: Any = diagnostics) -> dict:
-        result = await discover(store, connection_id)
+        await discover(store, connection_id)
         store.audit(user.id, "catalog.refreshed", connection_id)
-        return result
+        return catalog_view(store, connection_id)
 
     @router.post("/connections/{connection_id}/login")
     async def start_login(connection_id: str, user: Any = manage_credentials) -> dict:

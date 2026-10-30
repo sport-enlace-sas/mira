@@ -382,9 +382,10 @@ class FlowProvider:
                 )
                 incompatible = ""
                 output_budget = kwargs.get("max_tokens") or self.config.max_tokens
-                if request_size + output_budget > min(
+                context_limit = min(
                     node.context_window, info.get("context_window") or node.context_window
-                ):
+                )
+                if request_size + output_budget > context_limit:
                     incompatible = "context_incompatible"
                 if (
                     info.get("reasoning_efforts")
@@ -418,6 +419,9 @@ class FlowProvider:
                         "duration_ms": 0,
                         "usage": {},
                         "refresh_attempted": False,
+                        "input_tokens_estimated": request_size,
+                        "output_tokens_reserved": output_budget,
+                        "context_window": context_limit,
                     }
                     run["steps"].append(step)
                     started = time.monotonic()
@@ -425,7 +429,12 @@ class FlowProvider:
                         step.update(
                             result="skipped",
                             cause=incompatible or "connection_disabled",
-                            action="Editar el nodo o habilitar la conexión",
+                            action=(
+                                f"La solicitud requiere aproximadamente {request_size + output_budget} "
+                                f"tokens y el nodo admite {context_limit}. Ajusta el contexto o elige otro modelo"
+                                if incompatible == "context_incompatible"
+                                else "Editar el nodo o habilitar la conexión"
+                            ),
                         )
                         break
                     if mode == "real" and (

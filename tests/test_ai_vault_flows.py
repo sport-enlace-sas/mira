@@ -325,6 +325,23 @@ async def test_incompatible_context_is_skipped_without_truncation(store):
     await runtime.provider(LLMConfig()).complete([{"role": "user", "content": "whole request"}])
     assert invoke.await_count == 1
     assert store.runs()[0]["steps"][0]["cause"] == "context_incompatible"
+    skipped = store.runs()[0]["steps"][0]
+    assert skipped["context_window"] == 1024
+    assert skipped["input_tokens_estimated"] < skipped["context_window"]
+    assert skipped["output_tokens_reserved"] == 4096
+    assert "1024" in skipped["action"]
+
+
+def test_native_catalog_exposes_documented_capacity_without_claiming_access():
+    from mira.ai.catalog import curated
+
+    claude = {m["id"]: m for m in curated("claude-cli")}
+    assert claude["claude-opus-5-5"]["context_window"] == 1_000_000
+    assert claude["claude-opus-5-5"]["status"] == "unverified"
+    sol = next(m for m in curated("codex-cli") if m["id"] == "gpt-6.1-sol")
+    assert sol["context_window"] == 1_050_000
+    assert sol["default_context_window"] == 500_000
+    assert sol["status"] == "unverified"
 
 
 def test_cli_model_effort_and_filesystem_restrictions_are_explicit(tmp_path):
@@ -432,6 +449,64 @@ def api_client(store, user):
 
     app.include_router(create_ai_router(store.db))
     return TestClient(app)
+
+
+def test_catalog_keeps_verified_unlisted_models_after_native_refresh(store, monkeypatch):
+    cid, credential = connection(store, "codex-cli")
+    catalog = {
+        "models": [
+            {"id": "gpt-6-astra", "name": "Astra", "source": "codex:model/list", "status": "listed"}
+        ],
+        "status": "listed",
+        "checked_at": 10,
+    }
+    store.set_state(f"catalog:{credential}", catalog)
+    store.set_state(
+        f"access:{credential}:gpt-6.1-sol:max", {"status": "verified", "checked_at": 20}
+    )
+
+    async def refresh(*args):
+        store.set_state(f"catalog:{credential}", catalog)
+        return catalog
+
+    monkeypatch.setattr("mira.ai.api.discover", refresh)
+    with api_client(store, SimpleNamespace(id=1, is_admin=True)) as client:
+        for response in (
+            client.get(f"/api/ai/connections/{cid}/models"),
+            client.post(f"/api/ai/connections/{cid}/models/refresh"),
+        ):
+            assert response.status_code == 200
+            models = {m["id"]: m for m in response.json()["models"]}
+            assert models["gpt-6-astra"]["status"] == "listed"
+            assert models["gpt-6.1-sol"]["status"] == "unverified"
+            assert models["gpt-6.1-sol"]["access"]["max"] == {
+                "status": "verified",
+                "checked_at": 20,
+            }
+            assert "test-secret-never-returned" not in response.text
+
+
+def test_catalog_groups_claude_aliases_without_sharing_access_across_credentials(store):
+    from mira.ai.catalog import catalog_view
+
+    cid, credential = connection(store)
+    store.set_state(
+        f"access:{credential}:anthropic/claude-fable-5.1:off", {"status": "quota", "checked_at": 10}
+    )
+    store.set_state(
+        f"access:{credential}:claude-fable-5-1:off", {"status": "verified", "checked_at": 20}
+    )
+    models = catalog_view(store, cid)["models"]
+    fable = [m for m in models if m["id"] == "claude-fable-5-1"]
+    assert len(fable) == 1
+    assert fable[0]["access"]["off"]["status"] == "verified"
+    replacement = Vault(store).stage(cid, "oauth_token", "replacement-test-secret", 1)
+    secret, revision = Vault(store).read(replacement)
+    Vault(store).update(replacement, revision, secret, {"status": "ready"})
+    Vault(store).activate(cid, replacement, 1)
+    assert not next(m for m in catalog_view(store, cid)["models"] if m["id"] == "claude-fable-5-1")[
+        "access"
+    ]
 
 
 def test_permissions_and_validation_errors_do_not_disclose_secrets(store):

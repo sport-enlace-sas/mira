@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 import time
 from collections.abc import Callable
@@ -103,14 +104,24 @@ def curated(provider: str) -> list[dict]:
     ids = list(registry.all_models())
     if provider == "claude-cli":
         ids = [m for m in ids if m.startswith("anthropic/")]
-        ids = list(dict.fromkeys([*ids, "anthropic/claude-fable-5-1"]))
+        ids = list(
+            dict.fromkeys(
+                [
+                    *ids,
+                    "anthropic/claude-fable-5-1",
+                    "anthropic/claude-opus-5-5",
+                    "anthropic/claude-sonnet-5-5",
+                    "anthropic/claude-haiku-5-5",
+                ]
+            )
+        )
     elif provider == "codex-cli":
         ids = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-5.6-sol"]
     elif provider == "bedrock":
         # OpenRouter IDs are not valid Bedrock IDs. Discovery remains available
         # with AWS credentials; imported flows preserve their original IDs.
         ids = []
-    return [
+    models = [
         {
             "id": m.split("/", 1)[-1] if provider in {"codex-cli", "claude-cli"} else m,
             "name": m,
@@ -119,6 +130,80 @@ def curated(provider: str) -> list[dict]:
         }
         for m in ids
     ]
+    for model in models:
+        identifier = model["id"].replace(".", "-")
+        if provider == "claude-cli":
+            if identifier.startswith(
+                (
+                    "claude-fable-5",
+                    "claude-opus-4-7",
+                    "claude-opus-4-8",
+                    "claude-opus-5",
+                    "claude-sonnet-5",
+                    "claude-haiku-5-5",
+                )
+            ):
+                model["context_window"] = 1_000_000
+            elif identifier.startswith("claude-haiku-4-5"):
+                model["context_window"] = 200_000
+        elif provider == "codex-cli" and identifier == "gpt-6-1-sol":
+            # Keep the supported ceiling separate from the native default.
+            model["context_window"] = 1_050_000
+            model["default_context_window"] = 500_000
+    return models
+
+
+def catalog_view(store: AIStore, connection_id: str) -> dict:
+    """Keep discovery and proven access separate, including unlisted working models."""
+    from mira.ai.runtime import quota_key
+
+    connection = store.connection(connection_id)
+    credential_id = connection["active_credential"]
+    provider = connection["provider"]
+    result = store.state(
+        f"catalog:{credential_id}",
+        {"models": curated(provider), "status": "unverified", "checked_at": None},
+    )
+
+    def model_id(value: str) -> str:
+        if provider == "claude-cli":
+            value = value.removeprefix("anthropic/")
+            return re.sub(r"^(claude-[a-z0-9-]+-\d+)\.(\d+)$", r"\1-\2", value)
+        return value
+
+    # Older native clients may omit a model that accepts real requests. Registry
+    # entries remain explicitly unverified; discovery never erases probe evidence.
+    registry = curated(provider) if provider in {"claude-cli", "codex-cli"} else []
+    models = {}
+    for item in [*registry, *result["models"]]:
+        identifier = model_id(item["id"])
+        models[identifier] = {**models.get(identifier, {}), **item, "id": identifier, "access": {}}
+    if credential_id:
+        prefix = f"access:{credential_id}:"
+        for key, value in store.rows(
+            "SELECT id,data FROM ai_state WHERE id LIKE ?", (prefix + "%",)
+        ):
+            raw_model, effort = key[len(prefix) :].rsplit(":", 1)
+            access = json.loads(value)
+            if effort not in {"off", "low", "medium", "high", "xhigh", "max"}:
+                continue
+            identifier = model_id(raw_model)
+            item = models.setdefault(
+                identifier,
+                {
+                    "id": identifier,
+                    "name": identifier,
+                    "source": "diagnostic",
+                    "status": "unverified",
+                    "access": {},
+                },
+            )
+            previous = item["access"].get(effort, {})
+            if access.get("checked_at", 0) >= previous.get("checked_at", 0):
+                item["access"][effort] = access
+    for item in models.values():
+        item["quota"] = store.state(f"quota:{credential_id}:{quota_key(provider, item['id'])}", {})
+    return {**result, "models": list(models.values())}
 
 
 async def discover(store: AIStore, connection_id: str) -> dict:
