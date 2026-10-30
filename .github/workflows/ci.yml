@@ -58,6 +58,8 @@ jobs:
         run: uv run pre-commit run --all-files --hook-stage manual mypy
 
       - name: Test
+        env:
+          MIRA_TEST_POSTGRES_URL: postgresql://mira_test:ci-test-only@localhost:5432/mira_test
         run: uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
 
       - name: AI vault PostgreSQL persistence and locking

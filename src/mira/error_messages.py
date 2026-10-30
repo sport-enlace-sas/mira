@@ -55,7 +55,7 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         safe="LLM API error {status}",
     ),
     "no_tool_call": ErrorMessage(
-        full="Model returned neither tool call nor content",
+        full="Model returned neither tool call nor content ({detail})",
         safe="Model returned neither tool call nor content",
     ),
     "no_tools": ErrorMessage(

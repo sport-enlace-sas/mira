@@ -26,7 +26,7 @@ from mira.ai.runtime import AIRuntime, quota_key
 from mira.ai.store import AIStore, ConflictError, Vault
 from mira.config import LLMConfig
 from mira.dashboard.db import AppDatabase
-from mira.exceptions import NonRetriableLLMError
+from mira.exceptions import LLMError, NonRetriableLLMError
 
 
 @pytest.fixture
@@ -673,10 +673,11 @@ def test_failed_rotation_preserves_active_then_valid_rotation_activates(store, m
         assert store.connection(cid)["active_credential"] == candidate
 
 
+@pytest.mark.parametrize("provider_type", ["responses", "openai"])
 async def test_explicit_api_key_and_sol_max_are_used_without_ambient_credentials(
-    store, monkeypatch
+    store, monkeypatch, provider_type
 ):
-    cid, credential = connection(store, "responses", "database-only-key")
+    cid, credential = connection(store, provider_type, "database-only-key")
     monkeypatch.setenv("OPENAI_API_KEY", "obsolete-environment-key")
     original = httpx.AsyncClient
     requests = []
@@ -686,6 +687,7 @@ async def test_explicit_api_key_and_sol_max_are_used_without_ambient_credentials
         return httpx.Response(
             200,
             json={
+                "choices": [{"message": {"content": '{"ok":true}'}}],
                 "output": [
                     {
                         "type": "message",
@@ -713,11 +715,19 @@ async def test_explicit_api_key_and_sol_max_are_used_without_ambient_credentials
     assert requests[0].headers["authorization"] == "Bearer database-only-key"
     payload = json.loads(requests[0].content)
     assert payload["model"] == "gpt-6.1-sol"
-    assert payload["reasoning"] == {"effort": "max"}
+    if provider_type == "responses":
+        assert payload["reasoning"] == {"effort": "max"}
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == "max"
+        assert "reasoning" not in payload
 
 
-async def test_managed_adapter_does_not_retry_without_selected_reasoning(store, monkeypatch):
-    cid, credential = connection(store, "responses")
+@pytest.mark.parametrize("provider_type", ["responses", "openai"])
+async def test_managed_adapter_does_not_retry_without_selected_reasoning(
+    store, monkeypatch, provider_type
+):
+    cid, credential = connection(store, provider_type)
     original = httpx.AsyncClient
     requests = []
 
@@ -740,7 +750,38 @@ async def test_managed_adapter_does_not_retry_without_selected_reasoning(store, 
         with pytest.raises(NonRetriableLLMError):
             await provider.complete_with_tools([], [tool])
     assert len(requests) == 1
-    assert json.loads(requests[0].content)["reasoning"]["effort"] == "max"
+    payload = json.loads(requests[0].content)
+    if provider_type == "responses":
+        assert payload["reasoning"]["effort"] == "max"
+    else:
+        assert payload["reasoning_effort"] == "max"
+
+
+async def test_managed_transport_error_diagnostics_do_not_log_credentials(
+    store, monkeypatch, caplog
+):
+    secret = "transport-key-never-log"
+    cid, credential = connection(store, "openai", secret)
+    original = httpx.AsyncClient
+
+    def respond(request):
+        raise httpx.ConnectError(f"Proxy rejected Bearer {secret}", request=request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    runtime = AIRuntime(store)
+    tool = {"type": "function", "function": {"name": "probe", "parameters": {"type": "object"}}}
+    async with runtime.broker.provider(
+        store.connection(cid), LLMConfig(ai_managed=True, max_retries=1), credential
+    ) as provider:
+        with pytest.raises(LLMError) as error:
+            await provider.complete_with_tools([], [tool])
+    assert isinstance(error.value.__cause__, httpx.ConnectError)
+    assert "ConnectError" in caplog.text
+    assert secret not in caplog.text
 
 
 async def test_renewable_auth_is_refreshed_once_then_chain_continues(store):

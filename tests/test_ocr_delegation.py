@@ -2,7 +2,7 @@ import asyncio
 import base64
 from pathlib import Path
 
-from mira.config import _strip_deployment_only_llm_settings
+from mira.config import _strip_deployment_only_settings
 from mira.models import PRInfo
 from mira.ocr_delegation import OpenCodeReviewDelegation
 
@@ -73,7 +73,7 @@ def test_invalid_ocr_schema_degrades_without_leaking_output():
 
 
 def test_untrusted_repo_config_cannot_enable_or_repoint_ocr():
-    cleaned = _strip_deployment_only_llm_settings(
+    cleaned = _strip_deployment_only_settings(
         {
             "review": {
                 "ocr_delegation": True,

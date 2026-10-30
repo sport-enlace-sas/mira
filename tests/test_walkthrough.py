@@ -145,6 +145,24 @@ class TestParseWalkthroughResponse:
         with pytest.raises(ResponseParseError, match="Expected JSON object"):
             parse_walkthrough_response("[1, 2, 3]")
 
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"summary": ""}, {"summary": " \n\t"}, {"Summary": "Changes"}],
+    )
+    def test_rejects_empty_walkthrough_instead_of_rendering_only_stats(self, payload):
+        from mira.exceptions import ResponseParseError
+
+        with pytest.raises(ResponseParseError, match="non-empty summary"):
+            parse_walkthrough_response(json.dumps(payload))
+
+    def test_rejects_tool_xml_leaked_into_summary(self):
+        from mira.exceptions import ResponseParseError
+
+        # Shape observed in the posted walkthroughs on PRs #377 and #366.
+        raw = json.dumps({"summary": "Fix scanning.</summary>\n</invoke>"})
+        with pytest.raises(ResponseParseError, match="leaked tool-call XML"):
+            parse_walkthrough_response(raw)
+
     def test_with_sequence_diagram(self):
         raw = json.dumps(
             {
@@ -227,6 +245,14 @@ class TestParseWalkthroughResponse:
         raw = '{"summary": "Changes", "change_groups": []}</parameter></invoke>'
         result = parse_walkthrough_response(raw)
         assert result.summary == "Changes"
+
+    def test_capitalized_group_keys_accepted(self):
+        raw = json.dumps(
+            {"summary": "s", "change_groups": [{"Label": "Core", "Files": [{"Path": "a.py"}]}]}
+        )
+        result = parse_walkthrough_response(raw)
+        assert result.change_groups[0].label == "Core"
+        assert result.change_groups[0].files[0].path == "a.py"
 
     def test_skips_file_missing_path(self):
         raw = json.dumps(

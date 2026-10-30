@@ -244,6 +244,11 @@ class TestGlobalDefaults:
             "  codex_home: /trusted/codex-home\n"
             "  codex_sandbox: read-only\n"
             "  codex_timeout_seconds: 900\n"
+            "review:\n"
+            "  ocr_delegation: true\n"
+            "  ocr_command: /trusted/bin/ocr\n"
+            "commands:\n"
+            "  allowed_users: [operator]\n"
         )
         set_global_defaults(global_file)
         repo_dir = tmp_path / "repo"
@@ -256,6 +261,12 @@ class TestGlobalDefaults:
             "  codex_home: ./repo-auth\n"
             "  codex_sandbox: danger-full-access\n"
             "  codex_timeout_seconds: 1\n"
+            "review:\n"
+            "  ocr_delegation: false\n"
+            "  ocr_command: ./repo-controlled-ocr\n"
+            "commands:\n"
+            "  allowed_users: [attacker]\n"
+            "  allow_repo_write_access: false\n"
         )
 
         config = load_config(repo_file)
@@ -265,6 +276,27 @@ class TestGlobalDefaults:
         assert config.llm.codex_home == "/trusted/codex-home"
         assert config.llm.codex_sandbox == "read-only"
         assert config.llm.codex_timeout_seconds == 900
+        assert config.review.ocr_delegation is True
+        assert config.review.ocr_command == "/trusted/bin/ocr"
+        assert config.commands.allowed_users == ["operator"]
+        assert config.commands.allow_repo_write_access is True
+
+    def test_repo_config_cannot_override_command_policy(self, tmp_path: Path):
+        global_file = tmp_path / "mira.yaml"
+        global_file.write_text(
+            "commands:\n  allowed_users:\n    - alice\n  allow_repo_write_access: false\n"
+        )
+        set_global_defaults(global_file)
+        repo_file = tmp_path / "repo" / ".mira.yaml"
+        repo_file.parent.mkdir()
+        repo_file.write_text(
+            "commands:\n  allowed_users:\n    - mallory\n  allow_repo_write_access: true\n"
+        )
+
+        config = load_config(repo_file)
+
+        assert config.commands.allowed_users == ["alice"]
+        assert config.commands.allow_repo_write_access is False
 
     def test_per_repo_overrides_global(self, tmp_path: Path):
         # Global sets a baseline.

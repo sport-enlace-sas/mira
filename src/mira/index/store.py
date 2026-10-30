@@ -7,7 +7,10 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from mira.index._store_shared import _StoreSharedMixin
 from mira.models import PRFingerprint
@@ -749,6 +752,22 @@ class IndexStore(_StoreSharedMixin):
             head_sha=head_sha,
             previous_head_sha=previous_head_sha,
         )
+
+    @contextmanager
+    def iter_review_events(self) -> Iterator[Iterator[ReviewEvent]]:
+        """Stream the complete history, closing the cursor even on an early exit."""
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
+                "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
+                "categories, created_at, author_avatar_url, reviewed_paths, base_sha, head_sha, "
+                "previous_head_sha "
+                "FROM review_events ORDER BY created_at DESC, id ASC"
+            )
+            yield (ReviewEvent(*row) for row in cursor)
+        finally:
+            cursor.close()
 
     def list_review_events(self, limit: int = 100) -> list[ReviewEvent]:
         rows = self._conn.execute(
@@ -1762,6 +1781,27 @@ def search_packages_org_wide_sqlite(
 
     rows.sort(key=lambda r: (r["name"].lower(), r["owner"], r["repo"]))
     return rows[:limit]
+
+
+def count_vulnerabilities_org_wide_sqlite() -> dict[str, int]:
+    """Count persisted vulnerabilities by raw severity across SQLite stores."""
+    index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
+    counts: dict[str, int] = {}
+    for _platform, _owner, _repo, db_path in _iter_repo_dbs(index_dir):
+        try:
+            # Read-only mode also prevents recreating a DB removed after discovery.
+            conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT severity, COUNT(*) FROM vulnerabilities GROUP BY severity"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        for severity, count in rows:
+            counts[severity] = counts.get(severity, 0) + count
+    return counts
 
 
 def list_vulnerabilities_org_wide_sqlite(limit: int = 1000) -> list[dict]:

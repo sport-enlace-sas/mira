@@ -1308,7 +1308,24 @@ class ReviewEngine:
                     pr_description=pr_description,
                 )
                 wt_raw = await self.llm.walkthrough(wt_messages)
-                wt_parsed = parse_walkthrough_response(wt_raw)
+                try:
+                    wt_parsed = parse_walkthrough_response(wt_raw)
+                except ResponseParseError as exc:
+                    logger.warning("Invalid walkthrough response; retrying once: %s", exc)
+                    wt_messages = [
+                        *wt_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous walkthrough response was invalid. "
+                                "Submit the walkthrough again with a non-empty summary "
+                                "and change_groups using the declared JSON schema. "
+                                "Do not include tool-call XML in any field."
+                            ),
+                        },
+                    ]
+                    wt_raw = await self.llm.walkthrough(wt_messages)
+                    wt_parsed = parse_walkthrough_response(wt_raw)
                 return convert_to_walkthrough_result(wt_parsed)
             except Exception as exc:
                 logger.warning("Walkthrough generation failed, skipping: %s", exc)

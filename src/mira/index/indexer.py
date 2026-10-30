@@ -82,10 +82,10 @@ _SKIP_PATTERNS = [
 ]
 
 _FILE_FETCH_SEMAPHORE = 10
-# Concurrent LLM summarization batches per repo. The indexing model
-# typically handles 6-8 comfortably on OpenRouter; bumping from 3 nearly
-# halves file-phase wall time without changing quality.
-_LLM_SEMAPHORE = 8
+# Concurrent LLM summarization batches per repo is configurable via
+# index.llm_concurrency (see config.IndexConfig). The default of 8 suits
+# OpenRouter-style endpoints; subscription/self-hosted endpoints with low
+# concurrency limits should lower it to avoid sustained 429 backoff loops.
 # Smaller batches → faster individual calls → better wave parallelism.
 # Empirically a 5-file batch with one large file bloated to 7k output
 # tokens and took 87s, dominating an entire indexing run. With 3-file
@@ -476,7 +476,7 @@ async def index_repo(
     # tasks and consume them as they complete; the inner semaphore bounds
     # actual parallelism. Cancellation still works between batch
     # completions.
-    llm_sem = asyncio.Semaphore(_LLM_SEMAPHORE)
+    llm_sem = asyncio.Semaphore(config.index.llm_concurrency)
     batches = _build_batches(file_pairs)
     tasks = [asyncio.create_task(_summarize_batch(batch, llm, llm_sem)) for batch in batches]
 
@@ -564,6 +564,33 @@ async def index_repo(
     return indexed_count
 
 
+async def _read_paths(
+    owner: str,
+    repo: str,
+    fetcher: RepoFetcher,
+    branch: str,
+    paths: list[str],
+    fetch_sem: asyncio.Semaphore,
+    cached_contents: dict[str, str] | None,
+) -> dict[str, str | None]:
+    """Contents for *paths*: whatever the cache holds, fetching the rest.
+
+    The tarball cache is built from indexable paths alone, so a caller wanting a
+    path indexing skips — a conventions file, a manifest the summarizer ignores —
+    never finds it there. An absent key means "not cached" rather than "empty
+    file", so those paths are fetched instead of being read as blank.
+    """
+    cached = cached_contents or {}
+    missing = [p for p in paths if not cached.get(p)]
+    fetched: dict[str, str | None] = {}
+    if missing:
+        results = await asyncio.gather(
+            *(fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in missing)
+        )
+        fetched = dict(zip(missing, results, strict=False))
+    return {p: cached.get(p) or fetched.get(p) for p in paths}
+
+
 async def _index_conventions(
     owner: str,
     repo: str,
@@ -585,13 +612,10 @@ async def _index_conventions(
     if not candidates:
         return
 
-    if cached_contents is not None:
-        file_contents = {p: cached_contents.get(p) or "" for p in candidates}
-    else:
-        results = await asyncio.gather(
-            *(fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in candidates)
-        )
-        file_contents = {p: (c or "") for p, c in zip(candidates, results, strict=False)}
+    resolved = await _read_paths(
+        owner, repo, fetcher, branch, candidates, fetch_sem, cached_contents
+    )
+    file_contents = {p: (c or "") for p, c in resolved.items()}
 
     extracted = extract_conventions(file_contents)
     if not extracted:
@@ -645,22 +669,18 @@ async def _index_manifests(
     """Fetch known manifest files, parse them, and persist declared packages.
 
     Runs after the LLM summarization pass. Entirely deterministic — no LLM
-    calls. If ``cached_contents`` (typically a tarball-extracted dict) is
-    provided, manifest contents are read from there instead of re-fetching.
+    calls. ``cached_contents`` (typically a tarball-extracted dict) supplies
+    whichever manifests it holds; the rest are fetched.
     """
     manifest_paths = [p for p in tree_paths if is_manifest(p)]
     if not manifest_paths:
         store.clear_manifest_packages_for_missing_files(set())
         return
 
-    if cached_contents is not None:
-        contents: list[str | None] = [cached_contents.get(p) for p in manifest_paths]
-    else:
-        tasks = [
-            fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem)
-            for p in manifest_paths
-        ]
-        contents = await asyncio.gather(*tasks)
+    resolved = await _read_paths(
+        owner, repo, fetcher, branch, manifest_paths, fetch_sem, cached_contents
+    )
+    contents: list[str | None] = [resolved[p] for p in manifest_paths]
 
     live: set[str] = set()
     total_packages = 0
@@ -879,7 +899,7 @@ async def index_diff(
         file_pairs.append((path, content))
 
     # Summarize changed files
-    llm_sem = asyncio.Semaphore(_LLM_SEMAPHORE)
+    llm_sem = asyncio.Semaphore(config.index.llm_concurrency)
     indexed_count = 0
 
     if file_pairs:

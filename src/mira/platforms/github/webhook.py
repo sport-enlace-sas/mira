@@ -19,6 +19,7 @@ from mira.config import load_config
 from mira.index.indexer import _should_index
 from mira.index.store import IndexStore
 from mira.models import PRInfo
+from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.handlers import (
@@ -422,6 +423,7 @@ async def _handle_thread_freeform_reply(
             comment_line=comment.get("original_line", 0) or comment.get("line", 0),
             actor=comment["user"]["login"],
             bot_name=bot_name,
+            user_id=comment["user"].get("id"),
         )
     except Exception:
         logger.exception("Error handling free-form thread reply")
@@ -505,7 +507,7 @@ async def dispatch_github_event(
             owner = payload.get("repository", {}).get("owner", {}).get("login", "?")
             repo = payload.get("repository", {}).get("name", "?")
             number = payload.get("pull_request", {}).get("number", 0)
-            logger.debug(
+            logger.info(
                 "PR %s/%s#%s skipped — author %s filtered by author filter",
                 owner,
                 repo,
@@ -535,16 +537,6 @@ async def dispatch_github_event(
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if "pull_request" in payload.get("issue", {}) and has_mention(comment_body, names):
             cmd_word = command_after_mention(comment_body, names)
-            if cmd_word == "review":
-                pass  # review command bypasses author filter
-            elif author_is_filtered(
-                comment_user, cfg.filter.allowed_authors, cfg.filter.blocked_authors
-            ):
-                logger.debug(
-                    "issue_comment skipped — author %s filtered by author filter",
-                    comment_user,
-                )
-                return "ignored"
             if cmd_word in _PAUSE_KEYWORDS | _RESUME_KEYWORDS:
                 background_tasks.add_task(
                     handle_pause_resume, payload, app_auth, bot_name, cmd_word
@@ -584,7 +576,7 @@ async def dispatch_github_event(
         if ref == f"refs/heads/{default_branch}":
             sender = payload.get("sender", {}).get("login", "")
             if author_is_filtered(sender, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
-                logger.debug("push to %s skipped — author %s filtered", ref, sender)
+                logger.info("push to %s skipped — author %s filtered", ref, sender)
                 return "ignored"
             background_tasks.add_task(handle_push_index, payload, app_auth, bot_name)
             return "processing"
@@ -656,6 +648,7 @@ async def handle_comment(
             comment_user,
             bot_name,
             pr_title=payload["issue"].get("title", ""),
+            user_id=payload["comment"]["user"].get("id"),
         )
     except Exception:
         logger.exception("Error handling comment event")
@@ -689,6 +682,22 @@ async def handle_thread_reject(
         repo = payload["repository"]["name"]
         number = payload["pull_request"]["number"]
 
+        provider = create_provider(
+            "github", partial(app_auth.get_installation_token, installation_id)
+        )
+
+        actor = payload["comment"]["user"]["login"]
+        if not await is_command_allowed(
+            load_config(),
+            "reject",
+            actor,
+            provider=provider,
+            owner=owner,
+            repo=repo,
+            user_id=payload["comment"]["user"].get("id"),
+        ):
+            return
+
         # Capture the human reply for the activity conversation timeline.
         _record_human_reply(
             owner,
@@ -698,9 +707,6 @@ async def handle_thread_reject(
             payload["comment"],
         )
 
-        provider = create_provider(
-            "github", partial(app_auth.get_installation_token, installation_id)
-        )
         from mira.models import PRInfo as _PRInfo
 
         _pr_info_for_lookup = _PRInfo(
@@ -870,6 +876,18 @@ async def handle_pause_resume(
         provider = create_provider(
             "github", partial(app_auth.get_installation_token, installation_id)
         )
+
+        actor = payload.get("comment", {}).get("user", {})
+        if not await is_command_allowed(
+            load_config(),
+            command,
+            actor.get("login", ""),
+            provider=provider,
+            owner=owner,
+            repo=repo,
+            user_id=actor.get("id"),
+        ):
+            return
 
         if command in _PAUSE_KEYWORDS:
             await provider.add_label(pr_info, PAUSE_LABEL)
