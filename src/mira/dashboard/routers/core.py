@@ -274,8 +274,9 @@ def get_org_stats(period: str = "") -> OrgStatsModel:
     total_groups = 0
     try:
         with _open_relationships() as rs:
-            total_edges = len(rs.resolve_edges())
-            total_groups = len(rs.group_repos(rs.repos))
+            edges = rs.resolve_edges()
+            total_edges = len(edges)
+            total_groups = len(rs.group_repos(rs.repos, edges=edges))
     except Exception:
         pass
 
