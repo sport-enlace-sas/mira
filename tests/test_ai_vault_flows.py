@@ -360,6 +360,60 @@ async def test_live_trace_distinguishes_session_wait_and_persists_cancellation(s
     assert run["steps"][0]["phase"] == "finished"
 
 
+async def test_session_wait_obeys_node_timeout_and_continues_to_next_provider(store):
+    first, credential = connection(store)
+    second, _ = connection(store, "codex-cli")
+    flow = FlowInput.model_validate(
+        {
+            "name": "Busy account",
+            "nodes": [
+                {
+                    "id": "busy",
+                    "name": "Busy Claude",
+                    "connection_id": first,
+                    "model": "busy",
+                    "timeout": 1,
+                },
+                {
+                    "id": "available",
+                    "name": "Available Codex",
+                    "connection_id": second,
+                    "model": "working",
+                },
+            ],
+            "edges": [{"source": "busy", "target": "available"}],
+        }
+    )
+    fid = store.publish(flow, 1)
+    store.assign(dict.fromkeys(SCENARIOS, fid), 1)
+    runtime = AIRuntime(store)
+    released = asyncio.Event()
+    waiting = asyncio.Event()
+    invoked = []
+
+    @asynccontextmanager
+    async def provider(conn, config, active_id=None):
+        if conn["id"] == first:
+            try:
+                await waiting.wait()
+            finally:
+                released.set()
+        invoked.append(config.model)
+        yield FakeProvider(AsyncMock(return_value='{"ok":true}'))
+
+    runtime.broker.provider = provider
+    assert (
+        await asyncio.wait_for(runtime.provider(LLMConfig()).complete([]), timeout=5)
+        == '{"ok":true}'
+    )
+    assert released.is_set()
+    assert invoked == ["working"]
+    run = store.runs()[0]
+    assert run["steps"][0]["cause"] == "timeout"
+    assert run["steps"][1]["result"] == "success"
+    assert store.credential_metadata(credential)["status"] == "ready"
+
+
 async def test_incompatible_context_is_skipped_without_truncation(store):
     cid, _ = connection(store)
     fid = chain(store, cid, ("small", "large"))

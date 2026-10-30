@@ -489,17 +489,20 @@ class FlowProvider:
                                 )
                             result = '{"ok":true}'
                         else:
-                            result = await self._execute_node(
-                                connection,
-                                node,
-                                method,
-                                messages,
-                                kwargs,
-                                active_id,
-                                metadata,
-                                step,
-                                run,
-                            )
+                            # The node budget includes waiting for its session,
+                            # native refresh and inference, not only HTTP time.
+                            async with asyncio.timeout(node.timeout):
+                                result = await self._execute_node(
+                                    connection,
+                                    node,
+                                    method,
+                                    messages,
+                                    kwargs,
+                                    active_id,
+                                    metadata,
+                                    step,
+                                    run,
+                                )
                             step["phase"] = "saving"
                             self.runtime.store.save_run(run)
                             await self.runtime.broker.health(active_id, "ready")
