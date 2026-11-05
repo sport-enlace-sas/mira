@@ -334,10 +334,25 @@ def test_webhook_routes_merged_pr(monkeypatch):
     assert called_with["bot_name"] == "mira"
 
 
-def test_webhook_ignores_closed_but_not_merged(monkeypatch):
+def test_webhook_cancels_closed_pr_without_merge_learning(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
+    from mira.dashboard.db import AppDatabase
     from mira.platforms import server as wh
+
+    db = AppDatabase(str(tmp_path / "queue.db"), admin_password="synthetic-test")
+    monkeypatch.setattr("mira.platforms.github.webhook._get_app_db", lambda: db)
+    db.enqueue_review_job(
+        owner="acme",
+        repo="web",
+        pr_number=7,
+        head_sha="a" * 40,
+        pr_url="https://github.com/acme/web/pull/7",
+        pr_title="Abandoned",
+        installation_id=42,
+        is_private=True,
+    )
+    queued = db.list_review_jobs()[0]
 
     called = []
 
@@ -382,8 +397,10 @@ def test_webhook_ignores_closed_but_not_merged(monkeypatch):
         },
     )
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ignored"}
+    assert resp.json() == {"status": "cancelled"}
+    assert db.get_review_job(queued.id).status == "cancelled"
     assert called == []
+    db.close()
 
 
 # ── End-to-end handler test ──

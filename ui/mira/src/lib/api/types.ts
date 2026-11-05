@@ -23,7 +23,14 @@ export interface ReviewJobModel {
   head_sha: string
   pr_url: string
   pr_title: string
-  status: "pending" | "running" | "completed" | "failed" | "superseded"
+  status:
+    | "pending"
+    | "running"
+    | "completed"
+    | "failed"
+    | "superseded"
+    | "cancelling"
+    | "cancelled"
   attempts: number
   error: string
   provider_used: string
@@ -373,7 +380,8 @@ export interface ContributorSummary {
   previous: ContributionWindow
 }
 
-export type ContributorSort = "commits" | "prs" | "reviews" | "recent" | "additions"
+export type ContributorSort =
+  "commits" | "prs" | "reviews" | "recent" | "additions"
 export type StatsPeriod = "day" | "week" | "month"
 
 // ── Review insights ──

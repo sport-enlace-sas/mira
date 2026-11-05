@@ -93,6 +93,9 @@ class ClaudeCLIProvider(CodexCLIProvider):
                 raise LLMError(
                     "claude_timeout", seconds=self.config.claude_timeout_seconds
                 ) from exc
+            except BaseException:
+                await self._terminate_process_tree(proc)
+                raise
             if proc.returncode != 0:
                 detail = "\n".join(
                     text.strip()

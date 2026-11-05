@@ -1506,7 +1506,7 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
                 "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
-                "AND head_sha<>? AND status IN ('pending','running','failed')",
+                "AND head_sha<>? AND status IN ('pending','running','failed','cancelled')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur = self._sqlite_conn.execute(
@@ -1535,7 +1535,7 @@ class AppDatabase:
             cur.execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=%s "
                 "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s "
-                "AND head_sha<>%s AND status IN ('pending','running','failed')",
+                "AND head_sha<>%s AND status IN ('pending','running','failed','cancelled')",
                 (now, platform, owner, repo, pr_number, head_sha),
             )
             cur.execute(
@@ -1620,6 +1620,11 @@ class AppDatabase:
     def recover_interrupted_review_jobs(self) -> int:
         """Requeue work left running by a service restart or deploy."""
         now = time.time()
+        self._update_review_jobs(
+            "UPDATE mira_review_jobs SET status='cancelled', updated_at=? "
+            "WHERE status='cancelling'",
+            (now,),
+        )
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             cur = self._sqlite_conn.execute(
@@ -1710,6 +1715,81 @@ class AppDatabase:
             retried = cur.fetchone() is not None
         self._pg_commit()
         return retried
+
+    def _update_review_jobs(self, sql: str, args: tuple) -> int:
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            count = self._sqlite_conn.execute(sql, args).rowcount
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(sql.replace("?", "%s"), args)
+                count = cur.rowcount
+            self._pg_commit()
+        return count
+
+    def cancel_review_job(self, job_id: int, *, reason: str = "cancelled_by_user") -> bool:
+        return bool(
+            self._update_review_jobs(
+                "UPDATE mira_review_jobs SET status=CASE WHEN status='running' "
+                "THEN 'cancelling' ELSE 'cancelled' END, error=?, updated_at=? "
+                "WHERE id=? AND status IN ('pending','running')",
+                (reason, time.time(), job_id),
+            )
+        )
+
+    def cancel_pr_review_jobs(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        *,
+        reason: str,
+        platform: str = "github",
+    ) -> int:
+        return self._update_review_jobs(
+            "UPDATE mira_review_jobs SET status=CASE WHEN status='running' "
+            "THEN 'cancelling' ELSE 'cancelled' END, error=?, updated_at=? "
+            "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
+            "AND status IN ('pending','running')",
+            (reason, time.time(), platform, owner, repo, pr_number),
+        )
+
+    def complete_review_job_cancellation(self, job_id: int) -> None:
+        self._update_review_jobs(
+            "UPDATE mira_review_jobs SET status='cancelled', updated_at=? "
+            "WHERE id=? AND status='cancelling'",
+            (time.time(), job_id),
+        )
+
+    def resume_review_job(self, job_id: int) -> bool:
+        now = time.time()
+        return bool(
+            self._update_review_jobs(
+                "UPDATE mira_review_jobs SET status='pending', attempts=0, error='', "
+                "provider_used='', fallback_used=FALSE, models_attempted='', "
+                "next_attempt_at=?, updated_at=? WHERE id=? AND status='cancelled' "
+                "AND NOT EXISTS (SELECT 1 FROM mira_review_jobs newer "
+                "WHERE newer.platform=mira_review_jobs.platform AND newer.owner=mira_review_jobs.owner "
+                "AND newer.repo=mira_review_jobs.repo AND newer.pr_number=mira_review_jobs.pr_number "
+                "AND newer.id>mira_review_jobs.id)",
+                (now, now, job_id),
+            )
+        )
+
+    def get_review_job_request(self, job_id: int) -> ReviewJob | None:
+        sql = (
+            "SELECT id,platform,owner,repo,pr_number,head_sha,pr_url,pr_title,"
+            "installation_id,is_private,attempts FROM mira_review_jobs WHERE id=?"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(sql, (job_id,)).fetchone()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(sql.replace("?", "%s"), (job_id,))
+                row = cur.fetchone()
+        return ReviewJob(*row) if row else None
 
     def get_review_job(self, job_id: int) -> ReviewJobStatus | None:
         """Return one queue item for an authenticated operational action."""

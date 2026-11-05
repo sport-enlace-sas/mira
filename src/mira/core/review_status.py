@@ -82,6 +82,13 @@ class ReviewTracker:
                 job.error = error
                 job.finished_at = time.time()
 
+    def cancel(self, repo: str, pr_number: int) -> None:
+        with self._lock:
+            job = self._jobs.get(self._key(repo, pr_number))
+            if job:
+                job.status = "cancelled"
+                job.finished_at = time.time()
+
     def get_active(self) -> list[ReviewStatus]:
         with self._lock:
             self._evict_old()

@@ -32,13 +32,116 @@ from mira.platforms.github.webhook import (
 logger = logging.getLogger(__name__)
 
 _SAFE_BOT_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+_REVIEW_CANCEL_POLL_SECONDS = 1.0
+_REVIEW_PR_POLL_SECONDS = 30.0
+_REVIEW_WORKER_RESTART_SECONDS = 5.0
+
+
+async def _supervise_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
+    while True:
+        try:
+            await _run_review_worker(app_auth, bot_name)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            logger.warning("Review worker was cancelled unexpectedly; recovering queue")
+        except Exception as exc:
+            logger.warning("Review worker stopped (%s); recovering queue", type(exc).__name__)
+        await asyncio.sleep(_REVIEW_WORKER_RESTART_SECONDS)
+
+
+def _review_job_can_continue(db: Any, job: Any, info: Any) -> bool:
+    if info.merged or info.state != "open":
+        db.cancel_pr_review_jobs(
+            job.owner,
+            job.repo,
+            job.pr_number,
+            reason="pr_merged" if info.merged else "pr_closed",
+            platform=job.platform,
+        )
+        return False
+    if info.head_sha != job.head_sha:
+        db.enqueue_review_job(
+            owner=job.owner,
+            repo=job.repo,
+            pr_number=job.pr_number,
+            head_sha=info.head_sha,
+            pr_url=job.pr_url,
+            pr_title=info.title,
+            installation_id=job.installation_id,
+            is_private=bool(job.is_private),
+            platform=job.platform,
+        )
+        return False
+    return db.is_review_job_current(job.id)
+
+
+async def _run_cancellable_review(db: Any, job: Any, provider: Any, bot_name: str) -> bool:
+    from mira.platforms.handlers import run_pr_review
+
+    info = await asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
+    if not _review_job_can_continue(db, job, info):
+        db.complete_review_job_cancellation(job.id)
+        return True
+
+    async def watch() -> None:
+        next_pr_check = asyncio.get_running_loop().time() + _REVIEW_PR_POLL_SECONDS
+        while db.is_review_job_current(job.id):
+            await asyncio.sleep(_REVIEW_CANCEL_POLL_SECONDS)
+            if not db.is_review_job_current(job.id):
+                return
+            if asyncio.get_running_loop().time() >= next_pr_check:
+                try:
+                    current = await asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to check PR lifecycle for job %s: %s", job.id, type(exc).__name__
+                    )
+                else:
+                    if not _review_job_can_continue(db, job, current):
+                        return
+                next_pr_check = asyncio.get_running_loop().time() + _REVIEW_PR_POLL_SECONDS
+
+    review = asyncio.create_task(
+        run_pr_review(
+            provider,
+            job.owner,
+            job.repo,
+            job.pr_number,
+            job.pr_url,
+            bool(job.is_private),
+            bot_name,
+            platform=job.platform,
+            pr_title=job.pr_title,
+            publish_guard=lambda: db.is_review_job_current(job.id),
+            job_id=job.id,
+        )
+    )
+    monitor = asyncio.create_task(watch())
+    try:
+        done, _ = await asyncio.wait((review, monitor), return_when=asyncio.FIRST_COMPLETED)
+        if monitor in done:
+            await monitor
+            return True
+        return await review
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        raise RuntimeError("Review task was cancelled unexpectedly") from None
+    finally:
+        for task in (review, monitor):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(review, monitor, return_exceptions=True)
+        db.complete_review_job_cancellation(job.id)
 
 
 async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
     """Run the durable review queue inside Mira's single service process."""
     from mira.dashboard.api import _app_db
     from mira.exceptions import LLMError, NonRetriableLLMError
-    from mira.platforms.handlers import run_pr_review
     from mira.providers import create_provider
 
     recovered = _app_db.recover_interrupted_review_jobs()
@@ -56,19 +159,7 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
             provider = create_provider(
                 "github", partial(app_auth.get_installation_token, job.installation_id)
             )
-            reviewed = await run_pr_review(
-                provider,
-                job.owner,
-                job.repo,
-                job.pr_number,
-                job.pr_url,
-                bool(job.is_private),
-                bot_name,
-                platform=job.platform,
-                pr_title=job.pr_title,
-                publish_guard=lambda job_id=job.id: _app_db.is_review_job_current(job_id),
-                job_id=job.id,
-            )
+            reviewed = await _run_cancellable_review(_app_db, job, provider, bot_name)
             if not reviewed:
                 # Another SHA may still be completing. Return this job to the
                 # queue so the latest revision is not silently dropped.
@@ -139,7 +230,7 @@ def create_app(
             )
 
         review_worker_task = (
-            asyncio.create_task(_run_review_worker(app_auth, bot_name))
+            asyncio.create_task(_supervise_review_worker(app_auth, bot_name))
             if app_auth is not None
             else None
         )
