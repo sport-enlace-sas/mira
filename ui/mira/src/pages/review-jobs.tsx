@@ -1,7 +1,14 @@
-import { ExternalLink, RefreshCw } from "lucide-react"
+import {
+  ExternalLink,
+  RefreshCw,
+  Square,
+  Play,
+  LoaderCircle,
+} from "lucide-react"
 import { Link } from "react-router"
 import {
   useState,
+  useEffect,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react"
@@ -19,6 +26,8 @@ import {
 } from "@/components/ui/table"
 import { api, type ReviewJobModel } from "@/lib/api"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
+import { useAuth } from "@/lib/auth"
+import { toast } from "sonner"
 
 const STATUS_VARIANT: Record<
   ReviewJobModel["status"],
@@ -29,6 +38,24 @@ const STATUS_VARIANT: Record<
   completed: "outline",
   failed: "destructive",
   superseded: "secondary",
+  cancelling: "secondary",
+  cancelled: "outline",
+}
+
+const STATUS_LABEL: Record<ReviewJobModel["status"], string> = {
+  pending: "En cola",
+  running: "En curso",
+  completed: "Completada",
+  failed: "Falló",
+  superseded: "SHA sustituido",
+  cancelling: "Cancelando",
+  cancelled: "Cancelada",
+}
+
+const CANCELLATION_REASON: Record<string, string> = {
+  cancelled_by_user: "Cancelada manualmente",
+  pr_merged: "PR fusionado",
+  pr_closed: "PR cerrado",
 }
 
 const COLUMNS = [
@@ -45,7 +72,7 @@ const COLUMNS = [
   { key: "duration", label: "Audit duration", width: 130, minWidth: 110 },
   { key: "tokens", label: "Tokens", width: 150, minWidth: 120 },
   { key: "attempts", label: "Attempts", width: 100, minWidth: 80 },
-  { key: "actions", label: "Actions", width: 110, minWidth: 90 },
+  { key: "actions", label: "Acciones", width: 164, minWidth: 144 },
   { key: "updated", label: "Updated", width: 110, minWidth: 90 },
 ] as const
 
@@ -81,17 +108,27 @@ function formatDuration(durationMs: number) {
 
 export function ReviewJobsPage() {
   useDocumentTitle("Advisory jobs")
+  const { user } = useAuth()
   const [refreshNonce, setRefreshNonce] = useState(0)
   const {
     data: jobs,
     loading,
     error,
   } = useAsync(() => api.listReviewJobs(), [refreshNonce])
-  const [retrying, setRetrying] = useState<number | null>(null)
+  const [acting, setActing] = useState<number | null>(null)
   const [columnWidths, setColumnWidths] = useState<ColumnWidths>(
     INITIAL_COLUMN_WIDTHS
   )
-  const [nowEpochSeconds] = useState(() => Date.now() / 1_000)
+  const [nowEpochSeconds, setNowEpochSeconds] = useState(
+    () => Date.now() / 1_000
+  )
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowEpochSeconds(Date.now() / 1_000)
+      setRefreshNonce((n) => n + 1)
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   const resizeColumnBy = (key: ColumnKey, delta: number) => {
     const column = COLUMNS.find((candidate) => candidate.key === key)
@@ -145,26 +182,40 @@ export function ReviewJobsPage() {
     0
   )
 
-  const retry = async (jobId: number) => {
-    setRetrying(jobId)
+  const act = async (jobId: number, action: "cancel" | "resume" | "retry") => {
+    setActing(jobId)
     try {
-      await api.retryReviewJob(jobId)
-      setRefreshNonce((n) => n + 1)
+      if (action === "cancel") await api.cancelReviewJob(jobId)
+      else if (action === "resume") await api.resumeReviewJob(jobId)
+      else await api.retryReviewJob(jobId)
+      toast.success(
+        action === "cancel"
+          ? "Cancelación solicitada"
+          : "Revisión puesta en cola"
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : ""
+      const detail = message.match(/"detail"\s*:\s*"([^"\n]+)"/)?.[1]
+      toast.error(
+        detail ||
+          "No se pudo cambiar la revisión. Actualiza e inténtalo de nuevo"
+      )
     } finally {
-      setRetrying(null)
+      setRefreshNonce((n) => n + 1)
+      setActing(null)
     }
   }
 
   return (
-    <div className="space-y-6">
+    <div className="min-w-0 space-y-6 [contain:inline-size]">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
             Advisory jobs
           </h1>
           <p className="text-sm text-muted-foreground">
-            Native durable queue by pull-request SHA. Superseded work never
-            publishes a review.
+            Las revisiones se cancelan al cerrar o fusionar el PR. Reanudar
+            reinicia el intento desde el primer proveedor del flujo.
           </p>
         </div>
         <Button
@@ -217,7 +268,11 @@ export function ReviewJobsPage() {
                   {COLUMNS.map((column) => (
                     <TableHead
                       key={column.key}
-                      className="relative overflow-hidden pr-3"
+                      className={
+                        column.key === "actions"
+                          ? "sticky right-0 z-20 overflow-hidden bg-card pr-3"
+                          : "relative overflow-hidden pr-3"
+                      }
                     >
                       <span className="block truncate">{column.label}</span>
                       <div
@@ -264,14 +319,20 @@ export function ReviewJobsPage() {
                         {job.head_sha.slice(0, 12)}
                       </div>
                       {job.error && (
-                        <div className="mt-1 truncate text-xs text-destructive">
-                          {job.error}
+                        <div
+                          className={
+                            CANCELLATION_REASON[job.error]
+                              ? "mt-1 truncate text-xs text-muted-foreground"
+                              : "mt-1 truncate text-xs text-destructive"
+                          }
+                        >
+                          {CANCELLATION_REASON[job.error] || job.error}
                         </div>
                       )}
                     </TableCell>
                     <TableCell className="overflow-hidden">
                       <Badge variant={STATUS_VARIANT[job.status]}>
-                        {job.status}
+                        {STATUS_LABEL[job.status]}
                       </Badge>
                     </TableCell>
                     <TableCell className="overflow-hidden text-sm">
@@ -342,18 +403,54 @@ export function ReviewJobsPage() {
                           </div>
                         )}
                     </TableCell>
-                    <TableCell className="overflow-hidden">
-                      {(job.status === "failed" ||
-                        job.status === "pending") && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={retrying !== null}
-                          onClick={() => void retry(job.id)}
-                        >
-                          {retrying === job.id ? "Scheduling…" : "Retry"}
-                        </Button>
+                    <TableCell className="sticky right-0 z-10 space-y-2 overflow-hidden bg-card">
+                      {user?.is_admin &&
+                        (job.status === "running" ||
+                          job.status === "pending") && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={acting !== null}
+                            aria-label={`Cancelar revisión de PR #${job.pr_number}`}
+                            onClick={() => void act(job.id, "cancel")}
+                          >
+                            <Square className="mr-1 size-3" />
+                            {acting === job.id ? "Cancelando…" : "Cancelar"}
+                          </Button>
+                        )}
+                      {job.status === "cancelling" && (
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                          <LoaderCircle className="size-3 animate-spin" />{" "}
+                          Liberando sesión…
+                        </span>
                       )}
+                      {user?.is_admin &&
+                        job.status === "cancelled" &&
+                        job.error !== "pr_merged" && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={acting !== null}
+                            aria-label={`Reanudar revisión de PR #${job.pr_number}`}
+                            title="Reinicia este SHA desde el primer proveedor; el PR debe seguir abierto"
+                            onClick={() => void act(job.id, "resume")}
+                          >
+                            <Play className="mr-1 size-3" />
+                            {acting === job.id ? "Reanudando…" : "Reanudar"}
+                          </Button>
+                        )}
+                      {user?.is_admin &&
+                        (job.status === "failed" ||
+                          (job.status === "pending" && job.attempts > 0)) && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={acting !== null}
+                            onClick={() => void act(job.id, "retry")}
+                          >
+                            {acting === job.id ? "Programando…" : "Reintentar"}
+                          </Button>
+                        )}
                       <Link
                         className="block text-xs text-primary underline"
                         to={`/settings/ai?job=${job.id}`}

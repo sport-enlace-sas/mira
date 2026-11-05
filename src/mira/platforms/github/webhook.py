@@ -465,15 +465,20 @@ async def dispatch_github_event(
             background_tasks.add_task(handle_pull_request_review, payload, app_auth, bot_name)
         return "processing"
 
-    if (
-        event == "pull_request"
-        and action in _PR_MERGE_ACTIONS
-        and payload.get("pull_request", {}).get("merged")
-    ):
-        if payload.get("sender", {}).get("login", "") == f"{bot_name}[bot]":
-            return "ignored"
-        background_tasks.add_task(handle_pr_merged, payload, app_auth, bot_name)
-        return "processing"
+    if event == "pull_request" and action in _PR_MERGE_ACTIONS:
+        pr = payload.get("pull_request", {})
+        repository = payload.get("repository", {})
+        owner = repository.get("owner", {}).get("login", "")
+        repo = repository.get("name", "")
+        number = pr.get("number")
+        if owner and repo and number:
+            _get_app_db().cancel_pr_review_jobs(
+                owner, repo, number, reason="pr_merged" if pr.get("merged") else "pr_closed"
+            )
+        if pr.get("merged") and payload.get("sender", {}).get("login", "") != f"{bot_name}[bot]":
+            background_tasks.add_task(handle_pr_merged, payload, app_auth, bot_name)
+            return "processing"
+        return "cancelled" if owner and repo and number else "ignored"
 
     if event == "pull_request" and action in _PR_ACTIONS:
         sender = payload.get("sender", {}).get("login", "")

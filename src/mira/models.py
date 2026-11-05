@@ -506,6 +506,8 @@ class PRInfo:
     # and surfaced (with avatar) in the activity dashboard.
     author: str = ""
     author_avatar_url: str = ""
+    state: str = "open"
+    merged: bool = False
 
 
 @dataclass

@@ -3,7 +3,22 @@ import type { ReviewJobModel } from "./types"
 
 export const reviewJobsApi = {
   listReviewJobs: (limit = 200) =>
-    fetchJson<ReviewJobModel[]>(`/api/review-jobs?limit=${encodeURIComponent(limit)}`),
+    fetchJson<ReviewJobModel[]>(
+      `/api/review-jobs?limit=${encodeURIComponent(limit)}`
+    ),
   retryReviewJob: (jobId: number) =>
-    postJson<ReviewJobModel>(`/api/review-jobs/${encodeURIComponent(jobId)}/retry`, {}),
+    postJson<ReviewJobModel>(
+      `/api/review-jobs/${encodeURIComponent(jobId)}/retry`,
+      {}
+    ),
+  cancelReviewJob: (jobId: number) =>
+    postJson<ReviewJobModel>(
+      `/api/review-jobs/${encodeURIComponent(jobId)}/cancel`,
+      {}
+    ),
+  resumeReviewJob: (jobId: number) =>
+    postJson<ReviewJobModel>(
+      `/api/review-jobs/${encodeURIComponent(jobId)}/resume`,
+      {}
+    ),
 }

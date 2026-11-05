@@ -4,6 +4,7 @@ none is tied to a specific platform's payload shape."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -164,6 +165,10 @@ async def run_pr_review(
     try:
         result = await engine.review_pr(pr_url)
         review_tracker.complete(repo_full, number)
+    except asyncio.CancelledError:
+        await engine.cancel_background_tasks()
+        review_tracker.cancel(repo_full, number)
+        raise
     except Exception as exc:
         review_tracker.fail(repo_full, number, str(exc))
         from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event

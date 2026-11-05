@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from functools import partial
 
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -212,6 +213,57 @@ def retry_review_job(job_id: int, request: Request) -> ReviewJobModel:
     if job is None:  # Defensive: a concurrent cleanup should not become a 500.
         raise HTTPException(status_code=404, detail="Review job not found")
     return ReviewJobModel(**job.__dict__)
+
+
+@router.post("/api/review-jobs/{job_id}/cancel", response_model=ReviewJobModel)
+def cancel_review_job(job_id: int, request: Request) -> ReviewJobModel:
+    _api._require_admin(request)
+    job = _api._app_db.get_review_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Review job not found")
+    if not _api._app_db.cancel_review_job(job_id):
+        raise HTTPException(status_code=409, detail="Esta revisión ya terminó o se está cancelando")
+    return ReviewJobModel(**_api._app_db.get_review_job(job_id).__dict__)
+
+
+@router.post("/api/review-jobs/{job_id}/resume", response_model=ReviewJobModel)
+async def resume_review_job(job_id: int, request: Request) -> ReviewJobModel:
+    _api._require_admin(request)
+    job = _api._app_db.get_review_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Review job not found")
+    if job.status != "cancelled":
+        raise HTTPException(
+            status_code=409, detail="Espera a que la revisión termine de cancelarse"
+        )
+    review_request = _api._app_db.get_review_job_request(job_id)
+    auth = _api._build_app_auth()
+    if job.platform != "github" or auth is None or review_request is None:
+        raise HTTPException(status_code=503, detail="No se puede comprobar el estado del PR")
+    from mira.providers import create_provider
+
+    provider = create_provider(
+        "github", partial(auth.get_installation_token, review_request.installation_id)
+    )
+    try:
+        info = await asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="No se pudo consultar GitHub. Inténtalo de nuevo"
+        ) from exc
+    if info.merged or info.state != "open":
+        raise HTTPException(
+            status_code=409, detail="El PR está fusionado o cerrado y no se puede reanudar"
+        )
+    if info.head_sha != job.head_sha:
+        raise HTTPException(
+            status_code=409, detail="El PR tiene un SHA nuevo. Usa la revisión más reciente"
+        )
+    if not _api._app_db.resume_review_job(job_id):
+        raise HTTPException(
+            status_code=409, detail="La revisión cambió de estado. Actualiza la lista"
+        )
+    return ReviewJobModel(**_api._app_db.get_review_job(job_id).__dict__)
 
 
 @router.get("/api/stats", response_model=OrgStatsModel)

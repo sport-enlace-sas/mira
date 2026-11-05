@@ -612,6 +612,22 @@ class ReviewEngine:
             logger.warning("Overlap detection failed, continuing: %s", exc)
             return []
 
+    async def cancel_background_tasks(self) -> None:
+        import asyncio
+
+        tasks = list(getattr(self, "_review_tasks", []))
+        tasks.extend(
+            task
+            for task in (
+                getattr(self, "_overlap_task", None),
+                getattr(self, "_walkthrough_notify_task", None),
+            )
+            if task is not None
+        )
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def review_pr(self, pr_url: str) -> ReviewResult:
         """Full pipeline: fetch PR -> review -> post results.
 
@@ -839,6 +855,7 @@ class ReviewEngine:
         overlap_task = None
         if diff_text.strip():
             overlap_task = _asyncio.create_task(self._detect_overlaps_safe(pr_info, full_diff_text))
+            self._overlap_task = overlap_task
 
         try:
             result = await self._review_diff_internal(
@@ -864,6 +881,9 @@ class ReviewEngine:
                     }
                 )
         except BaseException as exc:
+            if isinstance(exc, _asyncio.CancelledError):
+                await self.cancel_background_tasks()
+                raise
             if overlap_task is not None:
                 overlap_task.cancel()
 
@@ -1430,6 +1450,7 @@ class ReviewEngine:
 
         # Fire walkthrough early so review_pr can post it before chunk review finishes.
         walkthrough_task = _asyncio.create_task(_generate_walkthrough())
+        self._review_tasks = [walkthrough_task]
 
         # `_walkthrough_notify_task` exposed on self so review_pr can await it
         # before its own final write — otherwise the in-progress update can land
@@ -1633,6 +1654,7 @@ class ReviewEngine:
                     return [], [], ""
 
         review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        self._review_tasks.append(review_task)
         # Per-chunk executors (fresh per call) so each chunk gets its own
         # 50KB tool-output budget; one shared executor would let an early
         # chunk exhaust the budget and wedge later chunks.
@@ -1716,6 +1738,7 @@ class ReviewEngine:
             if filtered and self.config.review.secrets_scan
             else _asyncio.sleep(0, result=[])
         )
+        self._review_tasks.extend([security_task, dependency_task, osv_task, secrets_task])
 
         (
             chunk_results,

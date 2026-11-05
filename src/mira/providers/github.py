@@ -245,6 +245,8 @@ class GitHubProvider(BaseProvider):
                 base_sha=pr.base.sha or "",
                 author=(user.login or "") if user else "",
                 author_avatar_url=(user.avatar_url or "") if user else "",
+                state=pr.state,
+                merged=bool(pr.merged),
             )
 
         try:
