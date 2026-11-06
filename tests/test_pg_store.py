@@ -18,7 +18,7 @@ from mira.dashboard.db import AppDatabase, User
 from mira.dashboard.routers import rules
 from mira.index import pg_store
 from mira.index.pg_store import _PG_SCHEMA, PgIndexStore
-from mira.index.store import IndexStore
+from mira.index.store import ExternalRef, FileSummary, IndexStore, SymbolInfo
 from mira.models import PRFingerprint
 
 
@@ -79,6 +79,50 @@ def _fp(number, *, head_sha="sha", updated_at=0.0, paths=None, symbols=None):
         symbols=symbols or [],
         updated_at=updated_at,
     )
+
+
+def test_relationship_bulk_inputs_are_repo_scoped_and_skip_orphaned_rows(store, fake_conn):
+    expected = ExternalRef("main.py", "git_url", "https://github.com/acme/target", "Shared API")
+    store.upsert_summary(
+        FileSummary(
+            path="main.py",
+            language="python",
+            summary="Payment processing",
+            symbols=[SymbolInfo("PaymentLedger", "class", "", "")],
+            external_refs=[expected],
+        )
+    )
+    store.upsert_summary(
+        FileSummary(
+            path="blank.py",
+            language="python",
+            summary="",
+            symbols=[SymbolInfo("IgnoredEmptySummary", "class", "", "")],
+        )
+    )
+    for owner, repo in [("other", "widgets"), ("acme", "other"), ("_gitlab/acme", "widgets")]:
+        other = PgIndexStore(owner, repo, "postgresql://fake")
+        other.upsert_summary(
+            FileSummary(
+                path="main.py",
+                language="python",
+                summary="Foreign summary",
+                symbols=[SymbolInfo("ForeignSymbol", "class", "", "")],
+                external_refs=[
+                    ExternalRef("main.py", "git_url", "https://example.invalid/foreign")
+                ],
+            )
+        )
+    fake_conn._conn.execute(
+        "INSERT INTO external_refs (owner, repo, file_path, kind, target, description) "
+        "VALUES ('acme', 'widgets', 'missing.py', 'git_url', 'orphan', '')"
+    )
+    queries: list[str] = []
+    fake_conn._conn.set_trace_callback(queries.append)
+
+    assert store.get_all_external_refs() == [expected]
+    assert store.get_summary_texts_and_symbol_names() == (["Payment processing"], ["PaymentLedger"])
+    assert len([q for q in queries if q.lstrip().upper().startswith("SELECT")]) == 3
 
 
 def test_org_wide_learnings_expose_registry_owner(fake_conn, monkeypatch):

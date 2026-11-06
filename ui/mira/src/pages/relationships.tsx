@@ -25,17 +25,11 @@ import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
 export function RelationshipsPage() {
   useDocumentTitle("Relationships")
-  const { data, loading, error } = useAsync(api.getRelationships, [])
-  const { data: repos } = useAsync(api.listRepos, [])
   const [refreshKey, setRefreshKey] = useState(0)
+  const { data: displayData, loading, error } = useAsync(api.getRelationships, [refreshKey])
+  const { data: repos } = useAsync(api.listRepos, [])
   const [showAddEdge, setShowAddEdge] = useState(false)
   const [newEdge, setNewEdge] = useState({ source: "", target: "", reason: "" })
-
-  const { data: freshData } = useAsync(
-    () => api.getRelationships(),
-    [refreshKey],
-  )
-  const displayData = freshData ?? data
 
   const repoFileCounts: Record<string, number> = {}
   repos?.forEach((r) => {

@@ -277,10 +277,11 @@ class RelationshipStore:
 
         for source_repo, store in self._stores.items():
             all_targets = store.get_all_external_targets()
+            if not all_targets:
+                continue
             all_refs_by_target: dict[str, list[ExternalRef]] = {}
-            for path in store.all_paths():
-                for ref in store._load_external_refs(path):
-                    all_refs_by_target.setdefault(ref.target, []).append(ref)
+            for ref in store.get_all_external_refs():
+                all_refs_by_target.setdefault(ref.target, []).append(ref)
 
             for target_str in all_targets:
                 matched_repo = self._match_target_to_repo(target_str, known, short_to_full)
@@ -338,7 +339,9 @@ class RelationshipStore:
 
         return [(k, v[0], v[1]) for k, v in sorted(result.items())]
 
-    def group_repos(self, repo_names: list[str]) -> list[RepoGroup]:
+    def group_repos(
+        self, repo_names: list[str], *, edges: list[RepoEdge] | None = None
+    ) -> list[RepoGroup]:
         """Group repos using multiple content-aware signals.
 
         Combines four signals to determine groups:
@@ -349,8 +352,11 @@ class RelationshipStore:
 
         Each candidate group needs at least 2 signals or 1 strong signal
         (mutual edges) to be accepted.
+
+        Pass edges already resolved for this request to avoid a second index scan.
         """
-        edges = self.resolve_edges()
+        if edges is None:
+            edges = self.resolve_edges()
 
         # Utility repos can't bridge unrelated groups: shared-lib being a
         # common dependency doesn't make its dependents related to each other.
@@ -544,18 +550,15 @@ class RelationshipStore:
 
         for repo_name, store in self._stores.items():
             words: Counter[str] = Counter()
-            for path in store.all_paths():
-                summary = store.get_summary(path)
-                if summary and summary.summary:
-                    for word in re.findall(r"[a-z]{3,}", summary.summary.lower()):
-                        if word not in _STOP_WORDS:
-                            words[word] += 1
-                    for sym in summary.symbols:
-                        for part in re.findall(
-                            r"[a-z]{3,}", re.sub(r"([A-Z])", r" \1", sym.name).lower()
-                        ):
-                            if part not in _STOP_WORDS:
-                                words[part] += 1
+            texts, names = store.get_summary_texts_and_symbol_names()
+            for text in texts:
+                for word in re.findall(r"[a-z]{3,}", text.lower()):
+                    if word not in _STOP_WORDS:
+                        words[word] += 1
+            for name in names:
+                for part in re.findall(r"[a-z]{3,}", re.sub(r"([A-Z])", r" \1", name).lower()):
+                    if part not in _STOP_WORDS:
+                        words[part] += 1
 
             keywords[repo_name] = {
                 word for word, count in words.items() if count >= 1 and len(word) >= 4

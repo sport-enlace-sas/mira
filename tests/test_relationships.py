@@ -6,7 +6,11 @@ relationship resolution, repo grouping, and template integration.
 
 from __future__ import annotations
 
+from contextlib import closing, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from mira.index.relationships import RelationshipStore
 from mira.index.store import ExternalRef, FileSummary, IndexStore, SymbolInfo
@@ -180,6 +184,119 @@ class TestRelationshipResolution:
         source_store.close()
 
         return RelationshipStore(index_dir=str(tmp_path))
+
+    @pytest.mark.parametrize("file_count", [1, 64])
+    @pytest.mark.parametrize("has_refs", [False, True])
+    def test_resolution_query_budget_is_independent_of_file_count(
+        self, tmp_path: Path, monkeypatch, file_count: int, has_refs: bool
+    ) -> None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with closing(self._setup_two_repos(tmp_path, "https://github.com/org/target-repo")) as rs:
+            source = rs._stores["org/source-repo"]
+            if not has_refs:
+                source.upsert_summary(
+                    FileSummary(path="main.py", language="python", summary="Main")
+                )
+            for number in range(file_count):
+                source.upsert_summary(
+                    FileSummary(
+                        path=f"unrelated-{number}.py", language="python", summary="Unrelated"
+                    )
+                )
+            queries: list[str] = []
+            for store in rs._stores.values():
+                store._conn.set_trace_callback(queries.append)
+
+            edges = rs.resolve_edges()
+
+            reads = [q for q in queries if q.lstrip().upper().startswith("SELECT")]
+            assert len(reads) <= (3 if has_refs else 2)
+            if has_refs:
+                assert [(e.source_repo, e.target_repo) for e in edges] == [
+                    ("org/source-repo", "org/target-repo")
+                ]
+                assert edges[0].refs == [
+                    ExternalRef("main.py", "git_url", "https://github.com/org/target-repo")
+                ]
+            else:
+                assert edges == []
+
+    @pytest.mark.parametrize("file_count", [1, 64])
+    def test_grouping_reuses_edges_and_bulk_text_without_losing_symbol_signals(
+        self, tmp_path: Path, monkeypatch, file_count: int
+    ) -> None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with closing(self._setup_two_repos(tmp_path, "https://github.com/org/target-repo")) as rs:
+            for name, target, path, text in [
+                ("source-repo", "target-repo", "main.py", "Leftmost"),
+                ("target-repo", "source-repo", "lib.py", "Rightmost"),
+            ]:
+                store = rs._stores[f"org/{name}"]
+                store.upsert_summary(
+                    FileSummary(
+                        path=path,
+                        language="python",
+                        summary=text,
+                        symbols=[SymbolInfo("PaymentInvoiceLedger", "class", "", "")],
+                        external_refs=[
+                            ExternalRef(path, "git_url", f"https://github.com/org/{target}")
+                        ],
+                    )
+                )
+                for number in range(file_count):
+                    store.upsert_summary(
+                        FileSummary(path=f"extra-{number}.py", language="python", summary=text)
+                    )
+            edges = rs.resolve_edges()
+            queries: list[str] = []
+            for store in rs._stores.values():
+                store._conn.set_trace_callback(queries.append)
+
+            groups = rs.group_repos(rs.repos, edges=edges)
+
+            reads = [q for q in queries if q.lstrip().upper().startswith("SELECT")]
+            assert len(reads) == 4
+            assert len(groups) == 1
+            assert set(groups[0].repos) == {"org/source-repo", "org/target-repo"}
+            assert any("content overlap" in evidence for evidence in groups[0].evidence)
+
+    @pytest.mark.parametrize("endpoint", ["stats", "relationships"])
+    def test_dashboard_endpoints_resolve_a_single_bounded_snapshot(
+        self, tmp_path: Path, monkeypatch, endpoint: str
+    ) -> None:
+        from mira.dashboard import api
+        from mira.dashboard.routers import core, relationships
+
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+        rs = self._setup_two_repos(tmp_path, "https://github.com/org/target-repo")
+        queries: list[str] = []
+        for store in rs._stores.values():
+            store._conn.set_trace_callback(queries.append)
+
+        @contextmanager
+        def open_relationships():
+            try:
+                yield rs
+            finally:
+                rs.close()
+
+        records = [
+            SimpleNamespace(owner="org", repo=name, platform="github")
+            for name in ["source-repo", "target-repo"]
+        ]
+        monkeypatch.setattr(api, "_app_db", SimpleNamespace(list_repos=lambda: records))
+        monkeypatch.setattr(core, "_open_relationships", open_relationships)
+        monkeypatch.setattr(relationships, "_open_relationships", open_relationships)
+
+        if endpoint == "stats":
+            result = core.get_org_stats()
+            assert result.total_edges == 1
+            assert result.total_files == 2
+        else:
+            result = relationships.get_relationships()
+            assert len(result.edges) == 1
+        assert len([q for q in queries if q.lstrip().upper().startswith("SELECT")]) == 7
 
     def test_docker_image_matches_repo(self, tmp_path: Path) -> None:
         # Create repos

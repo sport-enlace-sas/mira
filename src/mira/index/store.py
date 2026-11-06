@@ -1169,6 +1169,22 @@ class IndexStore(_StoreSharedMixin):
         ).fetchall()
         return [ExternalRef(file_path=r[0], kind=r[1], target=r[2], description=r[3]) for r in rows]
 
+    def get_all_external_refs(self) -> list[ExternalRef]:
+        """Load refs for indexed files without one query per file."""
+        rows = self._conn.execute(
+            "SELECT r.file_path, r.kind, r.target, r.description FROM external_refs r "
+            "JOIN files f ON f.path=r.file_path ORDER BY r.file_path, r.kind, r.target"
+        ).fetchall()
+        return [ExternalRef(file_path=r[0], kind=r[1], target=r[2], description=r[3]) for r in rows]
+
+    def get_summary_texts_and_symbol_names(self) -> tuple[list[str], list[str]]:
+        """Read similarity inputs without hydrating each file's entire index."""
+        texts = self._conn.execute("SELECT summary FROM files WHERE summary != ''").fetchall()
+        names = self._conn.execute(
+            "SELECT s.name FROM symbols s JOIN files f ON f.path=s.file_path WHERE f.summary != ''"
+        ).fetchall()
+        return [r[0] for r in texts], [r[0] for r in names]
+
     def _load_symbols(self, path: str) -> list[SymbolInfo]:
         rows = self._conn.execute(
             "SELECT name, kind, signature, description FROM symbols WHERE file_path = ?",
