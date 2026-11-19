@@ -1511,9 +1511,12 @@ class AppDatabase:
                 "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?,?) "
                 "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO UPDATE SET "
-                "status='pending', attempts=0, error='', next_attempt_at=excluded.next_attempt_at, "
+                "status=CASE WHEN mira_review_jobs.status='cancelling' THEN 'cancelling' ELSE 'pending' END, "
+                "attempts=CASE WHEN mira_review_jobs.status='cancelling' THEN mira_review_jobs.attempts ELSE 0 END, "
+                "error=CASE WHEN mira_review_jobs.status='cancelling' THEN 'pr_reopen_requested' ELSE '' END, "
+                "next_attempt_at=excluded.next_attempt_at, "
                 "updated_at=excluded.updated_at WHERE "
-                "(? AND mira_review_jobs.status='cancelled' "
+                "(? AND mira_review_jobs.status IN ('cancelled','cancelling') "
                 "AND mira_review_jobs.error IN ('pr_draft','pr_closed')) "
                 "OR (? AND mira_review_jobs.status='superseded')",
                 (
@@ -1535,7 +1538,8 @@ class AppDatabase:
             execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
                 "WHERE platform=? AND owner=? AND repo=? AND pr_number=? AND head_sha<>? "
-                "AND status IN ('pending','running','failed','cancelled')",
+                "AND (status IN ('pending','running','failed','cancelled') "
+                "OR (status='cancelling' AND error='pr_reopen_requested'))",
                 (now, *key, head_sha),
             )
             return True
@@ -1554,6 +1558,21 @@ class AppDatabase:
                 (f"mira-review-job:{platform}:{owner}:{repo}:{pr_number}",),
             )
             return persist(cur)
+
+    def is_review_head_superseded(
+        self, owner: str, repo: str, pr_number: int, head_sha: str, platform: str = "github"
+    ) -> bool:
+        query = (
+            "SELECT 1 FROM mira_review_jobs WHERE platform=? AND owner=? AND repo=? "
+            "AND pr_number=? AND head_sha=? AND status='superseded'"
+        )
+        args = (platform, owner, repo, pr_number, head_sha)
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            return self._sqlite_conn.execute(query, args).fetchone() is not None
+        with self._pg_cursor() as cur:
+            cur.execute(query.replace("?", "%s"), args)
+            return cur.fetchone() is not None
 
     def supersede_review_job(self, job_id: int) -> None:
         self._update_review_jobs(
@@ -1630,11 +1649,7 @@ class AppDatabase:
     def recover_interrupted_review_jobs(self) -> int:
         """Requeue work left running by a service restart or deploy."""
         now = time.time()
-        self._update_review_jobs(
-            "UPDATE mira_review_jobs SET status='cancelled', updated_at=? "
-            "WHERE status='cancelling'",
-            (now,),
-        )
+        self._complete_review_cancellations()
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             cur = self._sqlite_conn.execute(
@@ -1758,18 +1773,29 @@ class AppDatabase:
         platform: str = "github",
     ) -> int:
         return self._update_review_jobs(
-            "UPDATE mira_review_jobs SET status=CASE WHEN status='running' "
+            "UPDATE mira_review_jobs SET status=CASE WHEN status IN ('running','cancelling') "
             "THEN 'cancelling' ELSE 'cancelled' END, error=?, updated_at=? "
             "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
-            "AND status IN ('pending','running')",
+            "AND (status IN ('pending','running') "
+            "OR (status='cancelling' AND error='pr_reopen_requested'))",
             (reason, time.time(), platform, owner, repo, pr_number),
         )
 
     def complete_review_job_cancellation(self, job_id: int) -> None:
+        self._complete_review_cancellations(job_id)
+
+    def _complete_review_cancellations(self, job_id: int | None = None) -> None:
+        # A ready/reopen webhook can arrive while the old inference is still
+        # releasing its session. The queue only becomes claimable after cleanup.
+        condition = " AND id=?" if job_id is not None else ""
+        args = (time.time(), job_id) if job_id is not None else (time.time(),)
         self._update_review_jobs(
-            "UPDATE mira_review_jobs SET status='cancelled', updated_at=? "
-            "WHERE id=? AND status='cancelling'",
-            (time.time(), job_id),
+            "UPDATE mira_review_jobs SET "
+            "status=CASE WHEN error='pr_reopen_requested' THEN 'pending' ELSE 'cancelled' END, "
+            "attempts=CASE WHEN error='pr_reopen_requested' THEN 0 ELSE attempts END, "
+            "error=CASE WHEN error='pr_reopen_requested' THEN '' ELSE error END, "
+            "updated_at=? WHERE status='cancelling'" + condition,
+            args,
         )
 
     def resume_review_job(self, job_id: int) -> bool:

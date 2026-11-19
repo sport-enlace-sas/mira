@@ -3,6 +3,7 @@ handlers (PRs, comments, installations, push indexing)."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -628,18 +629,36 @@ async def handle_pull_request(
         # Record contribution before review so it lands even if the worker
         # later retries; this path is separately idempotent.
         _record_pr_contribution(payload, "pr_opened")
-        queued = _get_app_db().enqueue_review_job(
-            owner=owner,
-            repo=repo,
-            pr_number=number,
-            head_sha=head_sha,
-            pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
-            pr_title=pr.get("title", ""),
-            installation_id=int(payload.get("installation", {}).get("id", 0)),
-            is_private=bool(payload["repository"].get("private", False)),
-            defer_seconds=defer_seconds,
-            allow_reopen=payload.get("action") in {"ready_for_review", "reopened"},
-        )
+        pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        installation_id = int(payload.get("installation", {}).get("id", 0))
+        request = {
+            "owner": owner,
+            "repo": repo,
+            "pr_number": number,
+            "head_sha": head_sha,
+            "pr_url": pr_url,
+            "pr_title": pr.get("title", ""),
+            "installation_id": installation_id,
+            "is_private": bool(payload["repository"].get("private", False)),
+            "defer_seconds": defer_seconds,
+            "allow_reopen": payload.get("action") in {"ready_for_review", "reopened"},
+        }
+        db = _get_app_db()
+        queued = db.enqueue_review_job(**request)
+        if not queued and db.is_review_head_superseded(owner, repo, number, head_sha):
+            # Only GitHub's current head can revive a previously superseded SHA.
+            # A force-push back to it and an old redelivery look identical in the queue.
+            provider = create_provider(
+                "github", partial(app_auth.get_installation_token, installation_id)
+            )
+            current = await asyncio.wait_for(provider.get_pr_info(pr_url), timeout=10)
+            if (
+                current.head_sha == head_sha
+                and current.state == "open"
+                and not current.merged
+                and (not current.draft or not load_config().review.skip_draft_prs)
+            ):
+                queued = db.enqueue_review_job(**request, authoritative=True)
         logger.info("PR %s/%s#%s %s", owner, repo, number, "queued" if queued else "already queued")
     except Exception as exc:
         logger.exception("Error queueing pull_request event: %s", exc)
