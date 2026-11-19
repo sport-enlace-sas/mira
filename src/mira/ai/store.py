@@ -452,18 +452,18 @@ class AIStore:
 
     def review_trace(self, job_id: int) -> dict | None:
         rows = self.rows(
-            "SELECT data FROM ai_runs WHERE job_id=? AND id LIKE 'audit:%' "
+            "SELECT data FROM ai_runs WHERE job_id=? AND id LIKE ? "
             "ORDER BY created_at DESC LIMIT 1",
-            (str(job_id),),
+            (str(job_id), "audit:%"),
         )
         return json.loads(rows[0][0]) if rows else None
 
     def runs(self, job_id: str | None = None, limit: int = 100) -> list[dict]:
-        query = "SELECT data FROM ai_runs WHERE id NOT LIKE 'audit:%' AND id NOT LIKE 'metrics:%'"
-        args: tuple = ()
+        query = "SELECT data FROM ai_runs WHERE id NOT LIKE ? AND id NOT LIKE ?"
+        args: tuple = ("audit:%", "metrics:%")
         if job_id is not None:
             query += " AND job_id=?"
-            args = (job_id,)
+            args += (job_id,)
         return [
             json.loads(r[0])
             for r in self.rows(

@@ -309,13 +309,20 @@ class ReviewTrace:
         async def sender() -> None:
             while not self.stop.is_set():
                 await self.changed.wait()
+                if self.stop.is_set():
+                    return
                 self.changed.clear()
                 try:
                     await asyncio.wait_for(self.stop.wait(), timeout=interval)
                 except TimeoutError:
+                    if self.stop.is_set():
+                        return
                     self.changed.clear()
                     try:
-                        await asyncio.wait_for(publish(self.markdown()), timeout=10)
+                        # The GitHub provider edits comments in a thread. Wait for
+                        # the edit's own transport timeout rather than cancelling
+                        # its coroutine while it can still overwrite the final report.
+                        await publish(self.markdown())
                     except Exception as exc:
                         logger.debug("Unable to update PR progress: %s", type(exc).__name__)
 
@@ -325,4 +332,4 @@ class ReviewTrace:
         self.stop.set()
         self.changed.set()
         if self.progress_task is not None:
-            await self.progress_task
+            await asyncio.shield(self.progress_task)

@@ -406,6 +406,57 @@ async def test_buffered_review_trace_coalesces_and_retries_without_holding_revie
     assert [r["id"] for r in store.runs("42")] == ["first-run"]
 
 
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_review_progress_waits_for_inflight_edit_before_final_report(
+    monkeypatch, cancel_waiter
+):
+    from mira.ai.audit import ReviewTrace
+
+    wait_for = asyncio.wait_for
+
+    async def shorten_progress_timeout(awaitable, timeout):
+        # Exercise the old ten-second deadline without adding ten seconds to CI.
+        return await wait_for(awaitable, 0.01 if timeout == 10 else timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", shorten_progress_timeout)
+    trace = ReviewTrace(SimpleNamespace(submit=lambda snapshot: None), 42, 1, 2)
+    edit_started, release_edit = asyncio.Event(), asyncio.Event()
+    writes = []
+
+    async def edit():
+        edit_started.set()
+        await release_edit.wait()
+        writes.append("progress")
+
+    async def publish(_body):
+        # A provider edit already running in a thread survives cancellation
+        # of the awaiting coroutine.
+        await asyncio.shield(asyncio.create_task(edit()))
+
+    async def finalize():
+        await trace.stop_progress()
+        writes.append("final report")
+
+    trace.bind_progress(publish, interval=0)
+    await wait_for(edit_started.wait(), 2)
+    if cancel_waiter:
+        waiter = asyncio.create_task(trace.stop_progress())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    final = asyncio.create_task(finalize())
+    try:
+        with pytest.raises(TimeoutError):
+            await wait_for(asyncio.shield(final), 0.05)
+        assert writes == []
+    finally:
+        release_edit.set()
+        await wait_for(final, 2)
+        trace.finish("completed")
+    assert writes == ["progress", "final report"]
+
+
 async def test_live_trace_records_failed_and_running_nodes_before_provider_finishes(store):
     cid, _ = connection(store)
     chain(store, cid, ("invalid", "working"))
@@ -1322,6 +1373,22 @@ async def test_postgres_versions_encryption_and_cross_process_locks(tmp_path):
         assert not acquired.is_set()
     await asyncio.wait_for(task, 2)
     assert acquired.is_set()
+
+    job_id = int(fid[:12], 16)
+    recent = {"job_id": str(job_id), "created_at": time.time()}
+    run = {**recent, "id": f"run:{fid}"}
+    trace = {**recent, "id": f"audit:{fid}:latest", "stages": []}
+    store.save_runs(
+        [
+            {**trace, "id": f"audit:{fid}:previous", "created_at": recent["created_at"] - 1},
+            {**recent, "id": f"metrics:{fid}"},
+            run,
+            trace,
+        ]
+    )
+    assert store.review_trace(job_id) == trace
+    assert store.runs(str(job_id)) == [run]
+    assert all(not row["id"].startswith(("audit:", "metrics:")) for row in store.runs())
 
 
 def test_connection_transport_cannot_redirect_opaque_credentials_but_metadata_can_change(store):
