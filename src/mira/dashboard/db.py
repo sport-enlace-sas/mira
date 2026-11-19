@@ -1919,7 +1919,9 @@ class AppDatabase:
             )
         self._pg_commit()
 
-    def list_review_jobs(self, limit: int = 200) -> list[ReviewJobStatus]:
+    def list_review_jobs(
+        self, limit: int = 200, *, prioritize_active: bool = False
+    ) -> list[ReviewJobStatus]:
         """Newest durable jobs for the authenticated operations dashboard."""
         bounded_limit = max(1, min(limit, 500))
         columns = (
@@ -1927,16 +1929,22 @@ class AppDatabase:
             "provider_used,fallback_used,models_attempted,audit_duration_ms,input_tokens,output_tokens,"
             "ocr_status,ocr_version,ocr_duration_ms,ocr_error,next_attempt_at,created_at,updated_at"
         )
+        order = "created_at DESC, id DESC"
+        if prioritize_active:
+            order = (
+                "CASE WHEN status IN ('running','cancelling') THEN 0 "
+                "WHEN status='pending' THEN 1 ELSE 2 END, " + order
+            )
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             rows = self._sqlite_conn.execute(
-                f"SELECT {columns} FROM mira_review_jobs ORDER BY created_at DESC LIMIT ?",
+                f"SELECT {columns} FROM mira_review_jobs ORDER BY {order} LIMIT ?",
                 (bounded_limit,),
             ).fetchall()
         else:
             with self._pg_cursor() as cur:
                 cur.execute(
-                    f"SELECT {columns} FROM mira_review_jobs ORDER BY created_at DESC LIMIT %s",
+                    f"SELECT {columns} FROM mira_review_jobs ORDER BY {order} LIMIT %s",
                     (bounded_limit,),
                 )
                 rows = cur.fetchall()

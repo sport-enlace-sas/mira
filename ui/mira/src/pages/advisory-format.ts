@@ -1,4 +1,17 @@
-export const TOKEN_FORMATTER = new Intl.NumberFormat("es", { useGrouping: "always" })
+export const TOKEN_FORMATTER = new Intl.NumberFormat("es-VE")
+
+export const STAGE_NAME: Record<string, string> = {
+  ingestion: "Ingestión y contexto",
+  indexing: "Indexación",
+  review: "Revisión del PR",
+  security: "Seguridad",
+  dependencies: "Dependencias",
+  walkthrough: "Recorrido del cambio",
+  summary: "Resumen",
+  self_critique: "Autocrítica",
+  fix_verification: "Verificación de correcciones",
+  overlap: "Solapamiento con otros PR",
+}
 
 const DATE_TIME = new Intl.DateTimeFormat("es", { dateStyle: "medium", timeStyle: "short" })
 const RELATIVE_TIME = new Intl.RelativeTimeFormat("es", { numeric: "auto" })

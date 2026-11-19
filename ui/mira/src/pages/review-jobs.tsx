@@ -17,7 +17,7 @@ import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 
-import { formatDateTime, formatDuration, relativeTime, TOKEN_FORMATTER } from "./advisory-format"
+import { formatDateTime, formatDuration, relativeTime, STAGE_NAME, TOKEN_FORMATTER } from "./advisory-format"
 import { AdvisoryJobTrace } from "./advisory-job-trace"
 
 type JobStatus = ReviewJobModel["status"]
@@ -55,19 +55,6 @@ const CANCELLATION_REASON: Record<string, string> = {
   pr_draft: "PR movido a borrador",
   pr_reopen_requested: "Esperando que termine la cancelación del intento anterior",
   "worker restarted": "Trabajo recuperado después de reiniciar el worker",
-}
-
-const STAGE_NAME: Record<string, string> = {
-  ingestion: "Ingestión y contexto",
-  indexing: "Indexación",
-  review: "Revisión del PR",
-  security: "Seguridad",
-  dependencies: "Dependencias",
-  walkthrough: "Recorrido del cambio",
-  summary: "Resumen",
-  self_critique: "Autocrítica",
-  fix_verification: "Verificación de correcciones",
-  overlap: "Solapamiento con otros PR",
 }
 
 const FILTERS: { value: Filter; label: string }[] = [
@@ -115,8 +102,8 @@ function actionAvailability(job: ReviewJobModel, isAdmin: boolean, action: JobAc
   }
   if (action === "resume") {
     if (hasNewer) return "Hay un SHA más reciente para este PR"
-    return job.status === "cancelled" && job.platform === "github" && job.error === "cancelled_by_user"
-      ? null : "Disponible cuando se canceló manualmente un PR de GitHub"
+    if (job.status !== "cancelled" || job.platform !== "github") return "Disponible para revisiones canceladas de GitHub"
+    return ["pr_merged", "pr_closed", "pr_draft"].includes(job.error) ? CANCELLATION_REASON[job.error] : null
   }
   return job.status === "failed" || (job.status === "pending" && job.attempts > 0)
     ? null : "Disponible si falló un intento o hay un reintento en cola"
@@ -243,8 +230,8 @@ function JobCard({
           "overflow-hidden rounded-xl border bg-card shadow-xs",
           open && "border-sky-600/30 dark:border-sky-400/30",
         )}>
-          <div className="grid min-w-0 gap-4 px-4 pb-3 pt-4 @4xl:grid-cols-[minmax(0,1fr)_minmax(15rem,20rem)] @4xl:gap-8 sm:px-5">
-            <div className="min-w-0">
+          <div className="grid min-w-0 @4xl:grid-cols-[minmax(0,1fr)_minmax(15rem,20rem)] @4xl:gap-x-4">
+            <div className="min-w-0 px-4 pb-3 pt-4 sm:px-5 @4xl:col-start-1 @4xl:row-start-1">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <span className="inline-flex min-w-0 items-center gap-1.5 font-semibold text-sky-800 dark:text-sky-300">
                   <GitPullRequest aria-hidden="true" className="size-3.5 shrink-0" />
@@ -279,49 +266,51 @@ function JobCard({
               )}
               {note && <p className="mt-2 text-sm text-muted-foreground [overflow-wrap:anywhere]">{note}</p>}
             </div>
-            <dl className="grid min-w-0 grid-cols-2 gap-x-3 gap-y-2 rounded-lg border bg-muted/35 p-3 @4xl:self-start">
-              <div className="min-w-0">
-                <dt className="text-xs text-muted-foreground">Worker</dt>
-                <dd className="mt-0.5 text-sm font-medium tabular-nums">
-                  {summary?.worker != null ? "Worker " + summary.worker : job.status === "pending" ? "Por asignar" : "Sin registro"}
-                </dd>
+            <div className="grid gap-2 border-t px-4 py-3 sm:px-5 @4xl:col-span-2 @4xl:row-start-2 @4xl:flex @4xl:flex-wrap @4xl:items-center @4xl:justify-between">
+              <JobActions job={job} acting={acting} isAdmin={isAdmin} canDiagnose={canDiagnose} hasNewer={hasNewer} onAction={onAction} />
+              <div className="flex flex-wrap gap-2">
+                {result?.report_url && (
+                  <Button asChild variant="outline" className="h-9 px-3">
+                    <a href={result.report_url} target="_blank" rel="noreferrer">
+                      <FileCheck2 aria-hidden="true" />{result.report_kind === "check" ? "Ver check" : "Ver informe"}
+                    </a>
+                  </Button>
+                )}
+                <Button asChild variant="outline" className="h-9 px-3">
+                  <a href={job.pr_url} target="_blank" rel="noreferrer">Abrir PR<ExternalLink aria-hidden="true" /></a>
+                </Button>
               </div>
-              <div className="min-w-0">
-                <dt className="text-xs text-muted-foreground">Duración de auditoría</dt>
-                <dd className="mt-0.5 text-sm font-medium tabular-nums">
-                  {elapsed == null ? "—" : formatDuration(elapsed)}
-                </dd>
-              </div>
-              {modelNames.length > 0 && (
-                <div className="col-span-2 min-w-0 border-t pt-2">
-                  <dt className="text-xs text-muted-foreground">Modelos registrados</dt>
-                  <dd className="mt-0.5 font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">{modelNames.join(" · ")}</dd>
-                </div>
-              )}
-              {hasTokens && (
-                <div className="col-span-2 min-w-0 text-xs">
-                  <dt className="sr-only">Tokens registrados</dt>
-                  <dd className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-muted-foreground">
-                    <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.input_tokens)} entrada</span>
-                    <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.output_tokens)} salida</span>
+            </div>
+            <div className="min-w-0 px-4 pb-4 sm:px-5 @4xl:col-start-2 @4xl:row-start-1 @4xl:pl-0 @4xl:pt-4">
+              <dl className="grid min-w-0 grid-cols-2 gap-x-3 gap-y-2 rounded-lg border bg-muted/35 p-3">
+                <div className="min-w-0">
+                  <dt className="text-xs text-muted-foreground">Worker</dt>
+                  <dd className="mt-0.5 text-sm font-medium tabular-nums">
+                    {job.status === "pending" ? "Por asignar" : summary?.worker != null ? "Worker " + summary.worker : "Sin registro"}
                   </dd>
                 </div>
-              )}
-            </dl>
-          </div>
-          <div className="grid gap-2 border-t px-4 py-3 sm:px-5 @4xl:flex @4xl:flex-wrap @4xl:items-center @4xl:justify-between">
-            <JobActions job={job} acting={acting} isAdmin={isAdmin} canDiagnose={canDiagnose} hasNewer={hasNewer} onAction={onAction} />
-            <div className="flex flex-wrap gap-2">
-              {result?.report_url && (
-                <Button asChild variant="outline" className="h-9 px-3">
-                  <a href={result.report_url} target="_blank" rel="noreferrer">
-                    <FileCheck2 aria-hidden="true" />{result.report_kind === "check" ? "Ver check" : "Ver informe"}
-                  </a>
-                </Button>
-              )}
-              <Button asChild variant="outline" className="h-9 px-3">
-                <a href={job.pr_url} target="_blank" rel="noreferrer">Abrir PR<ExternalLink aria-hidden="true" /></a>
-              </Button>
+                <div className="min-w-0">
+                  <dt className="text-xs text-muted-foreground">{started != null ? "Intento en curso" : "Duración acumulada"}</dt>
+                  <dd className="mt-0.5 text-sm font-medium tabular-nums">
+                    {elapsed == null ? "—" : formatDuration(elapsed)}
+                  </dd>
+                </div>
+                {modelNames.length > 0 && (
+                  <div className="col-span-2 min-w-0 border-t pt-2">
+                    <dt className="text-xs text-muted-foreground">{job.status === "pending" ? "Modelos del último intento" : "Modelos registrados"}</dt>
+                    <dd className="mt-0.5 font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">{modelNames.join(" · ")}</dd>
+                  </div>
+                )}
+                {hasTokens && (
+                  <div className="col-span-2 min-w-0 text-xs">
+                    <dt className="mb-0.5 text-muted-foreground">Tokens acumulados</dt>
+                    <dd className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-muted-foreground">
+                      <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.input_tokens)} entrada</span>
+                      <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.output_tokens)} salida</span>
+                    </dd>
+                  </div>
+                )}
+              </dl>
             </div>
           </div>
           <CollapsibleContent className="space-y-5 border-t bg-muted/20 px-4 py-5 sm:px-5">
@@ -331,7 +320,7 @@ function JobCard({
                 <p className="mt-1 text-sm">{CONCLUSION[result.conclusion] ?? "Consultar resultado en el PR"}</p>
                 <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   {result.files_reviewed != null && result.files_total != null && (
-                    <span>{result.files_reviewed} de {result.files_total} archivos en el alcance</span>
+                    <span>{result.files_reviewed} de {result.files_total} archivos revisados en este alcance</span>
                   )}
                   {result.findings_count != null && (
                     <span>{result.findings_count} {result.findings_count === 1 ? "hallazgo" : "hallazgos"}</span>
@@ -370,8 +359,13 @@ export function ReviewJobsPage() {
   const [query, setQuery] = useState("")
   const [filter, setFilter] = useState<Filter>("all")
   const [page, setPage] = useState(0)
+  const searchInput = useRef<HTMLInputElement>(null)
   const resultsHeader = useRef<HTMLDivElement>(null)
-  const { data, loading, error } = useAsync(() => api.listReviewJobs(JOB_LIMIT), [refresh])
+  const pendingRequest = useRef<Promise<ReviewJobModel[]> | null>(null)
+  const { data, loading, error } = useAsync(() => {
+    pendingRequest.current ??= api.listReviewJobs(JOB_LIMIT).finally(() => { pendingRequest.current = null })
+    return pendingRequest.current
+  }, [refresh])
   const jobs = data ?? []
   const newestJobByPr = new Map<string, number>()
   const prKey = (job: ReviewJobModel) => [job.platform, job.owner, job.repo, job.pr_number].join("/")
@@ -446,6 +440,10 @@ export function ReviewJobsPage() {
     setQuery(value)
     setPage(0)
   }
+  const clearQuery = () => {
+    changeQuery("")
+    searchInput.current?.focus()
+  }
   const changePage = (value: number) => {
     setPage(value)
     window.requestAnimationFrame(() => resultsHeader.current?.focus())
@@ -455,13 +453,13 @@ export function ReviewJobsPage() {
     <div className="@container mx-auto min-w-0 max-w-7xl space-y-5 px-3 pb-8 pt-3 sm:px-6 sm:pt-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
-          <span className="grid size-11 shrink-0 place-items-center rounded-xl border border-sky-600/25 bg-sky-600/10 text-sky-800 dark:text-sky-300">
+          <span className="grid size-9 shrink-0 place-items-center sm:size-11 rounded-xl border border-sky-600/25 bg-sky-600/10 text-sky-800 dark:text-sky-300">
             <ListChecks aria-hidden="true" className="size-5" />
           </span>
-          <h1 className="text-balance text-2xl font-semibold tracking-tight sm:text-3xl">Revisiones de PR</h1>
+          <h1 className="text-balance text-xl font-semibold tracking-tight sm:text-3xl">Revisiones de PR</h1>
         </div>
-        <Button type="button" variant="outline" className="h-9 px-3" onClick={refreshJobs} aria-busy={loading}>
-          <RefreshCw aria-hidden="true" className={loading ? "motion-safe:animate-spin" : undefined} />Actualizar
+        <Button type="button" variant="outline" className="h-9 px-2.5 @sm:px-3" onClick={refreshJobs} aria-busy={loading} aria-label="Actualizar">
+          <RefreshCw aria-hidden="true" className={loading ? "motion-safe:animate-spin" : undefined} /><span className="hidden @sm:inline">Actualizar</span>
         </Button>
       </header>
 
@@ -479,13 +477,13 @@ export function ReviewJobsPage() {
         <div className="grid gap-2 @xl:grid-cols-[minmax(0,1fr)_minmax(10rem,13rem)]">
           <div className="relative min-w-0">
             <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input type="search" aria-label="Buscar revisiones" autoComplete="off" spellCheck={false} name="review-search"
+            <Input ref={searchInput} type="search" aria-label="Buscar revisiones" autoComplete="off" spellCheck={false} name="review-search"
               className="h-10 rounded-lg pl-9 pr-10 text-sm [&::-webkit-search-cancel-button]:appearance-none"
-              placeholder="Busca por PR, repositorio, SHA, worker o modelo…" value={query}
+              placeholder="PR, SHA, worker o modelo…" value={query}
               onChange={(event) => changeQuery(event.target.value)} />
             {query && (
               <Button type="button" variant="ghost" size="icon" className="absolute right-1.5 top-1/2 -translate-y-1/2"
-                aria-label="Limpiar búsqueda" onClick={() => changeQuery("")}><X aria-hidden="true" /></Button>
+                aria-label="Limpiar búsqueda" onClick={clearQuery}><X aria-hidden="true" /></Button>
             )}
           </div>
           <select aria-label="Filtrar por estado" value={filter} onChange={(event) => changeFilter(event.target.value as Filter)}
@@ -507,7 +505,7 @@ export function ReviewJobsPage() {
 
       {data && (
         <div ref={resultsHeader} tabIndex={-1} className="flex scroll-mt-4 flex-wrap items-center justify-between gap-2 rounded-sm text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
-          <p>{filtered.length} {filtered.length === 1 ? "revisión" : "revisiones"}{jobs.length === JOB_LIMIT && " en los últimos " + JOB_LIMIT + " registros"}</p>
+          <p>{filtered.length} {filtered.length === 1 ? "revisión" : "revisiones"}{jobs.length === JOB_LIMIT && " de " + JOB_LIMIT + " registros cargados"}</p>
           {pageCount > 1 && <p>Página {currentPage + 1} de {pageCount}</p>}
         </div>
       )}
@@ -518,7 +516,7 @@ export function ReviewJobsPage() {
           {jobs.length > 0 && (
             <div className="mt-3">
               <Button type="button" variant="outline" className="h-9 px-3"
-                onClick={() => { changeQuery(""); changeFilter("all") }}>Limpiar filtros</Button>
+                onClick={() => { clearQuery(); changeFilter("all") }}>Limpiar filtros</Button>
             </div>
           )}
         </div>

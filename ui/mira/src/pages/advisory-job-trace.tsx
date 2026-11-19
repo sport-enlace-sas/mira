@@ -5,20 +5,7 @@ import { api, type ReviewAuditStage, type ReviewAuditTrace, type ReviewJobModel 
 import { useAsync } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 
-import { formatDateTime, formatDuration, relativeTime, TOKEN_FORMATTER } from "./advisory-format"
-
-const STAGE_LABEL: Record<string, string> = {
-  ingestion: "Ingestión y contexto",
-  indexing: "Indexación",
-  review: "Revisión del PR",
-  security: "Seguridad",
-  dependencies: "Dependencias",
-  walkthrough: "Walkthrough",
-  summary: "Resumen",
-  self_critique: "Autocrítica",
-  fix_verification: "Verificación de correcciones",
-  overlap: "Solapamiento con otros PR",
-}
+import { formatDateTime, formatDuration, relativeTime, STAGE_NAME, TOKEN_FORMATTER } from "./advisory-format"
 
 const STAGE_STATUS: Record<ReviewAuditStage["status"], string> = {
   pending: "Pendiente",
@@ -26,7 +13,7 @@ const STAGE_STATUS: Record<ReviewAuditStage["status"], string> = {
   completed: "Completada",
   failed: "Falló",
   cancelled: "Cancelada",
-  skipped: "Sin ejecutar",
+  skipped: "Sin actividad registrada",
 }
 
 const PHASE_LABEL: Record<string, string> = {
@@ -92,7 +79,7 @@ function ModelMeasurements({ model, activity }: { model: ReviewAuditStage["model
     },
     {
       label: "Tiempo de inferencia",
-      value: inference != null && (inference > 0 || measured) ? formatDuration(inference) : null,
+      value: inference != null && (inference > 0 || model.usage_reported) ? formatDuration(inference) : null,
     },
     {
       label: "Tokens de entrada",
@@ -132,7 +119,7 @@ function ModelMeasurements({ model, activity }: { model: ReviewAuditStage["model
 }
 
 function AuditStage({ stage, activity, now }: { stage: ReviewAuditStage; activity: TraceActivity; now: number }) {
-  const title = STAGE_LABEL[stage.id] ?? stage.label
+  const title = STAGE_NAME[stage.id] ?? stage.label
   const startedAt = stage.started_at
   const running = stage.status === "running"
   const active = running && activity === "running"
@@ -252,9 +239,9 @@ export function AdvisoryJobTrace({ job, refresh, now }: { job: ReviewJobModel; r
     : "closed"
   const missingClosure = openTrace && activity === "closed"
   const started = trace.stages
-    .filter((stage) => stage.started_at != null)
-    .sort((left, right) => (left.started_at ?? 0) - (right.started_at ?? 0))
-  const withoutStart = trace.stages.filter((stage) => stage.started_at == null)
+    .filter((stage) => stage.started_at != null || stage.models.length || stage.issues?.length)
+    .sort((left, right) => (left.started_at ?? Infinity) - (right.started_at ?? Infinity))
+  const withoutStart = trace.stages.filter((stage) => !started.includes(stage))
   const activeCount = activity === "running" ? started.filter((stage) => stage.status === "running").length : 0
   const hasPartialUsage = trace.stages.some((stage) => stage.models.some((model) => model.usage_reported && model.calls_with_usage < model.calls))
   const hasTokens = trace.stages.some((stage) => stage.models.some((model) => model.usage_reported))
@@ -299,7 +286,7 @@ export function AdvisoryJobTrace({ job, refresh, now }: { job: ReviewJobModel; r
           <ul className="mt-1.5 flex min-w-0 flex-wrap gap-1.5">
             {withoutStart.map((stage) => (
               <li key={stage.id} className={cn(STAGE_CHIP, STAGE_TONE.quiet, "max-w-full wrap-anywhere rounded-md")}>
-                {STAGE_LABEL[stage.id] ?? stage.label} · {STAGE_STATUS[stage.status]}
+                {STAGE_NAME[stage.id] ?? stage.label} · {STAGE_STATUS[stage.status]}
               </li>
             ))}
           </ul>

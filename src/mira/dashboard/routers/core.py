@@ -202,11 +202,11 @@ def list_activity(limit: int = 200, repo: str = "", q: str = "") -> ActivityResp
 
 
 @router.get("/api/review-jobs", response_model=list[ReviewJobModel])
-def list_review_jobs(limit: int = 200) -> list[ReviewJobModel]:
+def list_review_jobs(limit: int = 200, prioritize_active: bool = False) -> list[ReviewJobModel]:
     """Durable advisory queue, including SHA state and provider provenance."""
     from mira.ai.api import get_store
 
-    jobs = _api._app_db.list_review_jobs(limit)
+    jobs = _api._app_db.list_review_jobs(limit, prioritize_active=prioritize_active)
     traces = get_store(_api._app_db).review_traces([job.id for job in jobs if job.attempts])
     return [
         ReviewJobModel(**job.__dict__, audit_summary=_audit_summary(job, traces.get(job.id)))

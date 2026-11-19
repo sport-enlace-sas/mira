@@ -382,6 +382,8 @@ def test_dashboard_job_list_batches_latest_trace_summaries(tmp_path, monkeypatch
     historical_summary = jobs[legacy.id].audit_summary
     assert historical_summary is not None and historical_summary.has_stage_failures
     assert historical_summary.result is None
+    assert list_review_jobs(limit=1)[0].id == legacy.id
+    assert list_review_jobs(limit=1, prioritize_active=True)[0].id == active.id
 
     now += 20
     store.save_run(
