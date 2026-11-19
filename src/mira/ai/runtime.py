@@ -8,6 +8,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from jsonschema import validate
@@ -125,13 +126,19 @@ def classify(error: Exception) -> tuple[str, str]:
     return "provider", "Revisar el proveedor y la configuración"
 
 
+@dataclass
+class _WorkerSession:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    owner: int | None = None
+    attempts: int = 0
+
+
 class AIRuntime:
     def __init__(self, store: AIStore) -> None:
         self.store = store
         self.broker = CredentialBroker(store)
         self.audit_writer = AuditWriter(store)
-        self._worker_sessions: dict[str, tuple[int, int]] = {}
-        self._worker_capacity_changed = asyncio.Condition()
+        self._worker_sessions: dict[str, _WorkerSession] = {}
 
     def managed(self) -> bool:
         latched = (self.store.root / "managed").exists()
@@ -174,8 +181,12 @@ class AIRuntime:
         )
 
     def worker_connection_busy(self, connection_id: str, worker: int) -> bool:
-        owner = self._worker_sessions.get(connection_id)
-        return owner is not None and owner[0] != worker
+        session = self._worker_sessions.get(connection_id)
+        return session is not None and session.owner != worker
+
+    def worker_connection_free(self, connection_id: str) -> bool:
+        # Include any queued attempts during handoff, before the next owner wakes.
+        return connection_id not in self._worker_sessions
 
     @asynccontextmanager
     async def worker_connection(
@@ -184,22 +195,23 @@ class AIRuntime:
         if worker is None:
             yield
             return
-        async with self._worker_capacity_changed:
-            await self._worker_capacity_changed.wait_for(
-                lambda: not self.worker_connection_busy(connection_id, worker)
-            )
-            _, count = self._worker_sessions.get(connection_id, (worker, 0))
-            self._worker_sessions[connection_id] = (worker, count + 1)
+        session = self._worker_sessions.get(connection_id)
+        if session is None:
+            session = self._worker_sessions[connection_id] = _WorkerSession()
+        session.attempts += 1
         try:
-            yield
+            # Lock.acquire wakes waiters in arrival order, even when the same
+            # worker that owns the connection has other attempts to run.
+            async with session.lock:
+                session.owner = worker
+                try:
+                    yield
+                finally:
+                    session.owner = None
         finally:
-            async with self._worker_capacity_changed:
-                _, count = self._worker_sessions[connection_id]
-                if count == 1:
-                    del self._worker_sessions[connection_id]
-                    self._worker_capacity_changed.notify_all()
-                else:
-                    self._worker_sessions[connection_id] = (worker, count - 1)
+            session.attempts -= 1
+            if not session.attempts:
+                del self._worker_sessions[connection_id]
 
     def activate(self, actor: int) -> None:
         snapshot = self.snapshot()
@@ -588,7 +600,7 @@ class FlowProvider:
                         and position < len(nodes)
                         and self.runtime.worker_connection_busy(node.connection_id, worker)
                         and any(
-                            not self.runtime.worker_connection_busy(other.connection_id, worker)
+                            self.runtime.worker_connection_free(other.connection_id)
                             and self.runtime._node_available(
                                 self.runtime.store.connection(other.connection_id), other.model
                             )
