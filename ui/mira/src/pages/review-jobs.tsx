@@ -82,7 +82,8 @@ const ISSUE_LABEL: Record<string, string> = {
   provider: "Error del proveedor",
   quota: "Cuota no disponible",
   reasoning_incompatible: "Nivel de razonamiento incompatible",
-  timeout: "Tiempo de espera agotado",
+  session_timeout: "Tiempo agotado esperando conexión",
+  timeout: "Tiempo de respuesta del modelo agotado",
   tools_incompatible: "Herramientas incompatibles",
   vault: "Almacén de credenciales no disponible",
 }
@@ -167,12 +168,18 @@ function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number;
                       <li key={`${model.provider}/${model.model}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5 text-xs">
                         <span className="min-w-0 break-all font-mono">{model.model} <span className="text-muted-foreground">· {model.provider}</span></span>
                         <span className="tabular-nums text-muted-foreground">
-                          {model.calls} {model.calls === 1 ? "llamada" : "llamadas"} · {formatDuration(model.duration_ms)}
+                          {model.calls} {model.calls === 1 ? "intento" : "intentos"} · {formatDuration(model.duration_ms)}
                           {" · "}
                           {model.usage_reported
                             ? `${model.calls_with_usage < model.calls ? "≥ " : ""}${TOKEN_FORMATTER.format(model.input_tokens)} entrada / ${TOKEN_FORMATTER.format(model.output_tokens)} salida`
                             : "tokens sin reporte"}
                         </span>
+                        {model.session_wait_ms != null && (
+                          <span className="w-full tabular-nums text-muted-foreground">
+                            Espera de conexión · {formatDuration(model.session_wait_ms)}
+                            {model.inference_ms != null && ` · Tiempo del modelo · ${formatDuration(model.inference_ms)}`}
+                          </span>
+                        )}
                       </li>
                     ))}
                   </ul>

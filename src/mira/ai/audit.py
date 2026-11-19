@@ -41,7 +41,8 @@ ISSUE_LABELS = {
     "provider": "Provider error",
     "quota": "Quota unavailable",
     "reasoning_incompatible": "Reasoning level unsupported",
-    "timeout": "Timed out",
+    "session_timeout": "Connection wait timed out",
+    "timeout": "Model response timed out",
     "tools_incompatible": "Tool use unsupported",
     "vault": "Credential storage unavailable",
 }
@@ -262,6 +263,9 @@ class ReviewTrace:
                     item["output_tokens"] += usage.get("completion_tokens", 0)
                     item["usage_reported"] |= bool(usage)
                     item["calls_with_usage"] += int(bool(usage))
+                    for timing in ("session_wait_ms", "inference_ms"):
+                        if timing in step:
+                            item[timing] = item.get(timing, 0) + step[timing]
             phases = {
                 step["phase"]
                 for run in runs
@@ -325,6 +329,10 @@ class ReviewTrace:
             model_text = ", ".join(f"`{model['model']}`" for model in models) or "—"
             duration = stage["duration_ms"]
             elapsed = f"{duration / 1000:.1f}s" if duration is not None else "—"
+            if any("session_wait_ms" in model for model in models):
+                wait = sum(model.get("session_wait_ms", 0) for model in models) / 1000
+                inference = sum(model.get("inference_ms", 0) for model in models) / 1000
+                elapsed += f" · wait {wait:.1f}s / model {inference:.1f}s"
             reported = [model for model in models if model["usage_reported"]]
             usage = (
                 f"{sum(model['input_tokens'] for model in reported):,} / "

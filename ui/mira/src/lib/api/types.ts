@@ -483,6 +483,8 @@ export interface ReviewAuditStage {
     model: string
     calls: number
     duration_ms: number
+    session_wait_ms?: number
+    inference_ms?: number
     input_tokens: number
     output_tokens: number
     usage_reported: boolean

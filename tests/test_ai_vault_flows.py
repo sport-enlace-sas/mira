@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from mira.ai.api import create_ai_router
 from mira.ai.credentials import ManagedClaude, ManagedCodex
 from mira.ai.models import SCENARIOS, ConnectionInput, FlowInput
-from mira.ai.runtime import AIRuntime, quota_key
+from mira.ai.runtime import AIRuntime, FlowExhaustedError, quota_key
 from mira.ai.store import AIStore, ConflictError, Vault
 from mira.config import LLMConfig
 from mira.dashboard.db import AppDatabase
@@ -52,11 +52,18 @@ def connection(store, provider="claude-cli", secret="test-secret-never-returned"
     return cid, credential
 
 
-def chain(store, cid, models=("fable", "opus", "sol", "last"), retries=0):
+def chain(store, cid, models=("fable", "opus", "sol", "last"), retries=0, *, timeout=120):
     flow = FlowInput(
         name="Review",
         nodes=[
-            {"id": str(i), "name": model, "connection_id": cid, "model": model, "retries": retries}
+            {
+                "id": str(i),
+                "name": model,
+                "connection_id": cid,
+                "model": model,
+                "retries": retries,
+                "timeout": timeout,
+            }
             for i, model in enumerate(models)
         ],
         edges=[{"source": str(i), "target": str(i + 1)} for i in range(len(models) - 1)],
@@ -246,27 +253,54 @@ def test_stale_credential_updates_and_old_rotations_are_rejected(store):
     assert store.rows("SELECT COUNT(*) FROM ai_flow_versions WHERE flow_id=?", (fid,))[0][0] == 2
 
 
-async def test_cancellation_stops_chain_and_releases_session_lock(store):
+@pytest.mark.parametrize("phase", ["waiting_for_session", "requesting"])
+async def test_cancellation_stops_chain_and_releases_session_lock(store, phase):
     cid, credential = connection(store)
     chain(store, cid, ("first", "second"))
     runtime = AIRuntime(store)
+    review = runtime.provider(LLMConfig())
+    review.shared["worker"] = 1
     started = asyncio.Event()
     seen = []
 
-    async def invoke(config):
-        seen.append(config.model)
-        started.set()
-        await asyncio.Event().wait()
+    @asynccontextmanager
+    async def broker(connection, config, credential_id):
+        if phase == "waiting_for_session":
+            started.set()
+        async with store.session_lock(credential_id):
 
-    mock_broker(runtime, invoke)
-    task = asyncio.create_task(runtime.provider(LLMConfig()).complete([]))
-    await started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert seen == ["first"]
-    assert store.runs()[0]["status"] == "cancelled"
-    assert store.runs()[0]["steps"][0]["result"] == "cancelled"
+            async def infer(*args, **kwargs):
+                seen.append(config.model)
+                started.set()
+                await asyncio.Event().wait()
+
+            yield FakeProvider(infer)
+
+    async def cancel_review():
+        task = asyncio.create_task(review.complete([]))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert runtime.worker_connection_busy(cid, 2)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    runtime.broker.provider = broker
+    if phase == "waiting_for_session":
+        async with store.session_lock(credential):
+            await cancel_review()
+        assert seen == []
+    else:
+        await cancel_review()
+        assert seen == ["first"]
+
+    run = store.runs()[0]
+    assert run["status"] == "cancelled"
+    step = run["steps"][0]
+    assert (step["result"], step["cause"]) == ("cancelled", "cancelled")
+    assert "session_wait_ms" in step and "inference_ms" in step
+    assert not runtime.worker_connection_busy(cid, 2)
     async with asyncio.timeout(1), store.session_lock(credential):
         pass
 
@@ -557,7 +591,8 @@ async def test_session_wait_obeys_node_timeout_and_continues_to_next_provider(st
     assert released.is_set()
     assert invoked == ["working"]
     run = store.runs()[0]
-    assert run["steps"][0]["cause"] == "timeout"
+    assert run["steps"][0]["cause"] == "session_timeout"
+    assert run["steps"][0]["inference_ms"] == 0
     assert run["steps"][1]["result"] == "success"
     assert store.credential_metadata(credential)["status"] == "ready"
 
@@ -1049,6 +1084,85 @@ async def test_managed_transport_error_diagnostics_do_not_log_credentials(
     assert isinstance(error.value.__cause__, httpx.ConnectError)
     assert "ConnectError" in caplog.text
     assert secret not in caplog.text
+
+
+async def test_session_wait_does_not_consume_inference_timeout(store):
+    cid, _ = connection(store)
+    chain(store, cid, ("model",), timeout=1)
+    runtime = AIRuntime(store)
+    reservation = runtime.worker_connection
+    review = runtime.provider(LLMConfig())
+    review.shared["worker"] = 1
+
+    @asynccontextmanager
+    async def delayed_reservation(connection_id, worker):
+        await asyncio.sleep(0.3)
+        async with reservation(connection_id, worker):
+            yield
+
+    async def infer(*args, **kwargs):
+        assert runtime.worker_connection_busy(cid, 2)
+        await asyncio.sleep(0.55)
+        return '{"ok":true}'
+
+    @asynccontextmanager
+    async def broker(connection, config, credential_id=None):
+        await asyncio.sleep(0.3)
+        yield FakeProvider(infer)
+
+    runtime.worker_connection = delayed_reservation
+    runtime.broker.provider = broker
+    assert await review.complete([]) == '{"ok":true}'
+    step = store.runs()[0]["steps"][0]
+    assert step["session_wait_ms"] >= 600
+    assert step["inference_ms"] >= 550
+    assert step["duration_ms"] >= 1150
+    assert not runtime.worker_connection_busy(cid, 2)
+
+
+@pytest.mark.parametrize(
+    ("phase", "cause", "expected_inferences"),
+    [("session", "session_timeout", 1), ("inference", "timeout", 2)],
+)
+async def test_credential_renewal_spends_the_remaining_budget(
+    store, phase, cause, expected_inferences
+):
+    cid, credential = connection(store)
+    data, revision = Vault(store).read(credential)
+    Vault(store).update(credential, revision, data, {"renewable": True})
+    chain(store, cid, ("model",), timeout=1)
+    runtime = AIRuntime(store)
+    review = runtime.provider(LLMConfig())
+    review.shared["worker"] = 1
+    session_attempts = 0
+    inference_attempts = 0
+
+    async def infer(*args, **kwargs):
+        nonlocal inference_attempts
+        inference_attempts += 1
+        await asyncio.sleep(0.55 if phase == "inference" else 0.02)
+        if inference_attempts == 1:
+            raise NonRetriableLLMError("claude_auth_failed")
+        return '{"ok":true}'
+
+    @asynccontextmanager
+    async def broker(connection, config, credential_id=None):
+        nonlocal session_attempts
+        session_attempts += 1
+        assert runtime.worker_connection_busy(cid, 2)
+        await asyncio.sleep(0.55 if phase == "session" else 0.02)
+        yield FakeProvider(infer)
+
+    runtime.broker.provider = broker
+    with pytest.raises(FlowExhaustedError):
+        await review.complete([])
+    step = store.runs()[0]["steps"][0]
+    assert step["cause"] == cause
+    assert step["refresh_attempted"] is True
+    assert session_attempts == 2
+    assert inference_attempts == expected_inferences
+    assert step["session_wait_ms" if phase == "session" else "inference_ms"] >= 1000
+    assert not runtime.worker_connection_busy(cid, 2)
 
 
 async def test_renewable_auth_is_refreshed_once_then_chain_continues(store):
