@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from mira.models import PRInfo
+from mira.subprocesses import terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +227,12 @@ class OpenCodeReviewDelegation:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=os.name == "posix",
         )
         try:
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=self.timeout_seconds)
-        except TimeoutError:
-            process.kill()
-            await process.communicate()
+        except (TimeoutError, asyncio.CancelledError):
+            await terminate_process_tree(process)
             raise
         if process.returncode != 0:
             raise RuntimeError("ocr_failed")

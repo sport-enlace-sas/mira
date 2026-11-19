@@ -27,7 +27,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 COPY . /app
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bubblewrap tini \
  && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "/app[serve,bedrock]"
 
@@ -48,6 +48,6 @@ COPY --from=ocr-builder /out/ocr /usr/local/bin/ocr
 RUN ocr --version
 
 EXPOSE 8000
-# ENTRYPOINT (not CMD) so `docker run … image --config /app/mira.yaml`
-# appends the args to `mira serve` instead of replacing the command.
-ENTRYPOINT ["mira", "serve"]
+# Run an init as PID 1 to reap orphaned Git and CLI subprocesses. Keeping
+# `mira serve` in ENTRYPOINT lets Docker append runtime arguments to serve.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "mira", "serve"]
