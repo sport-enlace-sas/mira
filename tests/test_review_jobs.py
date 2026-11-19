@@ -23,6 +23,7 @@ def test_new_sha_supersedes_pending_review_and_duplicate_is_idempotent(tmp_path)
     assert db.enqueue_review_job(head_sha="a" * 40, **args)
     assert not db.enqueue_review_job(head_sha="a" * 40, **args)
     assert db.enqueue_review_job(head_sha="b" * 40, **args)
+    assert not db.enqueue_review_job(head_sha="a" * 40, **args)
 
     job = db.claim_next_review_job()
     assert job is not None

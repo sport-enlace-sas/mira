@@ -73,6 +73,20 @@ credential health. Real diagnostics consume provider usage. They are cancellable
 and persist their steps. Advisory jobs link the same production trace by job ID.
 The deterministic OCR, OSV and secrets-scanning paths are unaffected.
 
+## Durable GitHub review queue
+
+The Inlaze deployment holds automatic reviews while a PR is a draft. When it is
+ready, it becomes eligible immediately. After a push to an open PR, the latest
+SHA becomes eligible after 90 seconds without a newer push. Replayed deliveries
+do not reset the timer. Explicit review commands remain available.
+
+The deployment setting `review.queue_workers` enables two consumers of the same
+managed review flows. The second waits while the assigned review flow has fewer
+than two available active connections. When the first connection is busy with a
+different review, a worker can continue through later nodes of that same flow.
+If the alternatives fail, it may wait for the busy node within its usual timeout.
+Use connections with independent quota to gain actual parallel inference.
+
 ## Phased migration
 
 1. Deploy the module; the existing provider configuration remains active.

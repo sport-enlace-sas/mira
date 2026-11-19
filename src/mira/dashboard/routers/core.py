@@ -203,6 +203,13 @@ def list_review_jobs(limit: int = 200) -> list[ReviewJobModel]:
     return [ReviewJobModel(**job.__dict__) for job in _api._app_db.list_review_jobs(limit)]
 
 
+@router.get("/api/review-jobs/{job_id}/trace")
+def review_job_trace(job_id: int) -> dict | None:
+    from mira.ai.api import get_store
+
+    return get_store(_api._app_db).review_trace(job_id)
+
+
 @router.post("/api/review-jobs/{job_id}/retry", response_model=ReviewJobModel)
 def retry_review_job(job_id: int, request: Request) -> ReviewJobModel:
     """Let an admin promptly retry a current job after a transient outage."""

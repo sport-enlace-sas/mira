@@ -622,6 +622,7 @@ def build_compact_audit_report(
     security_failed: bool = False,
     failure_notice: str = "",
     unverified_findings: list[ReviewComment] | None = None,
+    audit_progress: str = "",
 ) -> str:
     """Render one high-signal, immutable audit comment for a reviewed SHA."""
     parts = [
@@ -741,6 +742,19 @@ def build_compact_audit_report(
     if impact.visual_routes:
         parts.append(
             "> Routes are inferred statically and remain **runtime-unverified** until visual QA."
+        )
+
+    if audit_progress:
+        parts.extend(
+            [
+                "",
+                "<details>",
+                "<summary>Audit stage timings</summary>",
+                "",
+                audit_progress,
+                "",
+                "</details>",
+            ]
         )
 
     technical_evidence = impact.technical_evidence_lines()

@@ -1493,74 +1493,74 @@ class AppDatabase:
         installation_id: int,
         is_private: bool,
         platform: str = "github",
+        defer_seconds: int = 0,
+        allow_reopen: bool = False,
+        authoritative: bool = False,
     ) -> bool:
-        """Queue one SHA and supersede older work for the same PR.
-
-        The uniqueness constraint makes a repeated GitHub delivery a no-op.
-        A new SHA never overwrites completed history; it only invalidates work
-        that has not yet produced a result.
-        """
+        """Queue a SHA once and supersede prior work in the same transaction."""
         now = time.time()
-        if self._backend == "sqlite":
-            assert self._sqlite_conn is not None
-            self._sqlite_conn.execute(
+        key = (platform, owner, repo, pr_number)
+        sqlite = self._backend == "sqlite"
+
+        def persist(cur: Any) -> bool:
+            def execute(sql: str, args: tuple) -> None:
+                cur.execute(sql if sqlite else sql.replace("?", "%s"), args)
+
+            execute(
+                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
+                "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?,?) "
+                "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO UPDATE SET "
+                "status='pending', attempts=0, error='', next_attempt_at=excluded.next_attempt_at, "
+                "updated_at=excluded.updated_at WHERE "
+                "(? AND mira_review_jobs.status='cancelled' "
+                "AND mira_review_jobs.error IN ('pr_draft','pr_closed')) "
+                "OR (? AND mira_review_jobs.status='superseded')",
+                (
+                    *key,
+                    head_sha,
+                    pr_url,
+                    pr_title,
+                    installation_id,
+                    int(is_private) if sqlite else is_private,
+                    now + defer_seconds,
+                    now,
+                    now,
+                    allow_reopen,
+                    authoritative,
+                ),
+            )
+            if not cur.rowcount:
+                return False  # A duplicate or old delivery must not supersede the current SHA.
+            execute(
                 "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
-                "WHERE platform=? AND owner=? AND repo=? AND pr_number=? "
-                "AND head_sha<>? AND status IN ('pending','running','failed','cancelled')",
-                (now, platform, owner, repo, pr_number, head_sha),
+                "WHERE platform=? AND owner=? AND repo=? AND pr_number=? AND head_sha<>? "
+                "AND status IN ('pending','running','failed','cancelled')",
+                (now, *key, head_sha),
             )
-            cur = self._sqlite_conn.execute(
-                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
-                "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?) "
-                "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING",
-                (
-                    platform,
-                    owner,
-                    repo,
-                    pr_number,
-                    head_sha,
-                    pr_url,
-                    pr_title,
-                    installation_id,
-                    int(is_private),
-                    now,
-                    now,
-                    now,
-                ),
-            )
-            self._sqlite_conn.commit()
-            return cur.rowcount > 0
-        with self._pg_cursor() as cur:
+            return True
+
+        if sqlite:
+            assert self._sqlite_conn is not None
+            with self._sqlite_conn:
+                return persist(self._sqlite_conn.cursor())
+        from mira.db.postgres import connect
+
+        # Use a dedicated transaction. Other handlers share the normal
+        # autocommit connection and must not enter this PR's write transaction.
+        with connect(self._url) as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "UPDATE mira_review_jobs SET status='superseded', updated_at=%s "
-                "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s "
-                "AND head_sha<>%s AND status IN ('pending','running','failed','cancelled')",
-                (now, platform, owner, repo, pr_number, head_sha),
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"mira-review-job:{platform}:{owner}:{repo}:{pr_number}",),
             )
-            cur.execute(
-                "INSERT INTO mira_review_jobs (platform, owner, repo, pr_number, head_sha, pr_url, "
-                "pr_title, installation_id, is_private, status, next_attempt_at, created_at, updated_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s) "
-                "ON CONFLICT(platform, owner, repo, pr_number, head_sha) DO NOTHING RETURNING id",
-                (
-                    platform,
-                    owner,
-                    repo,
-                    pr_number,
-                    head_sha,
-                    pr_url,
-                    pr_title,
-                    installation_id,
-                    is_private,
-                    now,
-                    now,
-                    now,
-                ),
-            )
-            inserted = cur.fetchone() is not None
-        self._pg_commit()
-        return inserted
+            return persist(cur)
+
+    def supersede_review_job(self, job_id: int) -> None:
+        self._update_review_jobs(
+            "UPDATE mira_review_jobs SET status='superseded', updated_at=? "
+            "WHERE id=? AND status='running'",
+            (time.time(), job_id),
+        )
 
     def claim_next_review_job(self) -> ReviewJob | None:
         """Atomically claim the oldest pending job; safe with multiple replicas."""
@@ -1603,6 +1603,16 @@ class AppDatabase:
         if row is None:
             return None
         return ReviewJob(*row)
+
+    def has_claimable_review_jobs(self) -> bool:
+        sql = "SELECT 1 FROM mira_review_jobs WHERE status='pending' AND next_attempt_at<=? LIMIT 1"
+        now = (time.time(),)
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            return self._sqlite_conn.execute(sql, now).fetchone() is not None
+        with self._pg_cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), now)
+            return cur.fetchone() is not None
 
     def is_review_job_current(self, job_id: int) -> bool:
         """Return whether a claimed job has not been superseded by a new SHA."""

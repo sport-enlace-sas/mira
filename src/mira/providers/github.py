@@ -249,6 +249,7 @@ class GitHubProvider(BaseProvider):
                 author_avatar_url=(user.avatar_url or "") if user else "",
                 state=pr.state,
                 merged=bool(pr.merged),
+                draft=bool(pr.draft),
             )
 
         try:

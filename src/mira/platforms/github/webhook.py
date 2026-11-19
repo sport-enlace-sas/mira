@@ -44,7 +44,7 @@ from mira.providers import create_provider
 
 logger = logging.getLogger(__name__)
 
-_PR_ACTIONS = {"opened", "synchronize", "reopened"}
+_PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 _PR_MERGE_ACTIONS = {"closed"}
 
 
@@ -480,6 +480,19 @@ async def dispatch_github_event(
             return "processing"
         return "cancelled" if owner and repo and number else "ignored"
 
+    if event == "pull_request" and cfg.review.skip_draft_prs:
+        pr = payload.get("pull_request", {})
+        if action == "converted_to_draft":
+            repository = payload.get("repository", {})
+            owner = repository.get("owner", {}).get("login", "")
+            repo = repository.get("name", "")
+            number = pr.get("number")
+            if owner and repo and number:
+                _get_app_db().cancel_pr_review_jobs(owner, repo, number, reason="pr_draft")
+            return "ignored"
+        if action in _PR_ACTIONS and pr.get("draft"):
+            return "ignored"
+
     if event == "pull_request" and action in _PR_ACTIONS:
         sender = payload.get("sender", {}).get("login", "")
         if sender == f"{bot_name}[bot]":
@@ -529,7 +542,13 @@ async def dispatch_github_event(
         if any(lbl.get("name") == PAUSE_LABEL for lbl in pr_labels):
             logger.info("PR paused via %s label", PAUSE_LABEL)
             return "paused"
-        background_tasks.add_task(handle_pull_request, payload, app_auth, bot_name)
+        background_tasks.add_task(
+            handle_pull_request,
+            payload,
+            app_auth,
+            bot_name,
+            defer_seconds=cfg.review.synchronize_debounce_seconds if action == "synchronize" else 0,
+        )
         return "processing"
 
     if event == "issue_comment" and action == "created":
@@ -593,6 +612,8 @@ async def handle_pull_request(
     payload: dict[str, Any],
     app_auth: GitHubAppAuth,
     bot_name: str,
+    *,
+    defer_seconds: int = 0,
 ) -> None:
     """Persist a PR review request for the native in-process worker."""
     try:
@@ -616,6 +637,8 @@ async def handle_pull_request(
             pr_title=pr.get("title", ""),
             installation_id=int(payload.get("installation", {}).get("id", 0)),
             is_private=bool(payload["repository"].get("private", False)),
+            defer_seconds=defer_seconds,
+            allow_reopen=payload.get("action") in {"ready_for_review", "reopened"},
         )
         logger.info("PR %s/%s#%s %s", owner, repo, number, "queued" if queued else "already queued")
     except Exception as exc:

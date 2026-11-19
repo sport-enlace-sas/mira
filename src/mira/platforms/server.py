@@ -23,6 +23,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from mira.ai.audit import ReviewTrace
+from mira.config import MiraConfig, ReviewConfig, load_config
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.github.webhook import (
     _verify_signature,
@@ -52,37 +54,57 @@ async def _supervise_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> No
         await asyncio.sleep(_REVIEW_WORKER_RESTART_SECONDS)
 
 
-def _review_job_can_continue(db: Any, job: Any, info: Any) -> bool:
-    if info.merged or info.state != "open":
+def _review_job_can_continue(db: Any, job: Any, info: Any, policy: ReviewConfig) -> bool:
+    if not db.is_review_job_current(job.id):
+        return False
+    if info.merged or info.state != "open" or (policy.skip_draft_prs and info.draft):
+        reason = "pr_merged" if info.merged else "pr_closed" if info.state != "open" else "pr_draft"
         db.cancel_pr_review_jobs(
             job.owner,
             job.repo,
             job.pr_number,
-            reason="pr_merged" if info.merged else "pr_closed",
+            reason=reason,
             platform=job.platform,
         )
         return False
+    if not info.head_sha:
+        raise RuntimeError("GitHub did not return the PR head SHA")
     if info.head_sha != job.head_sha:
-        db.enqueue_review_job(
-            owner=job.owner,
-            repo=job.repo,
-            pr_number=job.pr_number,
-            head_sha=info.head_sha,
-            pr_url=job.pr_url,
-            pr_title=info.title,
-            installation_id=job.installation_id,
-            is_private=bool(job.is_private),
-            platform=job.platform,
-        )
+        if policy.review_on_synchronize:
+            db.enqueue_review_job(
+                owner=job.owner,
+                repo=job.repo,
+                pr_number=job.pr_number,
+                head_sha=info.head_sha,
+                pr_url=job.pr_url,
+                pr_title=info.title,
+                installation_id=job.installation_id,
+                is_private=bool(job.is_private),
+                platform=job.platform,
+                defer_seconds=policy.synchronize_debounce_seconds,
+                authoritative=True,
+            )
+        db.supersede_review_job(job.id)
         return False
-    return db.is_review_job_current(job.id)
+    return True
 
 
-async def _run_cancellable_review(db: Any, job: Any, provider: Any, bot_name: str) -> bool:
+async def _run_cancellable_review(
+    db: Any,
+    job: Any,
+    provider: Any,
+    bot_name: str,
+    *,
+    policy: ReviewConfig | None = None,
+    worker: int | None = None,
+    trace: ReviewTrace | None = None,
+) -> bool:
     from mira.platforms.handlers import run_pr_review
 
-    info = await asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
-    if not _review_job_can_continue(db, job, info):
+    policy = policy or ReviewConfig()
+    probe = asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
+    info = await trace.track("ingestion", probe) if trace else await probe
+    if not _review_job_can_continue(db, job, info, policy):
         db.complete_review_job_cancellation(job.id)
         return True
 
@@ -100,7 +122,7 @@ async def _run_cancellable_review(db: Any, job: Any, provider: Any, bot_name: st
                         "Unable to check PR lifecycle for job %s: %s", job.id, type(exc).__name__
                     )
                 else:
-                    if not _review_job_can_continue(db, job, current):
+                    if not _review_job_can_continue(db, job, current, policy):
                         return
                 next_pr_check = asyncio.get_running_loop().time() + _REVIEW_PR_POLL_SECONDS
 
@@ -117,6 +139,9 @@ async def _run_cancellable_review(db: Any, job: Any, provider: Any, bot_name: st
             pr_title=job.pr_title,
             publish_guard=lambda: db.is_review_job_current(job.id),
             job_id=job.id,
+            pr_info=info,
+            worker=worker,
+            trace=trace,
         )
     )
     monitor = asyncio.create_task(watch())
@@ -140,15 +165,46 @@ async def _run_cancellable_review(db: Any, job: Any, provider: Any, bot_name: st
 
 
 async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
-    """Run the durable review queue inside Mira's single service process."""
+    """Own queue recovery once and then run its consumers under the same lease."""
+    from mira.ai.api import get_store
+    from mira.dashboard.api import _app_db
+
+    async with get_store(_app_db).session_lock("github-review-queue-supervisor"):
+        config = load_config()
+        recovered = _app_db.recover_interrupted_review_jobs()
+        if recovered:
+            logger.info("Requeued %s interrupted review job(s)", recovered)
+        logger.info("Review queue started with %s worker slots", config.review.queue_workers)
+        async with asyncio.TaskGroup() as tasks:
+            for worker in range(1, config.review.queue_workers + 1):
+                tasks.create_task(_consume_review_jobs(app_auth, bot_name, config, worker=worker))
+
+
+async def _consume_review_jobs(
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+    config: MiraConfig,
+    *,
+    worker: int,
+) -> None:
+    from mira.ai.runtime import current
     from mira.dashboard.api import _app_db
     from mira.exceptions import LLMError, NonRetriableLLMError
     from mira.providers import create_provider
 
-    recovered = _app_db.recover_interrupted_review_jobs()
-    if recovered:
-        logger.info("Requeued %s interrupted review job(s)", recovered)
+    waiting_for_capacity = False
     while True:
+        if worker > 1 and _app_db.has_claimable_review_jobs():
+            runtime = current()
+            if runtime is None or not runtime.managed() or runtime.review_capacity() < worker:
+                if not waiting_for_capacity:
+                    logger.info(
+                        "Review worker %s waiting for another available AI connection", worker
+                    )
+                    waiting_for_capacity = True
+                await asyncio.sleep(_REVIEW_WORKER_RESTART_SECONDS)
+                continue
+            waiting_for_capacity = False
         job = _app_db.claim_next_review_job()
         if job is None:
             await asyncio.sleep(1)
@@ -156,11 +212,23 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
         if not _app_db.is_review_job_current(job.id):
             # A synchronize event superseded it after it was claimed.
             continue
+        runtime = current()
+        trace = ReviewTrace(runtime.audit_writer, job.id, job.attempts, worker) if runtime else None
+        outcome = "failed"
         try:
             provider = create_provider(
                 "github", partial(app_auth.get_installation_token, job.installation_id)
             )
-            reviewed = await _run_cancellable_review(_app_db, job, provider, bot_name)
+            logger.info("Review worker %s claimed job %s", worker, job.id)
+            reviewed = await _run_cancellable_review(
+                _app_db,
+                job,
+                provider,
+                bot_name,
+                policy=config.review,
+                worker=worker,
+                trace=trace,
+            )
             if not reviewed:
                 # Another SHA may still be completing. Return this job to the
                 # queue so the latest revision is not silently dropped.
@@ -168,6 +236,9 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
                     job.id, error="review already running", retry=job.attempts < 3
                 )
                 continue
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except NonRetriableLLMError as exc:
             _app_db.finish_review_job(job.id, error=f"{exc.code}: {exc.safe_message}")
             logger.warning("Review job %s failed without retry: %s", job.id, exc.safe_message)
@@ -189,7 +260,12 @@ async def _run_review_worker(app_auth: GitHubAppAuth, bot_name: str) -> None:
                 "Review job %s failed (attempt %s): %s", job.id, job.attempts, type(exc).__name__
             )
         else:
+            outcome = "completed" if _app_db.is_review_job_current(job.id) else "cancelled"
             _app_db.finish_review_job(job.id)
+        finally:
+            if trace is not None:
+                trace.finish(outcome)
+                await trace.stop_progress()
 
 
 def _json_status(status: str) -> Response:
@@ -296,6 +372,12 @@ def create_app(
             backfill_task.cancel()
         if review_worker_task is not None and not review_worker_task.done():
             review_worker_task.cancel()
+            await asyncio.gather(review_worker_task, return_exceptions=True)
+            from mira.ai.runtime import current
+
+            runtime = current()
+            if runtime is not None:
+                await runtime.audit_writer.close()
         if forgejo_auth is not None and not fj_task.done():
             fj_task.cancel()
         if bb_task is not None and not bb_task.done():

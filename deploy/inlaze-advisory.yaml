@@ -53,6 +53,9 @@ review:
   walkthrough_sequence_diagram: true
   pr_summary: disable
   review_on_synchronize: true
+  skip_draft_prs: true
+  synchronize_debounce_seconds: 90
+  queue_workers: 2
   self_critique: true
   security_pass: true
   # CLI providers are one-shot, isolated processes. Do not expose Mira's

@@ -15,6 +15,7 @@ import pytest
 from fastapi import BackgroundTasks, FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
+from mira.config import MiraConfig, ReviewConfig
 from mira.dashboard import api
 from mira.dashboard.db import AppDatabase
 from mira.models import PRInfo
@@ -210,7 +211,8 @@ async def test_running_review_is_stopped_and_releases_next_job(queue_db, monkeyp
     assert released.is_set()
 
 
-async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatch):
+@pytest.mark.parametrize("auto_review", [True, False])
+async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatch, auto_review):
     enqueue(queue_db)
     job = queue_db.claim_next_review_job()
     review = AsyncMock()
@@ -218,10 +220,101 @@ async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatc
     provider = SimpleNamespace(
         get_pr_info=AsyncMock(return_value=replace(info(job), head_sha="b" * 40))
     )
-    await server._run_cancellable_review(queue_db, job, provider, "mira")
+    await server._run_cancellable_review(
+        queue_db, job, provider, "mira", policy=ReviewConfig(review_on_synchronize=auto_review)
+    )
     review.assert_not_awaited()
     assert queue_db.get_review_job(job.id).status == "superseded"
-    assert queue_db.claim_next_review_job().head_sha == "b" * 40
+    current = queue_db.claim_next_review_job()
+    if auto_review:
+        assert current.head_sha == "b" * 40
+    else:
+        assert current is None
+
+
+def test_debounce_keeps_latest_sha_and_draft_can_be_requeued(persistent_queue, monkeypatch):
+    from mira.dashboard import db as db_module
+
+    db, _ = persistent_queue
+    now = 1_700_000_000.0
+    monkeypatch.setattr(db_module.time, "time", lambda: now)
+    original = enqueue(db)
+    args = {
+        "owner": "sport-enlace-sas",
+        "repo": "gannar-monorepo",
+        "pr_number": 938,
+        "head_sha": "b" * 40,
+        "pr_url": original.pr_url,
+        "pr_title": "Busy PR",
+        "installation_id": 42,
+        "is_private": True,
+    }
+    assert db.enqueue_review_job(**args, defer_seconds=90)
+    assert db.get_review_job(original.id).status == "superseded"
+    now += 89
+    assert not db.enqueue_review_job(**args, defer_seconds=90)
+    assert not db.has_claimable_review_jobs()
+    now += 1
+    job = db.claim_next_review_job()
+    assert job.head_sha == args["head_sha"]
+    db.cancel_pr_review_jobs(args["owner"], args["repo"], args["pr_number"], reason="pr_draft")
+    db.complete_review_job_cancellation(job.id)
+    assert db.enqueue_review_job(**args, allow_reopen=True)
+    revived = db.claim_next_review_job()
+    assert revived.id == job.id
+    assert revived.attempts == 1
+
+
+async def test_workers_claim_distinct_reviews_with_available_capacity(queue_db, monkeypatch):
+    from mira.ai.audit import AuditWriter
+    from mira.ai.store import AIStore
+
+    first = enqueue(queue_db, number=101)
+    second = enqueue(queue_db, number=102)
+    monkeypatch.setattr(api, "_app_db", queue_db)
+    writer = AuditWriter(AIStore(queue_db), interval=0.001)
+    capacity = 1
+    runtime = SimpleNamespace(
+        managed=lambda: True,
+        review_capacity=lambda: capacity,
+        audit_writer=writer,
+    )
+    monkeypatch.setattr("mira.ai.runtime.current", lambda: runtime)
+    monkeypatch.setattr("mira.providers.create_provider", lambda *args: object())
+    monkeypatch.setattr(server, "_REVIEW_WORKER_RESTART_SECONDS", 0.005)
+    running = {}
+    first_started = asyncio.Event()
+    both_started = asyncio.Event()
+
+    async def review(db, job, provider, bot_name, *, policy, worker, trace):
+        running[worker] = job.id
+        assert trace.worker == worker
+        first_started.set()
+        if len(running) == 2:
+            both_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "_run_cancellable_review", review)
+    config = MiraConfig(review=ReviewConfig(queue_workers=2))
+    auth = SimpleNamespace(get_installation_token=AsyncMock())
+    tasks = [
+        asyncio.create_task(server._consume_review_jobs(auth, "mira", config, worker=i))
+        for i in (1, 2)
+    ]
+    try:
+        await asyncio.wait_for(first_started.wait(), 2)
+        assert running == {1: first.id}
+        assert queue_db.get_review_job(second.id).status == "pending"
+        capacity = 2
+        await asyncio.wait_for(both_started.wait(), 2)
+        assert running == {1: first.id, 2: second.id}
+        assert queue_db.get_review_job(first.id).status == "running"
+        assert queue_db.get_review_job(second.id).status == "running"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await writer.close()
 
 
 @pytest.mark.parametrize("merged", [False, True])

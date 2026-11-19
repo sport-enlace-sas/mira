@@ -362,6 +362,9 @@ class ReviewConfig(BaseModel):
     # Disabling this saves tokens and reduces noise when you batch commits
     # locally before pushing — only the final diff gets reviewed.
     review_on_synchronize: bool = True
+    skip_draft_prs: bool = False
+    synchronize_debounce_seconds: int = Field(default=0, ge=0, le=600)
+    queue_workers: Literal[1, 2] = 1
 
     # When enabled, every new PR SHA is reviewed against the complete current
     # PR diff, even when earlier Mira threads exist.  The default incremental
@@ -468,7 +471,14 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
 )
 
 _DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset(
-    {"ocr_delegation", "ocr_command", "ocr_rule_path", "ocr_timeout_seconds", "ocr_max_rule_groups"}
+    {
+        "ocr_delegation",
+        "ocr_command",
+        "ocr_rule_path",
+        "ocr_timeout_seconds",
+        "ocr_max_rule_groups",
+        "queue_workers",
+    }
 )
 
 

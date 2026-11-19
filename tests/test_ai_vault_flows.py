@@ -309,6 +309,103 @@ async def test_snapshot_and_scenario_bindings_are_independent(store):
     assert fresh.for_scenario("summary").snapshot["summary"]["nodes"][0]["model"] == "summary-model"
 
 
+async def test_review_workers_share_the_flow_and_use_an_available_fallback(store):
+    claude, claude_credential = connection(store)
+    codex, _ = connection(store, "codex-cli", secret="a-distinct-test-secret")
+    fid = chain(store, claude, ("claude-test", "codex-test"))
+    flow = store.flow(fid)
+    flow["nodes"][1]["connection_id"] = codex
+    store.publish(
+        FlowInput(name="Mixed flow", nodes=flow["nodes"], edges=flow["edges"], expected_version=1),
+        1,
+        fid,
+    )
+    runtime = AIRuntime(store)
+    primary = runtime.provider(LLMConfig())
+    secondary = runtime.provider(LLMConfig())
+    primary.shared["worker"] = 1
+    secondary.shared["worker"] = 2
+    assert runtime.review_capacity() == 2
+    assert primary.snapshot == secondary.snapshot
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def invoke(config):
+        calls.append(config.provider)
+        if config.provider == "claude-cli" and not started.is_set():
+            started.set()
+            await release.wait()
+        return '{"ok":true}'
+
+    mock_broker(runtime, invoke)
+    task = asyncio.create_task(primary.complete([]))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(secondary.for_scenario("security").complete([]), 2)
+        assert calls == ["claude-cli", "codex-cli"]
+        assert store.runs()[0]["steps"][0]["cause"] == "capacity_busy"
+    finally:
+        release.set()
+        await task
+
+    await secondary.complete([])
+    assert calls[-1] == "claude-cli"  # The next job starts at the same first node.
+    store.set_state(f"quota:{claude_credential}:claude-test", {"until": time.time() + 120})
+    assert runtime.review_capacity() == 1
+
+
+async def test_buffered_review_trace_coalesces_and_retries_without_holding_review(
+    store, monkeypatch
+):
+    from mira.ai.audit import AuditWriter, ReviewTrace
+
+    attempts = []
+    save_runs = store.save_runs
+
+    def save(batch):
+        attempts.append(batch)
+        if len(attempts) == 1:
+            raise ConnectionError("synthetic database interruption")
+        save_runs(batch)
+
+    monkeypatch.setattr(store, "save_runs", save)
+    writer = AuditWriter(store, interval=0.001)
+    trace = ReviewTrace(writer, 42, 1, 2)
+    run = {
+        "id": "first-run",
+        "job_id": "42",
+        "created_at": time.time(),
+        "scenario": "security",
+        "status": "running",
+        "steps": [],
+    }
+    trace.observe(run)
+    run["status"] = "success"
+    run["finished_at"] = time.time()
+    run["steps"].append(
+        {
+            "result": "success",
+            "provider": "codex-cli",
+            "model": "sol",
+            "duration_ms": 50,
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6},
+        }
+    )
+    trace.observe(run)
+    trace.finish("completed")
+    assert not attempts  # The review submits events without waiting for storage.
+    await writer.close()
+    assert len(attempts) == 2
+    assert len(attempts[-1]) == 2
+    final = store.review_trace(42)
+    stage = next(s for s in final["stages"] if s["id"] == "security")
+    assert stage["status"] == "completed"
+    assert stage["models"][0]["input_tokens"] == 5
+    assert stage["models"][0]["output_tokens"] == 6
+    assert [r["id"] for r in store.runs("42")] == ["first-run"]
+
+
 async def test_live_trace_records_failed_and_running_nodes_before_provider_finishes(store):
     cid, _ = connection(store)
     chain(store, cid, ("invalid", "working"))
