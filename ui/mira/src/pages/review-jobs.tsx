@@ -39,6 +39,7 @@ const CANCELLATION_REASON: Record<string, string> = {
   pr_merged: "PR fusionado",
   pr_closed: "PR cerrado",
   pr_draft: "PR movido a borrador",
+  pr_reopen_requested: "Esperando que se libere la conexión",
 }
 
 const TOKEN_FORMATTER = new Intl.NumberFormat("es")
@@ -73,10 +74,10 @@ const PHASE_LABEL: Record<string, string> = {
 
 function relativeTime(epoch: number, now: number) {
   const seconds = Math.max(0, Math.floor(now / 1000 - epoch))
-  if (seconds < 60) return "just now"
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
+  if (seconds < 60) return "Ahora"
+  if (seconds < 3600) return `Hace ${Math.floor(seconds / 60)} min`
+  if (seconds < 86400) return `Hace ${Math.floor(seconds / 3600)} h`
+  return `Hace ${Math.floor(seconds / 86400)} d`
 }
 
 function formatDuration(durationMs: number) {
@@ -112,10 +113,13 @@ function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number;
           <p className="text-sm font-medium">Recorrido de auditoría</p>
           <p className="text-xs text-muted-foreground">
             Intento {data.attempt}{data.worker ? ` · Worker ${data.worker}` : ""}
-            {active.length > 0 && ` · En curso: ${active.map((stage) => STAGE_LABEL[stage.id] ?? stage.label).join(", ")}`}
+            {active.length > 0 && ` · En curso · ${active.map((stage) => STAGE_LABEL[stage.id] ?? stage.label).join(", ")}`}
           </p>
         </div>
-        <p className="text-xs text-muted-foreground">Los CLI pueden reportar tokens estimados.</p>
+        <div className="text-xs text-muted-foreground">
+          {active.length > 0 && <p>Último avance · {relativeTime(data.updated_at, now)}</p>}
+          <p>Los CLI pueden reportar tokens estimados.</p>
+        </div>
       </div>
       <ol className="grid gap-2 lg:grid-cols-2">
         {data.stages.map((stage) => {
@@ -205,7 +209,7 @@ export function ReviewJobsPage() {
   }
 
   return (
-    <div className="min-w-0 space-y-4 [contain:inline-size]">
+    <div className="min-w-0 space-y-4 px-3 pb-6 pt-2 sm:px-5 [contain:inline-size]">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold tracking-tight">Advisory jobs</h1>
         <Button variant="outline" size="sm" onClick={() => setRefreshNonce((n) => n + 1)}>

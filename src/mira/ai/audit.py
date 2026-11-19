@@ -171,6 +171,8 @@ class ReviewTrace:
         )
 
     def finish(self, status: str) -> None:
+        if self.finished_at is not None and self.status == status:
+            return
         self.status = status
         self.finished_at = time.time()
         self.emit()

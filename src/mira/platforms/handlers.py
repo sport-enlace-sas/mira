@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
+from mira.exceptions import ReviewSnapshotChanged
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
@@ -116,6 +117,7 @@ async def run_pr_review(
     pr_info: PRInfo | None = None,
     worker: int | None = None,
     trace: ReviewTrace | None = None,
+    snapshot_guard: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
@@ -148,6 +150,7 @@ async def run_pr_review(
         security_llm=security_llm,
         can_publish=publish_guard,
         trace=trace,
+        snapshot_guard=snapshot_guard,
     )
 
     from mira.dashboard.api import _app_db
@@ -174,7 +177,7 @@ async def run_pr_review(
 
             raise NonRetriableLLMError("review_chunks_failed")
         review_tracker.complete(repo_full, number)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, ReviewSnapshotChanged):
         await engine.cancel_background_tasks()
         review_tracker.cancel(repo_full, number)
         raise

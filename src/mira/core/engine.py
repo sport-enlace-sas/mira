@@ -37,7 +37,12 @@ from mira.core.review_reports import (
     make_report_marker,
 )
 from mira.core.threads import resolve_verified_threads, short_thread_description
-from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
+from mira.exceptions import (
+    MiraError,
+    ResponseParseError,
+    ReviewSnapshotChanged,
+    StructuredOutputError,
+)
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore, ReviewEvent
@@ -602,6 +607,7 @@ class ReviewEngine:
         security_llm: LLMProviderProtocol | None = None,
         can_publish: Callable[[], bool] | None = None,
         trace: ReviewTrace | None = None,
+        snapshot_guard: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -611,6 +617,7 @@ class ReviewEngine:
         self.bot_name = bot_name
         self.dry_run = dry_run
         self.trace = trace
+        self._snapshot_guard = snapshot_guard
         self._progress_comment: tuple[int, str] | None = None
         self._can_publish = can_publish or (lambda: True)
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
@@ -660,16 +667,24 @@ class ReviewEngine:
         return await self.trace.track(stage, work) if self.trace else await work
 
     async def _finalize_placeholder(
-        self, pr_info: PRInfo, comment_id: int, marker: str, reason: str
+        self,
+        pr_info: PRInfo,
+        comment_id: int,
+        marker: str,
+        reason: str,
+        *,
+        cancelled: bool = False,
     ) -> None:
         """Replace the in-progress placeholder with a short final note.
 
         Keeps the PR from sitting on "Reviewing this PR…" when no walkthrough
         can be shown. Best effort: a failure here is only logged.
         """
-        if not self.provider or not self._can_publish():
+        if not self.provider or (not cancelled and not self._can_publish()):
             return
         if self.trace:
+            if cancelled:
+                self.trace.finish("cancelled")
             await self.trace.stop_progress()
             markdown = self._progress_markdown(
                 pr_info, marker, f"{reason}\n\n{self.trace.markdown(final=True)}"
@@ -954,7 +969,18 @@ class ReviewEngine:
         run_id = await self._start_check(pr_info)
         try:
             result = await self._review_pr(pr_info)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ReviewSnapshotChanged):
+            if self.trace and self._progress_comment:
+                # The review tracker still owns the PR while this attempt closes
+                # the comment it started. Completed same-SHA reports were never bound.
+                comment_id, marker = self._progress_comment
+                await self._finalize_placeholder(
+                    pr_info,
+                    comment_id,
+                    marker,
+                    "This audit was cancelled or superseded.",
+                    cancelled=True,
+                )
             await self._finish_check(pr_info, run_id, "cancelled", None)
             raise
         except Exception as exc:
@@ -1037,10 +1063,16 @@ class ReviewEngine:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
                 return 0, 0, [], []
 
-        thread_result, diff_text = await _asyncio.gather(
-            _resolve_threads(),
-            self._track_stage("ingestion", self.provider.get_pr_diff(pr_info)),
-        )
+        diff_work = self._track_stage("ingestion", self.provider.get_pr_diff(pr_info))
+        if self._snapshot_guard is not None:
+            # The GitHub pull diff endpoint follows the live branch. Check the
+            # head again after fetching the diff, before any model or thread action.
+            diff_text = await diff_work
+            if not await self._snapshot_guard():
+                raise ReviewSnapshotChanged("The PR changed during ingestion")
+            thread_result = await _resolve_threads()
+        else:
+            thread_result, diff_text = await _asyncio.gather(_resolve_threads(), diff_work)
 
         threads_checked, llm_resolved, unresolved_threads, thread_decisions = thread_result
 

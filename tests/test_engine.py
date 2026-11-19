@@ -24,7 +24,7 @@ from mira.core.engine import (
     _select_review_lineage,
 )
 from mira.core.threads import _extract_sections
-from mira.exceptions import ProviderError
+from mira.exceptions import ProviderError, ReviewSnapshotChanged
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
@@ -201,6 +201,32 @@ class TestReviewEngine:
         mock_provider.get_pr_diff.assert_called_once()
         # Should post review since there are comments
         mock_provider.post_review.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_changed_snapshot_closes_progress_without_reviewing_another_sha(
+        self,
+        mock_llm: LLMProvider,
+        mock_provider: AsyncMock,
+    ):
+        mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7])
+        mock_provider.start_check_run = AsyncMock(return_value=19)
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 1)
+        guard = AsyncMock(return_value=False)
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            trace=trace,
+            snapshot_guard=guard,
+        )
+        with pytest.raises(ReviewSnapshotChanged):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+        guard.assert_awaited_once()
+        mock_llm.review.assert_not_awaited()
+        mock_provider.post_review.assert_not_awaited()
+        assert "cancelled or superseded" in mock_provider.update_comment.await_args.args[2]
+        assert mock_provider.finish_check_run.await_args.args[1:3] == (19, "neutral")
+        assert trace.snapshot()["status"] == "cancelled"
 
     @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):

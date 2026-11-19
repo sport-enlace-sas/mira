@@ -87,6 +87,19 @@ different review, a worker can continue through later nodes of that same flow.
 If the alternatives fail, it may wait for the busy node within its usual timeout.
 Use connections with independent quota to gain actual parallel inference.
 
+Advisory Jobs keeps one expandable card per SHA. The latest attempt shows its
+worker, active stages, model and provider, time, and input and output tokens
+reported by the client. A duration in progress includes waiting for a
+connection or model response. Parallel stages can overlap, so their durations
+do not add up to the elapsed audit time. The GitHub audit comment tracks the
+same SHA and is updated in place as stages change.
+
+The trace writer combines repeated updates and asynchronously persists small
+batches. Read the queue status and individual traces together when evaluating
+capacity. Count distinct active connections, jobs completed by each worker,
+and revisions superseded before their first claim. Compare queue wait and total
+latency only across comparable jobs and observation windows.
+
 ## Phased migration
 
 1. Deploy the module; the existing provider configuration remains active.

@@ -481,15 +481,18 @@ async def test_claude_cancellation_terminates_process_tree(monkeypatch):
     assert processes[0].returncode is not None
 
 
-async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch):
+@pytest.mark.parametrize("with_snapshot", [False, True])
+async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch, with_snapshot):
     from mira.config import MiraConfig
     from mira.core.review_status import ReviewTracker
     from mira.platforms import handlers
 
     started = asyncio.Event()
     tracker = ReviewTracker()
+    snapshot = info(enqueue(queue_db)) if with_snapshot else None
 
-    async def blocked_review(*args):
+    async def blocked_review(pr_url, *, pr_info=None):
+        assert pr_info is snapshot
         started.set()
         await asyncio.Event().wait()
 
@@ -501,7 +504,14 @@ async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch):
     monkeypatch.setattr(api, "_app_db", queue_db)
     task = asyncio.create_task(
         handlers.run_pr_review(
-            SimpleNamespace(), "o", "r", 1, "https://github.com/o/r/pull/1", True, "mira"
+            SimpleNamespace(),
+            "o",
+            "r",
+            1,
+            "https://github.com/o/r/pull/1",
+            True,
+            "mira",
+            pr_info=snapshot,
         )
     )
     await asyncio.wait_for(started.wait(), 1)

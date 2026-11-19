@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from mira.ai.audit import ReviewTrace
 from mira.config import MiraConfig, ReviewConfig, load_config
+from mira.exceptions import ReviewSnapshotChanged
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.github.webhook import (
     _verify_signature,
@@ -108,6 +109,14 @@ async def _run_cancellable_review(
         db.complete_review_job_cancellation(job.id)
         return True
 
+    snapshot_reconciled = False
+
+    async def snapshot_guard() -> bool:
+        nonlocal snapshot_reconciled
+        current = await asyncio.wait_for(provider.get_pr_info(job.pr_url), timeout=10)
+        snapshot_reconciled = not _review_job_can_continue(db, job, current, policy)
+        return not snapshot_reconciled
+
     async def watch() -> None:
         next_pr_check = asyncio.get_running_loop().time() + _REVIEW_PR_POLL_SECONDS
         while db.is_review_job_current(job.id):
@@ -142,6 +151,7 @@ async def _run_cancellable_review(
             pr_info=info,
             worker=worker,
             trace=trace,
+            snapshot_guard=snapshot_guard,
         )
     )
     monitor = asyncio.create_task(watch())
@@ -149,8 +159,11 @@ async def _run_cancellable_review(
         done, _ = await asyncio.wait((review, monitor), return_when=asyncio.FIRST_COMPLETED)
         if monitor in done:
             await monitor
-            return True
+            if not snapshot_reconciled:
+                return True
         return await review
+    except ReviewSnapshotChanged:
+        return True  # The live-state guard has already reconciled the queue.
     except asyncio.CancelledError:
         current = asyncio.current_task()
         if current is not None and current.cancelling():

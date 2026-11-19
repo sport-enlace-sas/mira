@@ -25,6 +25,10 @@ class DiffParseError(MiraError):
     """Error parsing a diff/patch."""
 
 
+class ReviewSnapshotChanged(MiraError):
+    """The queued PR changed while its diff was being fetched."""
+
+
 class LLMError(MiraError):
     """Error communicating with an LLM provider.
 
