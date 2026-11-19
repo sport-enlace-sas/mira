@@ -469,11 +469,12 @@ class TestReviewEngine:
         assert mock_llm.walkthrough.await_count == (2 if retry else 1)
         if mode == "pr":
             bodies = [call.args[2] for call in mock_provider.update_comment.call_args_list]
-            progress = [body for body in bodies if "Code review in progress" in body]
-            assert progress
-            assert all(("```mermaid" in body) is enabled for body in progress)
-            assert "Code review in progress" not in bodies[-1]
-            assert ("```mermaid" in bodies[-1]) is enabled
+            placeholder, final = bodies
+            assert "Reviewing this PR" in placeholder
+            assert "```mermaid" not in placeholder
+            assert "## Mira Audit ·" in final
+            assert "Reviewing this PR" not in final
+            assert ("```mermaid" in final) is enabled
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad_response", ["{}", '{"summary":"Changes.</invoke>"}'])
@@ -1306,13 +1307,19 @@ class TestCheckRunLifecycle:
         mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
         mock_provider.start_check_run = AsyncMock(return_value=42)
         mock_llm.walkthrough = AsyncMock(side_effect=RuntimeError("irrelevant"))
+        mock_llm.review = AsyncMock(return_value='{"summary":"Clean review","comments":[]}')
 
         config = MiraConfig()
         config.review.walkthrough = False
+        config.review.agentic_tools = False
+        config.review.security_pass = False
+        config.review.secrets_scan = False
         engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        assert result is not None
+        assert not result.comments
+        assert result.walkthrough is None
+        mock_llm.walkthrough.assert_not_awaited()
         mock_provider.finish_check_run.assert_awaited_once()
         assert mock_provider.finish_check_run.await_args.args[2] == "success"
 
