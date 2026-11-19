@@ -1,6 +1,11 @@
 import asyncio
 import base64
+import os
+import signal
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from mira.config import _strip_deployment_only_settings
 from mira.models import PRInfo
@@ -95,6 +100,27 @@ def test_github_checkout_uses_basic_auth_extraheader(tmp_path):
     expected = base64.b64encode(b"x-access-token:installation-token").decode("ascii")
     assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
     assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {expected}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX subprocess groups")
+@pytest.mark.parametrize("interruption", [TimeoutError, asyncio.CancelledError])
+async def test_ocr_stops_process_group_when_interrupted(tmp_path, monkeypatch, interruption):
+    ocr = OpenCodeReviewDelegation("ocr", "", 5, 32)
+    process = Mock(pid=123, returncode=None)
+    process.communicate = AsyncMock(side_effect=interruption)
+    process.wait = AsyncMock()
+    spawn = AsyncMock(return_value=process)
+    kill_group = Mock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", kill_group)
+
+    with pytest.raises(interruption):
+        await ocr._run(tmp_path, {}, "git", "fetch")
+
+    assert spawn.await_args.kwargs["start_new_session"] is True
+    kill_group.assert_called_once_with(process.pid, signal.SIGKILL)
+    process.wait.assert_awaited_once()
 
 
 def test_ocr_output_contract_drops_unsafe_paths_and_unexpected_rule_fields():

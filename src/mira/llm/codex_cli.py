@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import shlex
-import signal
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -31,6 +30,7 @@ from tenacity import (
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
+from mira.subprocesses import terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -214,23 +214,7 @@ class CodexCLIProvider:
         cmd.append("-")
         return cmd
 
-    @staticmethod
-    async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
-        """Terminate Codex and model-spawned descendants before returning."""
-        if os.name == "posix":
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                if proc.returncode is None:
-                    with suppress(ProcessLookupError):
-                        proc.kill()
-        elif proc.returncode is None:
-            with suppress(ProcessLookupError):
-                proc.kill()
-        if proc.returncode is None:
-            await proc.wait()
+    _terminate_process_tree = staticmethod(terminate_process_tree)
 
     @asynccontextmanager
     async def _auth_session(self) -> AsyncIterator[None]:
