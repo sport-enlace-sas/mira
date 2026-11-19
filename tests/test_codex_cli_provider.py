@@ -616,6 +616,29 @@ class TestClaudeAndFallbackProvider:
         assert chain.fallback_attempted is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("force_tool", [None, "submit_review"])
+    async def test_tool_choice_is_preserved_during_fallback(self, force_tool):
+        from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
+
+        primary = MagicMock()
+        fallback = MagicMock()
+        primary.complete_with_tools = AsyncMock(side_effect=LLMError("codex_timeout", seconds=1))
+        fallback.complete_with_tools = AsyncMock(return_value='{"comments": [], "summary": ""}')
+        chain = ProviderChain(primary, fallback)
+        messages = [{"role": "user", "content": "Review the change"}]
+        tools = [SUBMIT_REVIEW_TOOL]
+
+        assert (
+            await chain.complete_with_tools(messages, tools, temperature=0.0, force_tool=force_tool)
+            == '{"comments": [], "summary": ""}'
+        )
+        expected = {"temperature": 0.0}
+        if force_tool is not None:
+            expected["force_tool"] = force_tool
+        primary.complete_with_tools.assert_awaited_once_with(messages, tools, **expected)
+        fallback.complete_with_tools.assert_awaited_once_with(messages, tools, **expected)
+
+    @pytest.mark.asyncio
     async def test_invalid_claude_credentials_do_not_use_codex(self):
         primary = MagicMock()
         fallback = MagicMock()

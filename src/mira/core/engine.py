@@ -22,6 +22,7 @@ from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
 from mira.core.noise_filter import drop_already_posted, filter_noise
 from mira.core.passes import (
+    PassResult,
     agentic_review_loop,
     cap_review_summary,
     dependency_review_pass,
@@ -1350,10 +1351,6 @@ class ReviewEngine:
                     result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
 
         if self.trace:
-            if result.failed_chunks:
-                self.trace.stage_failed("review")
-            if result.security_failures:
-                self.trace.stage_failed("security")
             await self.trace.stop_progress()
 
         unverified = (
@@ -2238,9 +2235,12 @@ class ReviewEngine:
                     )
 
         async def run_chunks() -> list[_ChunkOutcome]:
-            return await self._track_stage(
+            outcomes = await self._track_stage(
                 "review", _asyncio.gather(*(_review_chunk(i, c) for i, c in enumerate(chunks)))
             )
+            if self.trace and any(outcome.failure for outcome in outcomes):
+                self.trace.stage_failed("review")
+            return outcomes
 
         review_task = _asyncio.create_task(run_chunks())
         self._review_tasks.append(review_task)
@@ -2262,19 +2262,26 @@ class ReviewEngine:
                     changed_paths=[f.path for f in filtered],
                 )
 
-        security_task = _asyncio.create_task(
-            security_review_pass(
-                self.llm,
-                filtered,
-                _security_relevant_files(filtered),
-                pr_title,
-                security_llm=self.security_llm,
-                agentic_executor_factory=_security_executor_factory,
-                max_hops=self.config.review.agentic_max_hops,
+        async def run_security() -> PassResult:
+            if not self.config.review.security_pass:
+                return PassResult()
+            outcome = await self._track_stage(
+                "security",
+                security_review_pass(
+                    self.llm,
+                    filtered,
+                    _security_relevant_files(filtered),
+                    pr_title,
+                    security_llm=self.security_llm,
+                    agentic_executor_factory=_security_executor_factory,
+                    max_hops=self.config.review.agentic_max_hops,
+                ),
             )
-            if self.config.review.security_pass
-            else _asyncio.sleep(0, result=[])
-        )
+            if self.trace and getattr(outcome, "failures", None):
+                self.trace.stage_failed("security")
+            return outcome
+
+        security_task = _asyncio.create_task(run_security())
 
         # Dependency-overlap pass: only when the PR touches a manifest file, so
         # most PRs pay nothing. When it does, fetch the repo's existing package

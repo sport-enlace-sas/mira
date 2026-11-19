@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -23,12 +24,14 @@ from mira.core.engine import (
     _security_relevant_files,
     _select_review_lineage,
 )
+from mira.core.passes import PassResult
 from mira.core.threads import _extract_sections
 from mira.exceptions import ProviderError, ReviewSnapshotChanged
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
     BotThreadRecord,
+    ChunkFailure,
     FileChangeType,
     FileDiff,
     KeyIssue,
@@ -166,6 +169,46 @@ def mock_provider(sample_diff_text: str) -> AsyncMock:
 
 
 class TestReviewEngine:
+    @pytest.mark.asyncio
+    async def test_security_failure_is_visible_while_review_is_still_running(
+        self,
+        mock_llm,
+        sample_diff_text,
+        monkeypatch,
+    ):
+        review_started = asyncio.Event()
+        security_done = asyncio.Event()
+
+        async def blocked_review(*args, **kwargs):
+            review_started.set()
+            await asyncio.Event().wait()
+
+        async def failed_security(*args, **kwargs):
+            await review_started.wait()
+            security_done.set()
+            return PassResult(
+                [], [ChunkFailure(chunk_index=0, paths=[], reason="security pass failed")]
+            )
+
+        mock_llm.review = AsyncMock(side_effect=blocked_review)
+        monkeypatch.setattr(engine_mod, "security_review_pass", failed_security)
+        config = MiraConfig()
+        config.review.agentic_tools = False
+        config.review.security_pass = True
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 55, 1, 1)
+        engine = ReviewEngine(config=config, llm=mock_llm, trace=trace)
+        review = asyncio.create_task(engine.review_diff(sample_diff_text))
+        try:
+            await asyncio.wait_for(security_done.wait(), 2)
+            stages = {stage["id"]: stage for stage in trace.snapshot()["stages"]}
+            assert stages["security"]["status"] == "failed"
+            assert stages["review"]["status"] == "running"
+        finally:
+            review.cancel()
+            await asyncio.gather(review, return_exceptions=True)
+            await engine.cancel_background_tasks()
+            trace.finish("cancelled")
+
     def test_review_lineage_uses_previous_distinct_sha_on_same_sha_retry(self):
         events = [
             SimpleNamespace(head_sha="new", previous_head_sha="old"),

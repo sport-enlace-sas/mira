@@ -122,9 +122,16 @@ class ProviderChain:
         )
 
     async def complete_with_tools(
-        self, messages: list[dict[str, str]], tools: list[dict], temperature: float | None = None
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
-        return await self._call("complete_with_tools", messages, tools, temperature=temperature)
+        tool_options = {"force_tool": force_tool} if force_tool is not None else {}
+        return await self._call(
+            "complete_with_tools", messages, tools, temperature=temperature, **tool_options
+        )
 
     async def complete_agentic(
         self, messages: list, tools: list[dict], temperature: float | None = None
