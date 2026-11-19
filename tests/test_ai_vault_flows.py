@@ -253,27 +253,54 @@ def test_stale_credential_updates_and_old_rotations_are_rejected(store):
     assert store.rows("SELECT COUNT(*) FROM ai_flow_versions WHERE flow_id=?", (fid,))[0][0] == 2
 
 
-async def test_cancellation_stops_chain_and_releases_session_lock(store):
+@pytest.mark.parametrize("phase", ["waiting_for_session", "requesting"])
+async def test_cancellation_stops_chain_and_releases_session_lock(store, phase):
     cid, credential = connection(store)
     chain(store, cid, ("first", "second"))
     runtime = AIRuntime(store)
+    review = runtime.provider(LLMConfig())
+    review.shared["worker"] = 1
     started = asyncio.Event()
     seen = []
 
-    async def invoke(config):
-        seen.append(config.model)
-        started.set()
-        await asyncio.Event().wait()
+    @asynccontextmanager
+    async def broker(connection, config, credential_id):
+        if phase == "waiting_for_session":
+            started.set()
+        async with store.session_lock(credential_id):
 
-    mock_broker(runtime, invoke)
-    task = asyncio.create_task(runtime.provider(LLMConfig()).complete([]))
-    await started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert seen == ["first"]
-    assert store.runs()[0]["status"] == "cancelled"
-    assert store.runs()[0]["steps"][0]["result"] == "cancelled"
+            async def infer(*args, **kwargs):
+                seen.append(config.model)
+                started.set()
+                await asyncio.Event().wait()
+
+            yield FakeProvider(infer)
+
+    async def cancel_review():
+        task = asyncio.create_task(review.complete([]))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert runtime.worker_connection_busy(cid, 2)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    runtime.broker.provider = broker
+    if phase == "waiting_for_session":
+        async with store.session_lock(credential):
+            await cancel_review()
+        assert seen == []
+    else:
+        await cancel_review()
+        assert seen == ["first"]
+
+    run = store.runs()[0]
+    assert run["status"] == "cancelled"
+    step = run["steps"][0]
+    assert (step["result"], step["cause"]) == ("cancelled", "cancelled")
+    assert "session_wait_ms" in step and "inference_ms" in step
+    assert not runtime.worker_connection_busy(cid, 2)
     async with asyncio.timeout(1), store.session_lock(credential):
         pass
 
