@@ -16,21 +16,6 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-react"
-import {
-  Background,
-  Controls,
-  ReactFlow,
-  addEdge,
-  applyEdgeChanges,
-  applyNodeChanges,
-  type Connection as GraphConnection,
-  type Edge,
-  type EdgeChange,
-  type Node,
-  type NodeChange,
-} from "@xyflow/react"
-import "@xyflow/react/dist/style.css"
-
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -43,7 +28,6 @@ import {
   type Diagnostic,
   type DiagnosticInput,
   type Flow,
-  type FlowNode,
   type Login,
   type Model,
   type Run,
@@ -51,8 +35,9 @@ import {
 import { useAuth } from "@/lib/auth"
 import { useDocumentTitle } from "@/lib/hooks"
 
-const selectClass =
-  "h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+import { connectionState, effortNames, efforts, friendlyError, providerNames, selectClass, statusLabel } from "./ai-display"
+import { FlowEditor } from "./ai-flow-editor"
+
 function Label({
   children,
   className = "",
@@ -70,20 +55,6 @@ function Label({
 }
 const date = (value?: number | null) =>
   value ? new Date(value * 1000).toLocaleString() : "Sin comprobar"
-const efforts = ["off", "low", "medium", "high", "xhigh", "max"]
-const statusLabel: Record<string, string> = {
-  pending: "Pendiente de prueba",
-  ready: "Comprobada",
-  auth_blocked: "Reconexión requerida",
-  listed: "Listado por proveedor",
-  unverified: "Sin verificar",
-  verified: "Acceso comprobado",
-  success: "Correcto",
-  failed: "Falló",
-  skipped: "Omitido",
-  cancelled: "Cancelado",
-  running: "En curso",
-}
 const phaseNames: Record<string, string> = {
   waiting_for_session: "Esperando disponibilidad de la cuenta",
   requesting: "Proveedor procesando la solicitud",
@@ -218,21 +189,6 @@ export function RunTrace({ run }: { run: Run }) {
   )
 }
 
-const providerNames: Record<string, string> = {
-  "claude-cli": "Claude",
-  "codex-cli": "Codex",
-  openai: "API compatible con OpenAI",
-  responses: "OpenAI Responses",
-  bedrock: "Amazon Bedrock",
-}
-const effortNames: Record<string, string> = {
-  off: "Automático",
-  low: "Bajo",
-  medium: "Medio",
-  high: "Alto",
-  xhigh: "Extra alto",
-  max: "Máximo · max",
-}
 const successTone =
   "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
 const pendingTone =
@@ -243,17 +199,6 @@ const credentialKind: Record<string, string> = {
   api_key: "Clave API",
   oauth_token: "Token OAuth",
   aws: "Credencial AWS",
-}
-
-function friendlyError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error)
-  try {
-    const detail = JSON.parse(message.replace(/^API error \d+: /, "")).detail
-    if (typeof detail === "string") return detail
-  } catch {
-    return message
-  }
-  return message
 }
 
 type ConnectionControls = {
@@ -671,6 +616,7 @@ function ConnectionCard({
 }: ConnectionControls & { diagnostics: Record<string, Diagnostic> }) {
   const native = ["claude-cli", "codex-cli"].includes(connection.provider)
   const providerName = providerNames[connection.provider] || connection.provider
+  const state = connectionState(connection, now)
   const [kind, setKind] = useState(
     connection.provider === "bedrock" ? "aws" : native ? "session" : "api_key"
   )
@@ -745,8 +691,8 @@ function ConnectionCard({
   }
 
   return (
-    <section className="min-w-0 space-y-3 rounded-2xl border bg-muted/15 p-3 sm:p-4">
-      <div className="flex flex-wrap items-start justify-between gap-3 px-1 py-1">
+    <section className="min-w-0 space-y-3 overflow-hidden rounded-xl border bg-card p-3 shadow-xs sm:p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <div
             className={`flex size-10 shrink-0 items-center justify-center rounded-lg border ${connection.provider === "claude-cli" ? "border-orange-500/20 bg-orange-500/10 text-orange-700 dark:text-orange-300" : "bg-muted text-foreground"}`}
@@ -758,26 +704,30 @@ function ConnectionCard({
             )}
           </div>
           <div className="min-w-0">
-            <h3 className="font-semibold wrap-anywhere">{connection.name}</h3>
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <h3 className="font-semibold wrap-anywhere">{connection.name}</h3>
+              <Badge variant="outline" className={state === "Lista para usar" ? successTone : connection.enabled ? pendingTone : "text-muted-foreground"}>
+                {state}
+              </Badge>
+            </div>
             <p className="text-xs text-muted-foreground">
               {providerName} · {sessions.length}{" "}
               {sessions.length === 1 ? "sesión" : "sesiones"}
-              {!connection.enabled && " · desactivada"}
             </p>
           </div>
         </div>
         {canManage && (
           <div className="flex flex-wrap gap-2">
             <Button
-              size="sm"
+              className="h-8"
               variant="outline"
               aria-expanded={adding}
               onClick={() => setAdding((value) => !value)}
             >
-              <Plus className="size-4" /> {adding ? "Cerrar" : "Añadir sesión"}
+              <Plus aria-hidden="true" className="size-4" /> {adding ? "Cerrar formulario" : "Añadir sesión"}
             </Button>
             <Button
-              size="sm"
+              className="h-8"
               variant="outline"
               disabled={disabled}
               onClick={() =>
@@ -800,11 +750,11 @@ function ConnectionCard({
             </Button>
             {sessions.length === 0 && (
               <Button
-                size="icon-sm"
+                size="icon"
                 variant="outline"
                 aria-label={`Eliminar conexión ${connection.name}`}
                 title="Eliminar conexión"
-                className="text-destructive hover:text-destructive"
+                className="size-8 text-destructive hover:text-destructive"
                 disabled={busy || loginPending}
                 onClick={() => setConfirm(true)}
               >
@@ -1036,323 +986,6 @@ function ConnectionCard({
   )
 }
 
-function FlowEditor({
-  flow,
-  connections,
-  save,
-  editable,
-}: {
-  flow: Flow
-  connections: Connection[]
-  save: (flow: Flow) => Promise<void>
-  editable: boolean
-}) {
-  const [name, setName] = useState(flow.name)
-  const [data, setData] = useState<FlowNode[]>(flow.nodes)
-  const [nodes, setNodes] = useState<Node[]>(
-    flow.nodes.map((n, i) => ({
-      id: n.id,
-      position:
-        n.position?.x !== undefined ? n.position : { x: i * 290, y: 70 },
-      data: { label: `${n.name}\n${n.model} · ${n.reasoning_effort}` },
-      style: {
-        width: 235,
-        whiteSpace: "pre-line",
-        background: "var(--card)",
-        color: "var(--foreground)",
-        borderColor: "var(--border)",
-      },
-    }))
-  )
-  const [edges, setEdges] = useState<Edge[]>(
-    flow.edges.map((e, i) => ({
-      ...e,
-      id: `edge-${i}`,
-      label: "Falla",
-      animated: true,
-    }))
-  )
-  const [selected, setSelected] = useState(data[0]?.id || "")
-  const [models, setModels] = useState<Model[]>([])
-  const [error, setError] = useState("")
-  const node = data.find((n) => n.id === selected)
-  useEffect(() => {
-    if (node?.connection_id)
-      aiApi
-        .models(node.connection_id)
-        .then((result) => setModels(result.models))
-        .catch(() => setModels([]))
-  }, [node?.connection_id])
-  const update = (patch: Partial<FlowNode>) => {
-    setData((previous) =>
-      previous.map((n) => (n.id === selected ? { ...n, ...patch } : n))
-    )
-    if (node)
-      setNodes((previous) =>
-        previous.map((n) =>
-          n.id === selected
-            ? {
-                ...n,
-                data: {
-                  label: `${patch.name ?? node.name}\n${patch.model ?? node.model} · ${patch.reasoning_effort ?? node.reasoning_effort}`,
-                },
-              }
-            : n
-        )
-      )
-  }
-  const add = () => {
-    const id = crypto.randomUUID()
-    const connection = connections[0]
-    const value: FlowNode = {
-      id,
-      name: `Paso ${data.length + 1}`,
-      connection_id: connection?.id || "",
-      model:
-        connection?.provider === "codex-cli"
-          ? "gpt-6.1-sol"
-          : "claude-haiku-4-5",
-      reasoning_effort: "off",
-      timeout: 120,
-      retries: 0,
-      context_window: 120000,
-    }
-    const terminal = data.find((n) => !edges.some((e) => e.source === n.id))
-    setData((previous) => [...previous, value])
-    setNodes((previous) => [
-      ...previous,
-      {
-        id,
-        position: { x: previous.length * 290, y: 70 },
-        data: { label: `${value.name}\n${value.model}` },
-      },
-    ])
-    setSelected(id)
-    if (terminal)
-      setEdges((previous) => [
-        ...previous,
-        {
-          id: crypto.randomUUID(),
-          source: terminal.id,
-          target: id,
-          label: "Falla",
-          animated: true,
-        },
-      ])
-  }
-  const publish = async () => {
-    setError("")
-    try {
-      await save({
-        ...flow,
-        name,
-        nodes: data.map((n) => ({
-          ...n,
-          position: nodes.find((g) => g.id === n.id)?.position,
-        })),
-        edges: edges.map((e) => ({ source: e.source, target: e.target })),
-      })
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">
-          Editor de flujo · versión {flow.version || "nueva"}
-        </CardTitle>
-        <p className="text-sm text-muted-foreground">
-          Conecta la salida de un nodo con la entrada del siguiente. Cada
-          solicitud empieza en el primer nodo y termina con la primera respuesta
-          válida.
-        </p>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="flex gap-2">
-          <Input
-            aria-label="Nombre del flujo"
-            disabled={!editable}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-          <Button
-            variant="outline"
-            disabled={!editable || !connections.length}
-            onClick={add}
-          >
-            Añadir paso
-          </Button>
-          <Button disabled={!editable} onClick={() => void publish()}>
-            Publicar versión
-          </Button>
-        </div>
-        <div className="h-80 rounded-md border">
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={(changes: NodeChange[]) => {
-              setNodes((previous) => applyNodeChanges(changes, previous))
-              setData((previous) =>
-                previous.filter(
-                  (n) =>
-                    !changes.some((c) => c.type === "remove" && c.id === n.id)
-                )
-              )
-            }}
-            onEdgesChange={(changes: EdgeChange[]) =>
-              setEdges((previous) => applyEdgeChanges(changes, previous))
-            }
-            onConnect={(connection: GraphConnection) =>
-              setEdges((previous) =>
-                addEdge(
-                  { ...connection, label: "Falla", animated: true },
-                  previous
-                )
-              )
-            }
-            onNodeClick={(_, n) => setSelected(n.id)}
-            nodesDraggable={editable}
-            nodesConnectable={editable}
-            elementsSelectable={true}
-            deleteKeyCode={editable ? ["Backspace", "Delete"] : null}
-            fitView
-          >
-            <Background />
-            <Controls />
-          </ReactFlow>
-        </div>
-        {node && (
-          <fieldset
-            disabled={!editable}
-            className="grid gap-3 rounded-md border p-4 md:grid-cols-3"
-          >
-            <div className="space-y-1">
-              <Label>Nombre del paso</Label>
-              <Input
-                value={node.name}
-                onChange={(e) => update({ name: e.target.value })}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label>Conexión / cuenta</Label>
-              <select
-                className={selectClass}
-                value={node.connection_id}
-                onChange={(e) =>
-                  update({ connection_id: e.target.value, model: "" })
-                }
-              >
-                <option value="">Seleccionar</option>
-                {connections.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name} · {c.provider}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <Label>Modelo</Label>
-              <Input
-                list="flow-models"
-                value={node.model}
-                onChange={(e) => update({ model: e.target.value })}
-              />
-              <datalist id="flow-models">
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {statusLabel[m.status]} · {m.name}
-                  </option>
-                ))}
-              </datalist>
-            </div>
-            <div className="space-y-1">
-              <Label>Esfuerzo de razonamiento</Label>
-              <select
-                className={selectClass}
-                value={node.reasoning_effort}
-                onChange={(e) => update({ reasoning_effort: e.target.value })}
-              >
-                {efforts.map((e) => (
-                  <option key={e}>{e}</option>
-                ))}
-              </select>
-            </div>
-            {(
-              [
-                ["timeout", "Timeout (segundos)"],
-                ["retries", "Reintentos del paso"],
-                ["context_window", "Capacidad de contexto (tokens)"],
-              ] as const
-            ).map(([key, label]) => (
-              <div key={key} className="space-y-1">
-                <Label>{label}</Label>
-                <Input
-                  aria-label={label}
-                  type="number"
-                  min={key === "retries" ? 0 : 1}
-                  value={node[key]}
-                  onChange={(e) => update({ [key]: Number(e.target.value) })}
-                />
-                {key === "context_window" && (
-                  <div className="space-y-1 text-xs text-muted-foreground">
-                    <p>
-                      Incluye instrucciones, contenido y reserva de salida. Una
-                      solicitud que no cabe pasa al siguiente nodo.
-                    </p>
-                    {models.find((m) => m.id === node.model)
-                      ?.context_window && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        onClick={() =>
-                          update({
-                            context_window: models.find(
-                              (m) => m.id === node.model
-                            )!.context_window!,
-                          })
-                        }
-                      >
-                        Usar capacidad anunciada:{" "}
-                        {models
-                          .find((m) => m.id === node.model)!
-                          .context_window!.toLocaleString()}
-                      </Button>
-                    )}
-                  </div>
-                )}
-              </div>
-            ))}
-            <Button
-              variant="outline"
-              onClick={() => {
-                setData((previous) => previous.filter((n) => n.id !== selected))
-                setNodes((previous) =>
-                  previous.filter((n) => n.id !== selected)
-                )
-                setEdges((previous) =>
-                  previous.filter(
-                    (e) => e.source !== selected && e.target !== selected
-                  )
-                )
-                setSelected("")
-              }}
-            >
-              Eliminar paso
-            </Button>
-          </fieldset>
-        )}
-        {error && (
-          <p role="alert" className="text-sm text-destructive">
-            {error}
-          </p>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 export function AIPage() {
   useDocumentTitle("Configuración de IA")
   const { user } = useAuth()
@@ -1374,6 +1007,9 @@ export function AIPage() {
   )
   const [flow, setFlow] = useState<Flow | null>(null)
   const [versions, setVersions] = useState<number[]>([])
+  const [draftKey, setDraftKey] = useState(0)
+  const [flowDirty, setFlowDirty] = useState(false)
+  const [leaveDraft, setLeaveDraft] = useState<(() => void) | null>(null)
   const [assignments, setAssignments] = useState<Record<string, string>>({})
   const [runs, setRuns] = useState<Run[]>([])
   const [audit, setAudit] = useState<Awaited<ReturnType<typeof aiApi.audit>>>(
@@ -1482,21 +1118,48 @@ export function AIPage() {
     }
   }
   const chooseFlow = async (id: string) => {
-    setVersions(id ? await aiApi.versions(id) : [])
-    setFlow(
-      id
-        ? await aiApi.flow(id)
-        : { id: "", name: "Nuevo flujo", version: 0, nodes: [], edges: [] }
-    )
+    const [selected, history] = id
+      ? await Promise.all([aiApi.flow(id), aiApi.versions(id)])
+      : [null, []]
+    setFlow(selected)
+    setVersions(history)
+    setFlowDirty(false)
     setFaults({})
   }
+  const guardDraft = (navigate: () => void) => {
+    if (section === "flows" && flowDirty) setLeaveDraft(() => navigate)
+    else navigate()
+  }
+  const selectSection = (next: string) => {
+    if (section === next) return
+    guardDraft(() => {
+      setSection(next)
+      setFlowDirty(false)
+      if (next === "flows" && !flow && flows.length) {
+        void action(() => chooseFlow(assignments.review || flows[0].id))
+      }
+    })
+  }
+  const createFlow = () => guardDraft(() => {
+    setFlow({ id: "", name: "", version: 0, nodes: [], edges: [] })
+    setDraftKey((current) => current + 1)
+    setVersions([])
+    setFlowDirty(false)
+    setFaults({})
+  })
+  const publishFlow = async (draft: Flow) => {
+    const result = await aiApi.saveFlow(draft)
+    const published = { ...draft, id: result.id, version: draft.version + 1 }
+    setFlows((previous) => [...previous.filter((entry) => entry.id !== published.id), {
+      id: published.id, name: published.name, version: published.version,
+    }].sort((left, right) => left.name.localeCompare(right.name)))
+    setFlow(published)
+    setVersions((previous) => [published.version, ...previous])
+    setFlowDirty(false)
+    setMessage(draft.id ? "Nueva versión publicada." : "Flujo publicado. Puedes asignarlo a un escenario.")
+  }
   const activeConnections = connections.filter(
-    (c) =>
-      c.enabled &&
-      c.credentials.some(
-        (credential) =>
-          credential.id === c.active_credential && credential.status === "ready"
-      )
+    (connection) => connectionState(connection, now) === "Lista para usar"
   )
   const assignedCount = Object.keys(assignments).length
   const scenarioCount = Object.keys(status?.scenarios || {}).length
@@ -1509,7 +1172,7 @@ export function AIPage() {
   if (!status)
     return (
       <div className="mx-auto max-w-7xl space-y-4 p-6">
-        <h1 className="text-2xl font-semibold">Conexiones y fallbacks</h1>
+        <h1 className="text-2xl font-semibold">Conexiones y flujos de IA</h1>
         {error ? (
           <>
             <p role="alert" className="text-sm text-destructive">
@@ -1532,87 +1195,26 @@ export function AIPage() {
     )
   return (
     <div className="mx-auto w-full max-w-7xl space-y-6 px-4 py-5 sm:px-6 lg:px-8">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="flex items-start gap-3">
-          <div className="mt-1 flex size-11 shrink-0 items-center justify-center rounded-xl border bg-muted/40">
-            <Sparkles className="size-5 text-primary" />
-          </div>
-          <div>
-            <p className="text-xs font-medium tracking-wider text-muted-foreground uppercase">
-              Configuración / Inteligencia artificial
-            </p>
-            <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-              Conexiones y fallbacks
-            </h1>
-            <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
-              Conecta tus cuentas, elige qué modelo usar y define quién responde
-              si el primero falla.
-            </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-sky-600/25 bg-sky-600/10 text-sky-800 dark:text-sky-300">
+            <Sparkles aria-hidden="true" className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">Conexiones y flujos de IA</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Administra tus cuentas y el orden de los modelos que usa MIRA.</p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Badge
-            variant="outline"
-            className={status?.mode === "managed" ? successTone : pendingTone}
-          >
-            <Database className="mr-1.5 size-3.5" />
-            {status?.mode === "managed"
-              ? "Configuración de BD activa"
-              : "Configuración por activar"}
+          <Badge variant="outline" className={status.mode === "managed" ? successTone : pendingTone}>
+            <Database aria-hidden="true" className="size-3.5" />
+            {status.mode === "managed" ? "Configuración activa" : "Configuración por activar"}
           </Badge>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={busy}
-            onClick={() => void action(reload)}
-          >
-            <RefreshCw
-              className={`mr-1.5 size-3.5 ${busy ? "animate-spin" : ""}`}
-            />
-            Actualizar
+          <Button type="button" variant="outline" className="h-8 px-2.5" disabled={busy} onClick={() => void action(reload)}>
+            <RefreshCw aria-hidden="true" className={busy ? "motion-safe:animate-spin" : undefined} />Actualizar
           </Button>
         </div>
-      </div>
-      <div className="grid gap-3 sm:grid-cols-3">
-        {[
-          {
-            icon: KeyRound,
-            value: `${activeConnections.length} / ${connections.length}`,
-            label: "Cuentas activas",
-            note: "Con credencial comprobada",
-          },
-          {
-            icon: Route,
-            value: String(flows.length),
-            label: "Flujos publicados",
-            note: "Secuencias de recuperación",
-          },
-          {
-            icon: ShieldCheck,
-            value: `${assignedCount} / ${scenarioCount || "—"}`,
-            label: "Escenarios asignados",
-            note: "Cada uso tiene su propio flujo",
-          },
-        ].map(({ icon: Icon, value, label, note }) => (
-          <div
-            key={label}
-            className="flex items-center gap-3 rounded-xl border bg-card p-4"
-          >
-            <div className="rounded-lg bg-muted p-2.5 text-muted-foreground">
-              <Icon className="size-4" />
-            </div>
-            <div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-xl font-semibold tabular-nums">
-                  {value}
-                </span>
-                <span className="text-xs font-medium">{label}</span>
-              </div>
-              <p className="mt-0.5 text-xs text-muted-foreground">{note}</p>
-            </div>
-          </div>
-        ))}
-      </div>
+      </header>
       {status?.mode === "legacy" && (
         <div className="rounded-2xl border bg-muted/20 p-4 sm:p-5">
           <p className="font-medium">Prepara MIRA en tres pasos</p>
@@ -1655,49 +1257,27 @@ export function AIPage() {
           </div>
         </div>
       )}
-      <nav
-        aria-label="Secciones de configuración IA"
-        className="grid gap-2 rounded-2xl border bg-muted/20 p-2 sm:grid-cols-3"
-      >
+      <nav aria-label="Secciones de configuración de IA" className="flex flex-wrap gap-1.5 rounded-xl border bg-muted/20 p-1.5">
         {[
-          {
-            key: "connections",
-            label: "Conexiones y sesiones",
-            description: "Cuentas, acceso y modelos",
-            icon: KeyRound,
-          },
-          {
-            key: "flows",
-            label: "Flujos de fallback",
-            description: "Orden de modelos por escenario",
-            icon: Route,
-          },
-          {
-            key: "diagnostics",
-            label: "Diagnósticos e historial",
-            description: "Pruebas, resultados y consumo",
-            icon: FlaskConical,
-          },
-        ].map(({ key, label, description, icon: Icon }) => (
-          <button
-            key={key}
-            type="button"
-            aria-current={section === key ? "page" : undefined}
-            className={`flex items-center gap-3 rounded-xl border px-3 py-3 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${section === key ? "border-primary/40 bg-background shadow-sm" : "border-border bg-card/60 text-muted-foreground hover:bg-background hover:text-foreground"}`}
-            onClick={() => setSection(key)}
-          >
-            <Icon
-              className={`size-4 shrink-0 ${section === key ? "text-primary" : ""}`}
-            />
-            <span>
-              <span className="block text-sm font-medium">{label}</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                {description}
-              </span>
-            </span>
-          </button>
+          { key: "connections", label: "Conexiones", icon: KeyRound },
+          { key: "flows", label: "Flujos y alternativas", icon: Route },
+          { key: "diagnostics", label: "Diagnóstico", icon: FlaskConical },
+        ].map(({ key, label, icon: Icon }) => (
+          <Button key={key} type="button" variant="ghost" aria-current={section === key ? "page" : undefined}
+            disabled={busy} onClick={() => selectSection(key)}
+            className="h-9 px-3 text-sm aria-[current=page]:bg-sky-600/10 aria-[current=page]:text-sky-900 dark:aria-[current=page]:text-sky-200">
+            <Icon aria-hidden="true" className="size-4" />{label}
+          </Button>
         ))}
       </nav>
+      <ConfirmDialog open={leaveDraft !== null} onOpenChange={(open) => { if (!open) setLeaveDraft(null) }}
+        title="¿Salir del editor de flujo?" description="Los cambios de este borrador aún no se han publicado."
+        confirmLabel="Descartar cambios" cancelLabel="Seguir editando"
+        onConfirm={() => {
+          const navigate = leaveDraft
+          setLeaveDraft(null)
+          navigate?.()
+        }} />
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}
@@ -1712,9 +1292,14 @@ export function AIPage() {
         <>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 className="font-semibold">Conexiones guardadas</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-lg font-semibold">Conexiones guardadas</h2>
+                <Badge variant="outline">{activeConnections.length} de {connections.length} listas</Badge>
+              </div>
+              <p className="mt-1 text-sm text-muted-foreground">Abre una sesión para ver sus modelos, comprobar el acceso o renovar la credencial.</p>
             </div>
             <Button
+              className="h-9 px-3"
               aria-expanded={showConnectionForm}
               disabled={!can("ai.credentials.manage")}
               onClick={() => setShowConnectionForm((value) => !value)}
@@ -1896,126 +1481,94 @@ export function AIPage() {
         </>
       )}
       {section === "flows" && (
-        <>
-          <div className="flex gap-2">
-            <select
-              aria-label="Flujo"
-              className={selectClass}
-              value={flow?.id || ""}
-              onChange={(e) => void action(() => chooseFlow(e.target.value))}
-            >
-              <option value="">Selecciona un flujo</option>
-              {flows.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name} · v{f.version}
-                </option>
-              ))}
-            </select>
-            <Button
-              variant="outline"
-              disabled={!can("ai.flows.manage")}
-              onClick={() => void chooseFlow("")}
-            >
-              Nuevo flujo
+        <section aria-labelledby="flow-settings-heading" className="min-w-0 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 id="flow-settings-heading" className="text-lg font-semibold">Flujos de IA</h2>
+              <p className="mt-1 text-sm text-muted-foreground">Crea una secuencia de modelos y asigna dónde debe usarla MIRA.</p>
+            </div>
+            <Button type="button" className="h-9 px-3" disabled={!can("ai.flows.manage") || busy} onClick={createFlow}>
+              <Plus aria-hidden="true" />Nuevo flujo
             </Button>
           </div>
-          {flow && (
-            <select
-              aria-label="Versión del flujo"
-              className={selectClass}
-              value={flow.version}
-              onChange={(e) => {
-                if (flow.id)
-                  void action(async () =>
-                    setFlow(await aiApi.flow(flow.id, Number(e.target.value)))
-                  )
-              }}
-              disabled={!flow.id}
-            >
-              {flow.id ? (
-                versions.map((version) => (
-                  <option key={version} value={version}>
-                    Versión {version}
-                    {version === flows.find((f) => f.id === flow.id)?.version
-                      ? " · publicada actual"
-                      : " · historial de solo lectura"}
-                  </option>
-                ))
-              ) : (
-                <option value={0}>Nueva versión</option>
+          {(flows.length > 0 || !!flow) && (
+            <div className="grid gap-3 rounded-xl border bg-muted/15 p-3 sm:grid-cols-[1fr_14rem] sm:p-4">
+              <div className="min-w-0 space-y-1">
+                <Label htmlFor="ai-flow-selection">Flujo guardado</Label>
+                <select id="ai-flow-selection" className={selectClass} value={flow?.id || ""} disabled={busy}
+                  onChange={(event) => {
+                    const id = event.target.value
+                    guardDraft(() => void action(() => chooseFlow(id)))
+                  }}>
+                  <option value="">{flow && !flow.id ? "Borrador nuevo" : "Selecciona un flujo"}</option>
+                  {flows.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · v{entry.version}</option>)}
+                </select>
+              </div>
+              {!!flow?.id && (
+                <div className="min-w-0 space-y-1">
+                  <Label htmlFor="ai-flow-version">Versión</Label>
+                  <select id="ai-flow-version" className={selectClass} value={flow.version} disabled={busy}
+                    onChange={(event) => {
+                      const version = Number(event.target.value)
+                      const flowId = flow.id
+                      guardDraft(() => void action(async () => {
+                        setFlow(await aiApi.flow(flowId, version))
+                        setFlowDirty(false)
+                      }))
+                    }}>
+                    {versions.map((version) => (
+                      <option key={version} value={version}>
+                        v{version} {version === flows.find((entry) => entry.id === flow.id)?.version ? "· Actual" : "· Histórica"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               )}
-            </select>
+            </div>
           )}
-          {flow && (
+          {flow ? (
             <FlowEditor
-              key={`${flow.id}-${flow.version}`}
+              key={flow.id ? flow.id + "-" + flow.version : "draft-" + draftKey}
               flow={flow}
               connections={connections}
-              editable={
-                can("ai.flows.manage") &&
-                (!flow.id ||
-                  flow.version === flows.find((f) => f.id === flow.id)?.version)
-              }
-              save={async (draft) => {
-                const result = await aiApi.saveFlow(draft)
-                await reload()
-                await chooseFlow(result.id)
-                setMessage(
-                  "Nueva versión publicada. Las ejecuciones en curso conservan su versión."
-                )
-              }}
+              now={now}
+              editable={can("ai.flows.manage") && (!flow.id || flow.version === flows.find((entry) => entry.id === flow.id)?.version)}
+              onDirtyChange={setFlowDirty}
+              save={publishFlow}
             />
+          ) : (
+            <p className="rounded-xl border border-dashed px-4 py-6 text-sm text-muted-foreground">
+              {busy ? "Cargando flujo…" : flows.length ? "Selecciona un flujo para ver o modificar su orden." : "Todavía no hay flujos publicados. Empieza eligiendo la conexión y el modelo principal."}
+            </p>
           )}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">
-                Asignaciones por escenario
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="grid gap-4 md:grid-cols-2">
-                {Object.entries(status?.scenarios || {}).map(
-                  ([scenario, label]) => (
-                    <div key={scenario} className="space-y-1">
-                      <Label>{label}</Label>
-                      <select
-                        disabled={!can("ai.flows.manage")}
-                        className={selectClass}
-                        value={assignments[scenario] || ""}
-                        onChange={(e) =>
-                          setAssignments((previous) => ({
-                            ...previous,
-                            [scenario]: e.target.value,
-                          }))
-                        }
-                      >
-                        <option value="" disabled>
-                          Seleccionar flujo
-                        </option>
-                        {flows.map((f) => (
-                          <option key={f.id} value={f.id}>
-                            {f.name}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )
-                )}
+          <details className="group/assign rounded-xl border bg-card">
+            <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-xl px-4 py-3 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+              <ChevronDown aria-hidden="true" className="size-4 transition-transform group-open/assign:rotate-180 motion-reduce:transition-none" />
+              <span className="font-semibold">Asignaciones por escenario</span>
+              <Badge variant="outline">{assignedCount} de {scenarioCount} asignados</Badge>
+            </summary>
+            <div className="space-y-3 border-t p-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                {Object.entries(status.scenarios).map(([scenario, label]) => (
+                  <div key={scenario} className="min-w-0 space-y-1">
+                    <Label htmlFor={"ai-scenario-" + scenario}>{scenarioNames[scenario] ?? label}</Label>
+                    <select id={"ai-scenario-" + scenario} disabled={!can("ai.flows.manage") || busy}
+                      className={selectClass} value={assignments[scenario] || ""}
+                      onChange={(event) => setAssignments((previous) => ({ ...previous, [scenario]: event.target.value }))}>
+                      <option value="" disabled>Seleccionar flujo</option>
+                      {flows.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
+                    </select>
+                  </div>
+                ))}
               </div>
-              <Button
-                disabled={!can("ai.flows.manage") || busy}
-                onClick={() =>
-                  void action(async () => {
-                    await aiApi.assign(assignments)
-                    setMessage("Asignaciones guardadas.")
-                  })
-                }
-              >
-                Guardar asignaciones
-              </Button>
-            </CardContent>
-          </Card>
-        </>
+              <Button disabled={!can("ai.flows.manage") || busy || !flows.length}
+                onClick={() => void action(async () => {
+                  await aiApi.assign(assignments)
+                  setMessage("Asignaciones guardadas.")
+                })}>Guardar asignaciones</Button>
+            </div>
+          </details>
+        </section>
       )}
       {section === "diagnostics" && (
         <>
