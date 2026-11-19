@@ -15,6 +15,7 @@ import pytest
 from fastapi import BackgroundTasks, FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
+from mira.config import MiraConfig, ReviewConfig
 from mira.dashboard import api
 from mira.dashboard.db import AppDatabase
 from mira.models import PRInfo
@@ -210,7 +211,8 @@ async def test_running_review_is_stopped_and_releases_next_job(queue_db, monkeyp
     assert released.is_set()
 
 
-async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatch):
+@pytest.mark.parametrize("auto_review", [True, False])
+async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatch, auto_review):
     enqueue(queue_db)
     job = queue_db.claim_next_review_job()
     review = AsyncMock()
@@ -218,10 +220,179 @@ async def test_missing_synchronize_event_queues_current_sha(queue_db, monkeypatc
     provider = SimpleNamespace(
         get_pr_info=AsyncMock(return_value=replace(info(job), head_sha="b" * 40))
     )
-    await server._run_cancellable_review(queue_db, job, provider, "mira")
+    await server._run_cancellable_review(
+        queue_db, job, provider, "mira", policy=ReviewConfig(review_on_synchronize=auto_review)
+    )
     review.assert_not_awaited()
     assert queue_db.get_review_job(job.id).status == "superseded"
-    assert queue_db.claim_next_review_job().head_sha == "b" * 40
+    current = queue_db.claim_next_review_job()
+    if auto_review:
+        assert current.head_sha == "b" * 40
+    else:
+        assert current is None
+
+
+def test_debounce_keeps_latest_sha_and_draft_can_be_requeued(persistent_queue, monkeypatch):
+    from mira.dashboard import db as db_module
+
+    db, _ = persistent_queue
+    now = 1_700_000_000.0
+    monkeypatch.setattr(db_module.time, "time", lambda: now)
+    original = enqueue(db)
+    args = {
+        "owner": "sport-enlace-sas",
+        "repo": "gannar-monorepo",
+        "pr_number": 938,
+        "head_sha": "b" * 40,
+        "pr_url": original.pr_url,
+        "pr_title": "Busy PR",
+        "installation_id": 42,
+        "is_private": True,
+    }
+    assert db.enqueue_review_job(**args, defer_seconds=90)
+    assert db.get_review_job(original.id).status == "superseded"
+    now += 89
+    assert not db.enqueue_review_job(**args, defer_seconds=90)
+    assert not db.has_claimable_review_jobs()
+    now += 1
+    job = db.claim_next_review_job()
+    assert job.head_sha == args["head_sha"]
+    db.cancel_pr_review_jobs(args["owner"], args["repo"], args["pr_number"], reason="pr_draft")
+    db.complete_review_job_cancellation(job.id)
+    assert db.enqueue_review_job(**args, allow_reopen=True)
+    revived = db.claim_next_review_job()
+    assert revived.id == job.id
+    assert revived.attempts == 1
+
+
+@pytest.mark.parametrize("cleanup", ["finished", "restart", "draft_again", "new_head"])
+def test_ready_event_during_cancellation_waits_for_cleanup(persistent_queue, cleanup):
+    db, _ = persistent_queue
+    queued = enqueue(db)
+    original = db.claim_next_review_job()
+    key = (original.owner, original.repo, original.pr_number)
+    db.cancel_pr_review_jobs(*key, reason="pr_draft")
+    assert db.enqueue_review_job(
+        owner=original.owner,
+        repo=original.repo,
+        pr_number=original.pr_number,
+        head_sha=original.head_sha,
+        pr_url=original.pr_url,
+        pr_title=original.pr_title,
+        installation_id=original.installation_id,
+        is_private=original.is_private,
+        allow_reopen=True,
+    )
+    assert db.get_review_job(queued.id).status == "cancelling"
+    assert db.claim_next_review_job() is None
+
+    if cleanup == "restart":
+        db.recover_interrupted_review_jobs()
+    else:
+        if cleanup == "draft_again":
+            db.cancel_pr_review_jobs(*key, reason="pr_draft")
+        elif cleanup == "new_head":
+            enqueue(db, sha="b" * 40)
+        db.complete_review_job_cancellation(queued.id)
+
+    claim = db.claim_next_review_job()
+    if cleanup == "draft_again":
+        assert claim is None
+        assert db.get_review_job(queued.id).status == "cancelled"
+    elif cleanup == "new_head":
+        assert claim.head_sha == "b" * 40
+        assert db.get_review_job(queued.id).status == "superseded"
+        assert db.claim_next_review_job() is None
+    else:
+        assert claim.id == queued.id
+        assert claim.attempts == 1
+
+
+async def test_superseded_sha_only_requeues_when_github_confirms_the_head(
+    persistent_queue, monkeypatch
+):
+    from mira.platforms.github import webhook
+
+    db, _ = persistent_queue
+    previous = enqueue(db)
+    newer = enqueue(db, sha="b" * 40)
+    assert db.claim_next_review_job().id == newer.id
+    db.finish_review_job(newer.id)
+    assert db.is_review_head_superseded(
+        previous.owner, previous.repo, previous.pr_number, previous.head_sha
+    )
+    get_pr_info = AsyncMock(return_value=info(newer))
+    monkeypatch.setattr(webhook, "_get_app_db", lambda: db)
+    monkeypatch.setattr(
+        webhook, "create_provider", lambda *_: SimpleNamespace(get_pr_info=get_pr_info)
+    )
+    auth = SimpleNamespace(get_installation_token=AsyncMock())
+    payload = {
+        "action": "synchronize",
+        "installation": {"id": 42},
+        "repository": {"name": previous.repo, "owner": {"login": previous.owner}},
+        "pull_request": {"number": previous.pr_number, "head": {"sha": previous.head_sha}},
+    }
+    await webhook.handle_pull_request(payload, auth, "mira")
+    assert db.claim_next_review_job() is None  # A delayed delivery is harmless.
+    assert db.get_review_job(previous.id).status == "superseded"
+
+    get_pr_info.return_value = info(previous)
+    await webhook.handle_pull_request(payload, auth, "mira")
+    assert db.claim_next_review_job().id == previous.id  # A real force-push is reviewed.
+    assert db.get_review_job(newer.id).status == "completed"
+
+
+async def test_workers_claim_distinct_reviews_with_available_capacity(queue_db, monkeypatch):
+    from mira.ai.audit import AuditWriter
+    from mira.ai.store import AIStore
+
+    first = enqueue(queue_db, number=101)
+    second = enqueue(queue_db, number=102)
+    monkeypatch.setattr(api, "_app_db", queue_db)
+    writer = AuditWriter(AIStore(queue_db), interval=0.001)
+    capacity = 1
+    runtime = SimpleNamespace(
+        managed=lambda: True,
+        review_capacity=lambda: capacity,
+        audit_writer=writer,
+    )
+    monkeypatch.setattr("mira.ai.runtime.current", lambda: runtime)
+    monkeypatch.setattr("mira.providers.create_provider", lambda *args: object())
+    monkeypatch.setattr(server, "_REVIEW_WORKER_RESTART_SECONDS", 0.005)
+    running = {}
+    first_started = asyncio.Event()
+    both_started = asyncio.Event()
+
+    async def review(db, job, provider, bot_name, *, policy, worker, trace):
+        running[worker] = job.id
+        assert trace.worker == worker
+        first_started.set()
+        if len(running) == 2:
+            both_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "_run_cancellable_review", review)
+    config = MiraConfig(review=ReviewConfig(queue_workers=2))
+    auth = SimpleNamespace(get_installation_token=AsyncMock())
+    tasks = [
+        asyncio.create_task(server._consume_review_jobs(auth, "mira", config, worker=i))
+        for i in (1, 2)
+    ]
+    try:
+        await asyncio.wait_for(first_started.wait(), 2)
+        assert running == {1: first.id}
+        assert queue_db.get_review_job(second.id).status == "pending"
+        capacity = 2
+        await asyncio.wait_for(both_started.wait(), 2)
+        assert running == {1: first.id, 2: second.id}
+        assert queue_db.get_review_job(first.id).status == "running"
+        assert queue_db.get_review_job(second.id).status == "running"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await writer.close()
 
 
 @pytest.mark.parametrize("merged", [False, True])
@@ -310,15 +481,18 @@ async def test_claude_cancellation_terminates_process_tree(monkeypatch):
     assert processes[0].returncode is not None
 
 
-async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch):
+@pytest.mark.parametrize("with_snapshot", [False, True])
+async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch, with_snapshot):
     from mira.config import MiraConfig
     from mira.core.review_status import ReviewTracker
     from mira.platforms import handlers
 
     started = asyncio.Event()
     tracker = ReviewTracker()
+    snapshot = info(enqueue(queue_db)) if with_snapshot else None
 
-    async def blocked_review(*args):
+    async def blocked_review(pr_url, *, pr_info=None):
+        assert pr_info is snapshot
         started.set()
         await asyncio.Event().wait()
 
@@ -330,7 +504,14 @@ async def test_handler_cancellation_releases_tracker(queue_db, monkeypatch):
     monkeypatch.setattr(api, "_app_db", queue_db)
     task = asyncio.create_task(
         handlers.run_pr_review(
-            SimpleNamespace(), "o", "r", 1, "https://github.com/o/r/pull/1", True, "mira"
+            SimpleNamespace(),
+            "o",
+            "r",
+            1,
+            "https://github.com/o/r/pull/1",
+            True,
+            "mira",
+            pr_info=snapshot,
         )
     )
     await asyncio.wait_for(started.wait(), 1)

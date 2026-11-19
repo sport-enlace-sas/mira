@@ -499,15 +499,46 @@ async def test_pr_opened_still_reviewed_when_review_on_synchronize_off(
 
 @patch("mira.platforms.github.webhook.load_config")
 @patch("mira.platforms.github.webhook.handle_pull_request", new_callable=AsyncMock)
+@pytest.mark.parametrize("delay", [0, 90])
 async def test_pr_synchronize_reviewed_by_default(
-    mock_handler: AsyncMock, mock_load_config, client: AsyncClient
+    mock_handler: AsyncMock, mock_load_config, client: AsyncClient, delay: int
 ) -> None:
-    mock_load_config.return_value = MiraConfig()
+    mock_load_config.return_value = MiraConfig(
+        review=ReviewConfig(synchronize_debounce_seconds=delay)
+    )
     payload = _make_pr_payload(action="synchronize")
     payload["sender"] = {"login": "alice"}
     result = await _post(client, "pull_request", payload)
     assert result["status"] == "processing"
     mock_handler.assert_awaited_once()
+    assert mock_handler.await_args.kwargs["defer_seconds"] == delay
+
+
+@patch("mira.platforms.github.webhook.load_config")
+@patch("mira.platforms.github.webhook.handle_pull_request", new_callable=AsyncMock)
+@pytest.mark.parametrize(
+    ("action", "draft", "expected"),
+    [
+        ("opened", True, "ignored"),
+        ("synchronize", True, "ignored"),
+        ("ready_for_review", False, "processing"),
+    ],
+)
+async def test_draft_pr_is_queued_only_when_ready(
+    mock_handler, mock_load_config, client: AsyncClient, action, draft, expected
+):
+    mock_load_config.return_value = MiraConfig(
+        review=ReviewConfig(skip_draft_prs=True, synchronize_debounce_seconds=90)
+    )
+    payload = _make_pr_payload(action=action)
+    payload["pull_request"]["draft"] = draft
+    payload["sender"] = {"login": "alice"}
+    assert (await _post(client, "pull_request", payload))["status"] == expected
+    if draft:
+        mock_handler.assert_not_awaited()
+    else:
+        mock_handler.assert_awaited_once()
+        assert mock_handler.await_args.kwargs["defer_seconds"] == 0
 
 
 @patch("mira.platforms.github.webhook.load_config")

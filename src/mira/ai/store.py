@@ -392,17 +392,78 @@ class AIStore:
         self.audit(actor, "assignments.updated", "scenarios")
 
     def save_run(self, run: dict) -> None:
-        self.execute(
+        self.save_runs([run])
+
+    def save_runs(self, runs: list[dict]) -> None:
+        query = self.sql(
             "INSERT INTO ai_runs VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-            (run["id"], run["created_at"], str(run.get("job_id", "")), json.dumps(run)),
         )
+        with self.transaction() as cur:
+            cur.executemany(
+                query,
+                [
+                    (run["id"], run["created_at"], str(run.get("job_id", "")), json.dumps(run))
+                    for run in runs
+                    if "job_metrics" not in run
+                ],
+            )
+            for run in runs:
+                if "job_metrics" not in run:
+                    continue
+                # Queue delivery is at-least-once. Record each attempt's
+                # contribution before adding its counters to the parent job.
+                cur.execute(
+                    self.sql("INSERT INTO ai_runs VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING"),
+                    (run["id"], run["created_at"], str(run["job_id"]), "{}"),
+                )
+                if not cur.rowcount:
+                    continue
+                metrics = run["job_metrics"]
+                cur.execute(
+                    self.sql(
+                        "UPDATE mira_review_jobs SET audit_duration_ms=audit_duration_ms+?, "
+                        "input_tokens=input_tokens+?, output_tokens=output_tokens+? WHERE id=?"
+                    ),
+                    (
+                        metrics["audit_duration_ms"],
+                        metrics["input_tokens"],
+                        metrics["output_tokens"],
+                        run["job_id"],
+                    ),
+                )
+                # A late flush cannot override the provider of a newer attempt.
+                cur.execute(
+                    self.sql(
+                        "UPDATE mira_review_jobs SET provider_used=?,fallback_used=?,models_attempted=?, "
+                        "ocr_status=?,ocr_version=?,ocr_duration_ms=?,ocr_error=? WHERE id=? AND attempts=?"
+                    ),
+                    (
+                        metrics["provider_used"][:80],
+                        metrics["fallback_used"],
+                        metrics["models_attempted"][:500],
+                        metrics["ocr_status"],
+                        metrics["ocr_version"],
+                        metrics["ocr_duration_ms"],
+                        metrics["ocr_error"],
+                        run["job_id"],
+                        run["attempt"],
+                    ),
+                )
+
+    def review_trace(self, job_id: int) -> dict | None:
+        rows = self.rows(
+            "SELECT data FROM ai_runs WHERE job_id=? AND id LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (str(job_id), "audit:%"),
+        )
+        return json.loads(rows[0][0]) if rows else None
 
     def runs(self, job_id: str | None = None, limit: int = 100) -> list[dict]:
-        query = "SELECT data FROM ai_runs"
-        args: tuple = ()
+        query = "SELECT data FROM ai_runs WHERE id NOT LIKE ? AND id NOT LIKE ?"
+        args: tuple = ("audit:%", "metrics:%")
         if job_id is not None:
-            query += " WHERE job_id=?"
-            args = (job_id,)
+            query += " AND job_id=?"
+            args += (job_id,)
         return [
             json.loads(r[0])
             for r in self.rows(

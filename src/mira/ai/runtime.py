@@ -6,13 +6,16 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from jsonschema import validate
 from jsonschema.exceptions import ValidationError as SchemaValidationError
 
+from mira.ai.audit import AuditWriter
 from mira.ai.credentials import CredentialBroker
-from mira.ai.models import SCENARIOS, FlowInput
+from mira.ai.models import SCENARIOS, FlowInput, FlowNode
 from mira.ai.store import AIStore, new_id
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
@@ -120,6 +123,9 @@ class AIRuntime:
     def __init__(self, store: AIStore) -> None:
         self.store = store
         self.broker = CredentialBroker(store)
+        self.audit_writer = AuditWriter(store)
+        self._worker_sessions: dict[str, tuple[int, int]] = {}
+        self._worker_capacity_changed = asyncio.Condition()
 
     def managed(self) -> bool:
         latched = (self.store.root / "managed").exists()
@@ -136,6 +142,58 @@ class AIRuntime:
 
     def provider(self, config: LLMConfig) -> FlowProvider:
         return FlowProvider(self, config, config.ai_scenario, self.snapshot())
+
+    def review_capacity(self) -> int:
+        """Count available active connections in the assigned review flow."""
+        review_id = self.store.assignments().get("review")
+        if not review_id:
+            return 0
+        flow = self.store.flow(review_id)
+        return len(
+            {
+                node["connection_id"]
+                for node in flow["nodes"]
+                if self._node_available(self.store.connection(node["connection_id"]), node["model"])
+            }
+        )
+
+    def _node_available(self, connection: dict, model: str) -> bool:
+        active = connection["active_credential"]
+        if not connection["enabled"] or not active:
+            return False
+        quota = self.store.state(f"quota:{active}:{quota_key(connection['provider'], model)}", {})
+        return (
+            self.store.credential_metadata(active)["status"] == "ready"
+            and quota.get("until", 0) <= time.time()
+        )
+
+    def worker_connection_busy(self, connection_id: str, worker: int) -> bool:
+        owner = self._worker_sessions.get(connection_id)
+        return owner is not None and owner[0] != worker
+
+    @asynccontextmanager
+    async def worker_connection(
+        self, connection_id: str, worker: int | None
+    ) -> AsyncIterator[None]:
+        if worker is None:
+            yield
+            return
+        async with self._worker_capacity_changed:
+            await self._worker_capacity_changed.wait_for(
+                lambda: not self.worker_connection_busy(connection_id, worker)
+            )
+            _, count = self._worker_sessions.get(connection_id, (worker, 0))
+            self._worker_sessions[connection_id] = (worker, count + 1)
+        try:
+            yield
+        finally:
+            async with self._worker_capacity_changed:
+                _, count = self._worker_sessions[connection_id]
+                if count == 1:
+                    del self._worker_sessions[connection_id]
+                    self._worker_capacity_changed.notify_all()
+                else:
+                    self._worker_sessions[connection_id] = (worker, count - 1)
 
     def activate(self, actor: int) -> None:
         snapshot = self.snapshot()
@@ -183,10 +241,8 @@ class FlowProvider:
         shared: dict | None = None,
     ) -> None:
         self.runtime, self.scenario, self.snapshot = runtime, scenario, snapshot
-        node_connections = [
-            runtime.store.connection(n["connection_id"])
-            for n in snapshot.get(scenario, {}).get("nodes", [])
-        ]
+        nodes = self._nodes(snapshot[scenario]) if scenario in snapshot else []
+        node_connections = [runtime.store.connection(node.connection_id) for node in nodes]
         api_only = bool(node_connections) and all(
             c["provider"] not in {"claude-cli", "codex-cli"} for c in node_connections
         )
@@ -194,10 +250,8 @@ class FlowProvider:
         self.supports_temperature = api_only
         self.supports_max_tokens = api_only
         self.config = config.model_copy(update={"ai_managed": True, "ai_scenario": scenario})
-        if snapshot.get(scenario, {}).get("nodes"):
-            first = FlowInput.model_validate(
-                {k: v for k, v in snapshot[scenario].items() if k in {"name", "nodes", "edges"}}
-            ).ordered_nodes()[0]
+        if nodes:
+            first = nodes[0]
             self.config = self.config.model_copy(
                 update={"model": first.model, "max_context_tokens": first.context_window}
             )
@@ -215,8 +269,20 @@ class FlowProvider:
         )
         self.last_provider = "primary"
 
+    def _nodes(self, flow: dict) -> list[FlowNode]:
+        return FlowInput.model_validate(
+            {key: value for key, value in flow.items() if key in {"name", "nodes", "edges"}}
+        ).ordered_nodes()
+
     def for_scenario(self, scenario: str) -> FlowProvider:
         return FlowProvider(self.runtime, self.config, scenario, self.snapshot, self.shared)
+
+    def _publish_run(self, run: dict) -> None:
+        trace = self.shared.get("audit_trace")
+        if trace is not None:
+            trace.observe(run)
+        else:
+            self.runtime.store.save_run(run)
 
     @property
     def attempted_models(self) -> list[str]:
@@ -321,10 +387,10 @@ class FlowProvider:
         for renewal in range(2):
             try:
                 step["phase"] = "waiting_for_session"
-                self.runtime.store.save_run(run)
+                self._publish_run(run)
                 async with self.runtime.broker.provider(connection, config, active_id) as provider:
                     step["phase"] = "requesting"
-                    self.runtime.store.save_run(run)
+                    self._publish_run(run)
                     try:
                         async with asyncio.timeout(node.timeout):
                             result = await getattr(provider, method)(messages, **kwargs)
@@ -357,9 +423,9 @@ class FlowProvider:
         flow = flow or self.snapshot.get(self.scenario)
         if not flow:
             raise LLMError("ai_scenario_unassigned", scenario=self.scenario)
-        nodes = FlowInput.model_validate(
-            {k: v for k, v in flow.items() if k in {"name", "nodes", "edges"}}
-        ).ordered_nodes()
+        nodes = self._nodes(flow)
+        if not nodes:
+            raise LLMError("ai_scenario_unassigned", scenario=self.scenario)
         run = {
             "id": new_id(),
             "created_at": time.time(),
@@ -371,13 +437,17 @@ class FlowProvider:
             "status": "running",
             "steps": [],
         }
+        if self.shared.get("worker") is not None:
+            run["worker"] = self.shared["worker"]
         self.last_run_id = run["id"]
-        self.runtime.store.save_run(run)
+        self._publish_run(run)
         request_size = self.count_tokens(
             json.dumps(messages, ensure_ascii=False) + json.dumps(kwargs.get("tools", []))
         )
+        worker = self.shared.get("worker") if mode == "real" else None
+        node_order = list(enumerate(nodes))
         try:
-            for index, node in enumerate(nodes):
+            for position, (index, node) in enumerate(node_order):
                 connection = self.runtime.store.connection(node.connection_id)
                 active_id = credential_id or connection["active_credential"]
                 metadata = self.runtime.store.credential_metadata(active_id) if active_id else {}
@@ -464,6 +534,27 @@ class FlowProvider:
                             reset_at=cooldown.get("reset_at"),
                         )
                         break
+                    if (
+                        worker is not None
+                        and position < len(nodes)
+                        and self.runtime.worker_connection_busy(node.connection_id, worker)
+                        and any(
+                            not self.runtime.worker_connection_busy(other.connection_id, worker)
+                            and self.runtime._node_available(
+                                self.runtime.store.connection(other.connection_id), other.model
+                            )
+                            for other in nodes[index + 1 :]
+                        )
+                    ):
+                        step.update(
+                            result="skipped",
+                            cause="capacity_busy",
+                            action="Probar el siguiente nodo del mismo flujo",
+                        )
+                        # If the other nodes fail, revisit this node under its normal
+                        # timeout, including the wait for its connection.
+                        node_order.append((index, node))
+                        break
                     self.last_provider = "primary" if index == 0 else "fallback"
                     self.shared["fallback"] |= index > 0
                     for key, value in (
@@ -491,7 +582,12 @@ class FlowProvider:
                         else:
                             # The node budget includes waiting for its session,
                             # native refresh and inference, not only HTTP time.
-                            async with asyncio.timeout(node.timeout):
+                            step["phase"] = "waiting_for_session"
+                            self._publish_run(run)
+                            async with (
+                                asyncio.timeout(node.timeout),
+                                self.runtime.worker_connection(node.connection_id, worker),
+                            ):
                                 result = await self._execute_node(
                                     connection,
                                     node,
@@ -503,8 +599,6 @@ class FlowProvider:
                                     step,
                                     run,
                                 )
-                            step["phase"] = "saving"
-                            self.runtime.store.save_run(run)
                             await self.runtime.broker.health(active_id, "ready")
                             self.runtime.store.set_state(
                                 f"access:{active_id}:{node.model}:{node.reasoning_effort}",
@@ -552,7 +646,7 @@ class FlowProvider:
                             break
                     finally:
                         step["duration_ms"] = int((time.monotonic() - started) * 1000)
-                        self.runtime.store.save_run(run)
+                        self._publish_run(run)
             run["status"] = "failed"
             raise FlowExhaustedError(run) from None
         except asyncio.CancelledError:
@@ -560,7 +654,7 @@ class FlowProvider:
             raise
         finally:
             run["finished_at"] = time.time()
-            self.runtime.store.save_run(run)
+            self._publish_run(run)
 
     async def complete(
         self,

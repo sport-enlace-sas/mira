@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mira.ai.audit import ReviewTrace
 from mira.config import MiraConfig
 from mira.core import engine as engine_mod
 from mira.core.diff_parser import parse_diff
@@ -23,7 +24,7 @@ from mira.core.engine import (
     _select_review_lineage,
 )
 from mira.core.threads import _extract_sections
-from mira.exceptions import ProviderError
+from mira.exceptions import ProviderError, ReviewSnapshotChanged
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
@@ -200,6 +201,32 @@ class TestReviewEngine:
         mock_provider.get_pr_diff.assert_called_once()
         # Should post review since there are comments
         mock_provider.post_review.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_changed_snapshot_closes_progress_without_reviewing_another_sha(
+        self,
+        mock_llm: LLMProvider,
+        mock_provider: AsyncMock,
+    ):
+        mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7])
+        mock_provider.start_check_run = AsyncMock(return_value=19)
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 1)
+        guard = AsyncMock(return_value=False)
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            trace=trace,
+            snapshot_guard=guard,
+        )
+        with pytest.raises(ReviewSnapshotChanged):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+        guard.assert_awaited_once()
+        mock_llm.review.assert_not_awaited()
+        mock_provider.post_review.assert_not_awaited()
+        assert "cancelled or superseded" in mock_provider.update_comment.await_args.args[2]
+        assert mock_provider.finish_check_run.await_args.args[1:3] == (19, "neutral")
+        assert trace.snapshot()["status"] == "cancelled"
 
     @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
@@ -755,21 +782,29 @@ class TestReviewEngine:
         assert wt.confidence_score.reason == "original"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_trace", [False, True])
     async def test_walkthrough_placeholder_then_single_compact_final(
-        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock, with_trace: bool
     ):
         """A new SHA goes from placeholder directly to one compact final report."""
         # Simulate GitHub: first lookup returns None (no existing comment),
         # subsequent lookups return the newly-created placeholder ID.
         mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7, 7, 7, 7])
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 1) if with_trace else None
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, trace=trace
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # 1. One placeholder post.
         mock_provider.post_comment.assert_called_once()
         placeholder_body = mock_provider.post_comment.call_args[0][1]
-        assert "Reviewing this PR" in placeholder_body
+        assert ("Reviewing this PR" in placeholder_body) is not with_trace
+        if trace:
+            assert "### Audit progress" in placeholder_body
+            assert "| Security | Pending |" in placeholder_body
+            trace.finish("completed")
         assert "<!-- mira-report:walkthrough:" + ("a" * 40) + " -->" in placeholder_body
 
         # 2. Exactly one final update; no transient full walkthrough is posted.
@@ -779,6 +814,9 @@ class TestReviewEngine:
         assert "## Mira PR Walkthrough" not in update_bodies[0]
         assert "## Mira Audit · `aaaaaaaaaaaa`" in update_bodies[0]
         assert "PR walkthrough summary" in update_bodies[0]
+        if trace:
+            assert "Audit stage timings" in update_bodies[0]
+            assert "| PR review | Completed |" in update_bodies[0]
 
         # 3. Inline comments post fires once, at the end.
         mock_provider.post_review.assert_called_once()

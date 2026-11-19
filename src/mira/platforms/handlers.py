@@ -9,21 +9,24 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 
+from mira.ai.audit import ReviewTrace
 from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
+from mira.exceptions import ReviewSnapshotChanged
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
 from mira.llm.tool_schemas import SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
+from mira.models import PRInfo
 from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.mentions import strip_mentions
 
@@ -111,6 +114,10 @@ async def run_pr_review(
     pr_title: str = "",
     publish_guard: Callable[[], bool] | None = None,
     job_id: int = 0,
+    pr_info: PRInfo | None = None,
+    worker: int | None = None,
+    trace: ReviewTrace | None = None,
+    snapshot_guard: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
@@ -120,25 +127,20 @@ async def run_pr_review(
     """
     repo_full = f"{owner}/{repo}"
 
-    # Atomically claim the slot — avoids stacking redundant runs when
-    # two concurrent webhooks arrive. Returns False if already reviewing.
-    if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-        logger.info("Review already in progress for %s, skipping", pr_url)
-        return False
-
     review_started_at = time.monotonic()
     config = load_config()
-    from mira.dashboard.models_config import llm_config_for
-
-    llm = create_llm(llm_config_for("review", config.llm))
-    indexing_llm = create_llm(llm_config_for("indexing", config.llm))
-    security_llm = create_llm(llm_config_for("security", config.llm))
     from mira.ai.runtime import FlowProvider
 
+    llm = create_llm(llm_config_for("review", config.llm))
     if isinstance(llm, FlowProvider):
         llm.shared["job_id"] = str(job_id or "")
+        llm.shared["worker"] = worker
+        llm.shared["audit_trace"] = trace
         indexing_llm = llm.for_scenario("indexing")
         security_llm = llm.for_scenario("security")
+    else:
+        indexing_llm = create_llm(llm_config_for("indexing", config.llm))
+        security_llm = create_llm(llm_config_for("security", config.llm))
     engine = ReviewEngine(
         config=config,
         llm=llm,
@@ -147,6 +149,8 @@ async def run_pr_review(
         indexing_llm=indexing_llm,
         security_llm=security_llm,
         can_publish=publish_guard,
+        trace=trace,
+        snapshot_guard=snapshot_guard,
     )
 
     from mira.dashboard.api import _app_db
@@ -161,15 +165,19 @@ async def run_pr_review(
     repo_record = _app_db.get_repo(owner, repo, platform=platform)
     is_indexed = bool(repo_record and repo_record.status == "ready")
 
+    if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
+        logger.info("Review already in progress for %s, skipping", pr_url)
+        return False
+
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
-        result = await engine.review_pr(pr_url)
+        result = await engine.review_pr(pr_url, pr_info=pr_info)
         if result.all_chunks_failed:
             from mira.exceptions import NonRetriableLLMError
 
             raise NonRetriableLLMError("review_chunks_failed")
         review_tracker.complete(repo_full, number)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, ReviewSnapshotChanged):
         await engine.cancel_background_tasks()
         review_tracker.cancel(repo_full, number)
         raise
@@ -192,14 +200,12 @@ async def run_pr_review(
         if job_id:
             try:
                 ocr_plan = getattr(engine, "_ocr_plan", None)
-                if ocr_plan is not None:
-                    _app_db.set_review_job_ocr(
-                        job_id,
-                        status=ocr_plan.status,
-                        version=ocr_plan.version,
-                        duration_ms=ocr_plan.duration_ms,
-                        error=ocr_plan.error,
-                    )
+                ocr = {
+                    "status": (ocr_plan.status if ocr_plan is not None else "disabled")[:24],
+                    "version": (ocr_plan.version if ocr_plan is not None else "")[:120],
+                    "duration_ms": max(0, int(ocr_plan.duration_ms)) if ocr_plan is not None else 0,
+                    "error": (ocr_plan.error if ocr_plan is not None else "")[:120],
+                }
                 chains = (llm, indexing_llm, security_llm)
                 if isinstance(llm, FlowProvider):
                     chains = (llm,)
@@ -223,9 +229,8 @@ async def run_pr_review(
                             input_tokens += max(0, prompt_tokens)
                         if isinstance(completion_tokens, int):
                             output_tokens += max(0, completion_tokens)
-                _app_db.set_review_job_execution(
-                    job_id,
-                    provider_used=(
+                execution = {
+                    "provider_used": (
                         llm.shared.get("last_success_provider", "unknown")
                         if isinstance(llm, FlowProvider)
                         else config.llm.fallback_provider
@@ -233,12 +238,23 @@ async def run_pr_review(
                         else config.llm.provider
                     )
                     or "unknown",
-                    fallback_used=fallback_used,
-                    models_attempted=" -> ".join(attempted_models),
-                    audit_duration_ms=max(0, int((time.monotonic() - review_started_at) * 1000)),
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
+                    "fallback_used": fallback_used,
+                    "models_attempted": " -> ".join(attempted_models),
+                    "audit_duration_ms": max(0, int((time.monotonic() - review_started_at) * 1000)),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }
+                if trace is not None:
+                    trace.record_job_metrics(
+                        {
+                            **execution,
+                            **{f"ocr_{field}": value for field, value in ocr.items()},
+                        }
+                    )
+                else:
+                    if ocr_plan is not None:
+                        _app_db.set_review_job_ocr(job_id, **ocr)
+                    _app_db.set_review_job_execution(job_id, **execution)
             except Exception:
                 # Operational provenance must never replace the review's real
                 # success or failure with a telemetry write error.

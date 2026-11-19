@@ -1,30 +1,12 @@
-import {
-  ExternalLink,
-  RefreshCw,
-  Square,
-  Play,
-  LoaderCircle,
-} from "lucide-react"
+import { ChevronDown, ExternalLink, LoaderCircle, Play, RefreshCw, Square } from "lucide-react"
 import { Link } from "react-router"
-import {
-  useState,
-  useEffect,
-  type KeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
-} from "react"
+import { useEffect, useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { api, type ReviewJobModel } from "@/lib/api"
+import { Card } from "@/components/ui/card"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
+import { api, type ReviewAuditStage, type ReviewJobModel } from "@/lib/api"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 import { useAuth } from "@/lib/auth"
 import { toast } from "sonner"
@@ -56,45 +38,50 @@ const CANCELLATION_REASON: Record<string, string> = {
   cancelled_by_user: "Cancelada manualmente",
   pr_merged: "PR fusionado",
   pr_closed: "PR cerrado",
+  pr_draft: "PR movido a borrador",
+  pr_reopen_requested: "Esperando que se libere la conexión",
 }
 
-const COLUMNS = [
-  {
-    key: "pullRequest",
-    label: "Pull request / SHA",
-    width: 300,
-    minWidth: 220,
-  },
-  { key: "status", label: "Status", width: 120, minWidth: 96 },
-  { key: "provider", label: "Provider", width: 150, minWidth: 110 },
-  { key: "models", label: "Models attempted", width: 220, minWidth: 150 },
-  { key: "ocr", label: "OCR", width: 220, minWidth: 140 },
-  { key: "duration", label: "Audit duration", width: 130, minWidth: 110 },
-  { key: "tokens", label: "Tokens", width: 150, minWidth: 120 },
-  { key: "attempts", label: "Attempts", width: 100, minWidth: 80 },
-  { key: "actions", label: "Acciones", width: 164, minWidth: 144 },
-  { key: "updated", label: "Updated", width: 110, minWidth: 90 },
-] as const
+const TOKEN_FORMATTER = new Intl.NumberFormat("es")
 
-type ColumnKey = (typeof COLUMNS)[number]["key"]
-type ColumnWidths = Record<ColumnKey, number>
+const STAGE_LABEL: Record<string, string> = {
+  ingestion: "Ingestión y contexto",
+  indexing: "Indexación",
+  review: "Revisión del PR",
+  security: "Seguridad",
+  dependencies: "Dependencias",
+  walkthrough: "Walkthrough",
+  summary: "Resumen",
+  self_critique: "Autocrítica",
+  fix_verification: "Verificación de correcciones",
+  overlap: "Solapamiento con otros PR",
+}
 
-const INITIAL_COLUMN_WIDTHS = Object.fromEntries(
-  COLUMNS.map((column) => [column.key, column.width])
-) as ColumnWidths
+const STAGE_STATUS: Record<ReviewAuditStage["status"], string> = {
+  pending: "Pendiente",
+  running: "En curso",
+  completed: "Completada",
+  failed: "Falló",
+  cancelled: "Cancelada",
+  skipped: "Sin ejecutar",
+}
 
-const TOKEN_FORMATTER = new Intl.NumberFormat("en-US")
+const PHASE_LABEL: Record<string, string> = {
+  preparing: "Preparando solicitud",
+  waiting_for_session: "Esperando conexión",
+  requesting: "Esperando respuesta del modelo",
+}
 
-function relativeTime(epoch: number) {
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - epoch))
-  if (seconds < 60) return "just now"
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  return `${Math.floor(seconds / 86400)}d ago`
+function relativeTime(epoch: number, now: number) {
+  const seconds = Math.max(0, Math.floor(now / 1000 - epoch))
+  if (seconds < 60) return "Ahora"
+  if (seconds < 3600) return `Hace ${Math.floor(seconds / 60)} min`
+  if (seconds < 86400) return `Hace ${Math.floor(seconds / 3600)} h`
+  return `Hace ${Math.floor(seconds / 86400)} d`
 }
 
 function formatDuration(durationMs: number) {
-  if (durationMs < 1_000) return `${durationMs} ms`
+  if (durationMs < 1_000) return `${Math.round(durationMs)} ms`
   if (durationMs < 60_000)
     return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)} s`
   const totalSeconds = Math.round(durationMs / 1_000)
@@ -106,83 +93,98 @@ function formatDuration(durationMs: number) {
   return `${hours}h ${minutes}m`
 }
 
+type JobAction = "cancel" | "resume" | "retry"
+
+function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number; now: number }) {
+  const { data, error, loading } = useAsync(() => api.reviewJobTrace(job.id), [job.id, refresh])
+  if (error) return <p className="text-sm text-destructive">No se pudo cargar el recorrido.</p>
+  if (!data) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        {loading ? "Cargando recorrido…" : "Este intento todavía no tiene un recorrido registrado."}
+      </p>
+    )
+  }
+  const active = data.stages.filter((stage) => stage.status === "running")
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-medium">Recorrido de auditoría</p>
+          <p className="text-xs text-muted-foreground">
+            Intento {data.attempt}{data.worker ? ` · Worker ${data.worker}` : ""}
+            {active.length > 0 && ` · En curso · ${active.map((stage) => STAGE_LABEL[stage.id] ?? stage.label).join(", ")}`}
+          </p>
+        </div>
+        <div className="text-xs text-muted-foreground">
+          {active.length > 0 && <p>Último avance · {relativeTime(data.updated_at, now)}</p>}
+          <p>Los CLI pueden reportar tokens estimados.</p>
+        </div>
+      </div>
+      <ol className="grid gap-2 lg:grid-cols-2">
+        {data.stages.map((stage) => {
+          const elapsed = stage.status === "running" && stage.started_at != null
+            ? Math.max(0, now - stage.started_at * 1000)
+            : stage.duration_ms
+          const phases = stage.phases.map((phase) => PHASE_LABEL[phase]).filter(Boolean)
+          return (
+            <li key={stage.id} className="min-w-0">
+              <div className={`h-full rounded-md border px-3 py-2 ${stage.status === "running" ? "border-primary/60 bg-primary/5" : "bg-card"}`}>
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="min-w-0 flex-1 font-medium">{STAGE_LABEL[stage.id] ?? stage.label}</span>
+                  <Badge variant={stage.status === "failed" ? "destructive" : stage.status === "running" ? "default" : "outline"}>
+                    {STAGE_STATUS[stage.status]}
+                  </Badge>
+                  <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
+                    {elapsed == null ? "—" : formatDuration(elapsed)}
+                  </span>
+                </div>
+                {phases.length > 0 && (
+                  <p className="mt-1 text-xs text-muted-foreground">{phases.join(" · ")}</p>
+                )}
+                {stage.models.length > 0 && (
+                  <ul className="mt-2 divide-y border-t">
+                    {stage.models.map((model) => (
+                      <li key={`${model.provider}/${model.model}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5 text-xs">
+                        <span className="min-w-0 break-all font-mono">{model.model} <span className="text-muted-foreground">· {model.provider}</span></span>
+                        <span className="tabular-nums text-muted-foreground">
+                          {model.calls} {model.calls === 1 ? "llamada" : "llamadas"} · {formatDuration(model.duration_ms)}
+                          {" · "}
+                          {model.usage_reported
+                            ? `${model.calls_with_usage < model.calls ? "≥ " : ""}${TOKEN_FORMATTER.format(model.input_tokens)} entrada / ${TOKEN_FORMATTER.format(model.output_tokens)} salida`
+                            : "tokens sin reporte"}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </li>
+          )
+        })}
+      </ol>
+    </div>
+  )
+}
+
 export function ReviewJobsPage() {
   useDocumentTitle("Advisory jobs")
   const { user } = useAuth()
   const [refreshNonce, setRefreshNonce] = useState(0)
-  const {
-    data: jobs,
-    loading,
-    error,
-  } = useAsync(() => api.listReviewJobs(), [refreshNonce])
   const [acting, setActing] = useState<number | null>(null)
-  const [columnWidths, setColumnWidths] = useState<ColumnWidths>(
-    INITIAL_COLUMN_WIDTHS
-  )
-  const [nowEpochSeconds, setNowEpochSeconds] = useState(
-    () => Date.now() / 1_000
-  )
+  const [expandedJob, setExpandedJob] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  const { data: jobs, loading, error } = useAsync(() => api.listReviewJobs(), [refreshNonce])
+
   useEffect(() => {
     const timer = window.setInterval(() => {
-      setNowEpochSeconds(Date.now() / 1_000)
+      setNow(Date.now())
       setRefreshNonce((n) => n + 1)
     }, 5000)
     return () => window.clearInterval(timer)
   }, [])
 
-  const resizeColumnBy = (key: ColumnKey, delta: number) => {
-    const column = COLUMNS.find((candidate) => candidate.key === key)
-    if (!column) return
-    setColumnWidths((current) => ({
-      ...current,
-      [key]: Math.max(column.minWidth, current[key] + delta),
-    }))
-  }
-
-  const beginColumnResize = (
-    event: ReactPointerEvent<HTMLDivElement>,
-    key: ColumnKey
-  ) => {
-    event.preventDefault()
-    const column = COLUMNS.find((candidate) => candidate.key === key)
-    if (!column) return
-
-    const startX = event.clientX
-    const startWidth = columnWidths[key]
-
-    const move = (pointerEvent: PointerEvent) => {
-      const nextWidth = Math.max(
-        column.minWidth,
-        startWidth + pointerEvent.clientX - startX
-      )
-      setColumnWidths((current) => ({ ...current, [key]: nextWidth }))
-    }
-    const stop = () => {
-      window.removeEventListener("pointermove", move)
-      window.removeEventListener("pointerup", stop)
-      window.removeEventListener("pointercancel", stop)
-    }
-
-    window.addEventListener("pointermove", move)
-    window.addEventListener("pointerup", stop)
-    window.addEventListener("pointercancel", stop)
-  }
-
-  const handleResizeKey = (
-    event: KeyboardEvent<HTMLDivElement>,
-    key: ColumnKey
-  ) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return
-    event.preventDefault()
-    resizeColumnBy(key, event.key === "ArrowLeft" ? -16 : 16)
-  }
-
-  const tableWidth = COLUMNS.reduce(
-    (total, column) => total + columnWidths[column.key],
-    0
-  )
-
-  const act = async (jobId: number, action: "cancel" | "resume" | "retry") => {
+  const act = async (jobId: number, action: JobAction) => {
     setActing(jobId)
     try {
       if (action === "cancel") await api.cancelReviewJob(jobId)
@@ -207,267 +209,97 @@ export function ReviewJobsPage() {
   }
 
   return (
-    <div className="min-w-0 space-y-6 [contain:inline-size]">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Advisory jobs
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Las revisiones se cancelan al cerrar o fusionar el PR. Reanudar
-            reinicia el intento desde el primer proveedor del flujo.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setRefreshNonce((n) => n + 1)}
-          disabled={loading}
-        >
-          <RefreshCw
-            className={loading ? "mr-2 size-4 animate-spin" : "mr-2 size-4"}
-          />{" "}
-          Refresh
+    <div className="min-w-0 space-y-4 px-3 pb-6 pt-2 sm:px-5 [contain:inline-size]">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold tracking-tight">Advisory jobs</h1>
+        <Button variant="outline" size="sm" onClick={() => setRefreshNonce((n) => n + 1)}>
+          <RefreshCw className={loading ? "mr-2 size-4 animate-spin" : "mr-2 size-4"} />
+          Actualizar
         </Button>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Recent executions</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            Drag a column edge to resize it. Double-click an edge to reset its
-            width. CLI-backed token counts are estimates.
-          </p>
-        </CardHeader>
-        <CardContent className="px-3 sm:px-5">
-          {error ? (
-            <p className="p-6 text-sm text-destructive">
-              Could not load review jobs.
-            </p>
-          ) : loading && !jobs ? (
-            <p className="p-6 text-sm text-muted-foreground">Loading queue…</p>
-          ) : !jobs?.length ? (
-            <p className="p-6 text-sm text-muted-foreground">
-              No advisory jobs have been received yet.
-            </p>
-          ) : (
-            <Table
-              className="table-fixed"
-              containerClassName="rounded-lg border"
-              style={{ width: tableWidth, minWidth: tableWidth }}
-            >
-              <colgroup>
-                {COLUMNS.map((column) => (
-                  <col
-                    key={column.key}
-                    style={{ width: columnWidths[column.key] }}
-                  />
-                ))}
-              </colgroup>
-              <TableHeader>
-                <TableRow>
-                  {COLUMNS.map((column) => (
-                    <TableHead
-                      key={column.key}
-                      className={
-                        column.key === "actions"
-                          ? "sticky right-0 z-20 overflow-hidden bg-card pr-3"
-                          : "relative overflow-hidden pr-3"
-                      }
-                    >
-                      <span className="block truncate">{column.label}</span>
-                      <div
-                        role="separator"
-                        aria-label={`Resize ${column.label} column`}
-                        aria-orientation="vertical"
-                        aria-valuemin={column.minWidth}
-                        aria-valuenow={columnWidths[column.key]}
-                        tabIndex={0}
-                        className="group absolute inset-y-0 right-0 z-10 w-2 cursor-col-resize touch-none outline-none select-none focus-visible:bg-primary/10"
-                        onPointerDown={(event) =>
-                          beginColumnResize(event, column.key)
-                        }
-                        onKeyDown={(event) =>
-                          handleResizeKey(event, column.key)
-                        }
-                        onDoubleClick={() =>
-                          setColumnWidths((current) => ({
-                            ...current,
-                            [column.key]: column.width,
-                          }))
-                        }
-                      >
-                        <span className="absolute inset-y-2 right-0 w-px bg-border transition-colors group-hover:bg-primary group-focus-visible:bg-primary" />
-                      </div>
-                    </TableHead>
-                  ))}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {jobs.map((job) => (
-                  <TableRow key={job.id}>
-                    <TableCell className="overflow-hidden">
-                      <a
-                        href={job.pr_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="block truncate font-medium hover:underline"
-                      >
-                        {job.owner}/{job.repo} #{job.pr_number}
-                        <ExternalLink className="ml-1 inline size-3" />
-                      </a>
-                      <div className="mt-1 font-mono text-xs text-muted-foreground">
-                        {job.head_sha.slice(0, 12)}
-                      </div>
-                      {job.error && (
-                        <div
-                          className={
-                            CANCELLATION_REASON[job.error]
-                              ? "mt-1 truncate text-xs text-muted-foreground"
-                              : "mt-1 truncate text-xs text-destructive"
-                          }
-                        >
-                          {CANCELLATION_REASON[job.error] || job.error}
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="overflow-hidden">
-                      <Badge variant={STATUS_VARIANT[job.status]}>
-                        {STATUS_LABEL[job.status]}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-sm">
-                      {job.provider_used || "pending"}
-                      {job.fallback_used && (
-                        <span className="ml-1 text-xs text-amber-600">
-                          fallback
-                        </span>
-                      )}
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-xs">
-                      {job.models_attempted ? (
-                        job.models_attempted.split(" -> ").map((model) => (
-                          <div
-                            key={model}
-                            className="truncate font-mono text-muted-foreground"
-                          >
-                            {model}
-                          </div>
-                        ))
-                      ) : (
-                        <span className="text-muted-foreground">pending</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-xs">
-                      <span>{job.ocr_status}</span>
-                      {job.ocr_version && (
-                        <div className="truncate text-muted-foreground">
-                          {job.ocr_version}
-                        </div>
-                      )}
-                      {job.ocr_error && (
-                        <div className="truncate text-destructive">
-                          {job.ocr_error}
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-sm text-muted-foreground">
-                      {job.audit_duration_ms > 0
-                        ? formatDuration(job.audit_duration_ms)
-                        : "pending"}
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-xs">
-                      {job.audit_duration_ms > 0 ||
-                      job.input_tokens > 0 ||
-                      job.output_tokens > 0 ? (
-                        <>
-                          <div>
-                            <span className="text-muted-foreground">In</span>{" "}
-                            {TOKEN_FORMATTER.format(job.input_tokens)}
-                          </div>
-                          <div>
-                            <span className="text-muted-foreground">Out</span>{" "}
-                            {TOKEN_FORMATTER.format(job.output_tokens)}
-                          </div>
-                        </>
-                      ) : (
-                        <span className="text-muted-foreground">pending</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="overflow-hidden">
-                      {job.attempts}
-                      {job.status === "pending" &&
-                        job.attempts > 0 &&
-                        job.next_attempt_at > nowEpochSeconds && (
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            retry scheduled
-                          </div>
-                        )}
-                    </TableCell>
-                    <TableCell className="sticky right-0 z-10 space-y-2 overflow-hidden bg-card">
-                      {user?.is_admin &&
-                        (job.status === "running" ||
-                          job.status === "pending") && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={acting !== null}
-                            aria-label={`Cancelar revisión de PR #${job.pr_number}`}
-                            onClick={() => void act(job.id, "cancel")}
-                          >
-                            <Square className="mr-1 size-3" />
-                            {acting === job.id ? "Cancelando…" : "Cancelar"}
-                          </Button>
-                        )}
-                      {job.status === "cancelling" && (
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                          <LoaderCircle className="size-3 animate-spin" />{" "}
-                          Liberando sesión…
-                        </span>
-                      )}
-                      {user?.is_admin &&
-                        job.status === "cancelled" &&
-                        job.error !== "pr_merged" && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={acting !== null}
-                            aria-label={`Reanudar revisión de PR #${job.pr_number}`}
-                            title="Reinicia este SHA desde el primer proveedor; el PR debe seguir abierto"
-                            onClick={() => void act(job.id, "resume")}
-                          >
-                            <Play className="mr-1 size-3" />
-                            {acting === job.id ? "Reanudando…" : "Reanudar"}
-                          </Button>
-                        )}
-                      {user?.is_admin &&
-                        (job.status === "failed" ||
-                          (job.status === "pending" && job.attempts > 0)) && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={acting !== null}
-                            onClick={() => void act(job.id, "retry")}
-                          >
-                            {acting === job.id ? "Programando…" : "Reintentar"}
-                          </Button>
-                        )}
-                      <Button asChild variant="outline" size="sm">
-                        <Link to={`/settings/ai?job=${job.id}`}>
-                          Recorrido de IA
-                        </Link>
+      {error && <p className="p-3 text-sm text-destructive">No se pudo actualizar la cola.</p>}
+      {!jobs?.length && (
+        <Card className="p-4 text-sm text-muted-foreground">
+          {loading ? "Cargando cola…" : "Aún no hay revisiones en Advisory Jobs."}
+        </Card>
+      )}
+
+      <div className="space-y-2">
+        {jobs?.map((job) => {
+          const delayed = job.status === "pending" && job.next_attempt_at > now / 1000
+          return (
+            <Collapsible key={job.id} open={expandedJob === job.id} onOpenChange={(open) => setExpandedJob(open ? job.id : null)}>
+              <Card className="gap-0 overflow-hidden py-0">
+                <div className="flex flex-wrap items-start gap-3 p-3 sm:items-center sm:p-4">
+                  <div className="min-w-40 flex-1">
+                    <a href={job.pr_url} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-center gap-1 font-medium hover:underline">
+                      <span className="truncate">{job.owner}/{job.repo} #{job.pr_number}</span>
+                      <ExternalLink className="size-3 shrink-0" />
+                    </a>
+                    <p className="truncate text-xs text-muted-foreground" title={job.pr_title}>{job.pr_title}</p>
+                    <p className="mt-1 font-mono text-xs text-muted-foreground">{job.head_sha.slice(0, 12)}</p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                    <Badge variant={STATUS_VARIANT[job.status]}>{STATUS_LABEL[job.status]}</Badge>
+                    <span className="tabular-nums text-muted-foreground">
+                      {job.audit_duration_ms > 0 ? formatDuration(job.audit_duration_ms) : relativeTime(job.updated_at, now)}
+                    </span>
+                    {(job.input_tokens > 0 || job.output_tokens > 0) && (
+                      <span className="tabular-nums text-muted-foreground">
+                        {TOKEN_FORMATTER.format(job.input_tokens)} ent. / {TOKEN_FORMATTER.format(job.output_tokens)} sal.
+                      </span>
+                    )}
+                  </div>
+                  <CollapsibleTrigger asChild>
+                    <Button variant="outline" size="sm" className="group">
+                      {expandedJob === job.id ? "Ocultar detalle" : "Ver recorrido"}
+                      <ChevronDown className="ml-1 size-4 transition-transform group-data-[state=open]:rotate-180 motion-reduce:transition-none" />
+                    </Button>
+                  </CollapsibleTrigger>
+                  {(job.error || delayed || job.status === "cancelling") && (
+                    <p className={`w-full text-xs ${job.error && !CANCELLATION_REASON[job.error] ? "text-destructive" : "text-muted-foreground"}`}>
+                      {job.error ? CANCELLATION_REASON[job.error] ?? job.error
+                        : delayed ? (job.attempts ? "Reintento programado" : "Esperando que termine la serie de pushes")
+                        : "Liberando conexión…"}
+                    </p>
+                  )}
+                </div>
+                <CollapsibleContent className="space-y-4 border-t bg-muted/20 p-3 sm:p-4">
+                  <JobTrace job={job} refresh={refreshNonce} now={now} />
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
+                    <span>Intentos · {job.attempts}</span>
+                    {job.provider_used && <span>Proveedor · {job.provider_used}{job.fallback_used ? " (fallback)" : ""}</span>}
+                    <span>OCR · {job.ocr_status}{job.ocr_duration_ms ? ` · ${formatDuration(job.ocr_duration_ms)}` : ""}{job.ocr_version ? ` · ${job.ocr_version}` : ""}</span>
+                    {job.ocr_error && <span className="text-destructive">{job.ocr_error}</span>}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {user?.is_admin && (job.status === "pending" || job.status === "running") && (
+                      <Button variant="outline" size="sm" disabled={acting !== null} onClick={() => void act(job.id, "cancel")}>
+                        <Square className="mr-1 size-3" />{acting === job.id ? "Cancelando…" : "Cancelar"}
                       </Button>
-                    </TableCell>
-                    <TableCell className="overflow-hidden text-sm text-muted-foreground">
-                      {relativeTime(job.updated_at)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+                    )}
+                    {job.status === "cancelling" && <LoaderCircle aria-label="Cancelando" className="size-4 animate-spin" />}
+                    {user?.is_admin && job.status === "cancelled" && job.error !== "pr_merged" && (
+                      <Button variant="outline" size="sm" disabled={acting !== null} onClick={() => void act(job.id, "resume")}>
+                        <Play className="mr-1 size-3" />{acting === job.id ? "Reanudando…" : "Reanudar"}
+                      </Button>
+                    )}
+                    {user?.is_admin && (job.status === "failed" || (job.status === "pending" && job.attempts > 0)) && (
+                      <Button variant="outline" size="sm" disabled={acting !== null} onClick={() => void act(job.id, "retry")}>
+                        {acting === job.id ? "Programando…" : "Reintentar"}
+                      </Button>
+                    )}
+                    <Button asChild variant="outline" size="sm">
+                      <Link to={`/settings/ai?job=${job.id}`}>Diagnóstico de IA</Link>
+                    </Button>
+                  </div>
+                </CollapsibleContent>
+              </Card>
+            </Collapsible>
+          )
+        })}
+      </div>
     </div>
   )
 }

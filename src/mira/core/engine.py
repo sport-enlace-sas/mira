@@ -7,11 +7,12 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
     from mira.llm.base import LLMProviderProtocol
 
+from mira.ai.audit import ReviewTrace
 from mira.analysis.severity import classify_severity
 from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
@@ -36,7 +37,12 @@ from mira.core.review_reports import (
     make_report_marker,
 )
 from mira.core.threads import resolve_verified_threads, short_thread_description
-from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
+from mira.exceptions import (
+    MiraError,
+    ResponseParseError,
+    ReviewSnapshotChanged,
+    StructuredOutputError,
+)
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore, ReviewEvent
@@ -74,6 +80,7 @@ from mira.providers.base import BaseProvider, CheckConclusion
 from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 def _select_review_lineage(
@@ -599,6 +606,8 @@ class ReviewEngine:
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
         can_publish: Callable[[], bool] | None = None,
+        trace: ReviewTrace | None = None,
+        snapshot_guard: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -607,6 +616,9 @@ class ReviewEngine:
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
+        self.trace = trace
+        self._snapshot_guard = snapshot_guard
+        self._progress_comment: tuple[int, str] | None = None
         self._can_publish = can_publish or (lambda: True)
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
         # is not the same as `_index_was_empty` (whole-repo: no data at all).
@@ -629,7 +641,11 @@ class ReviewEngine:
         """
         if not self.provider or not self._can_publish():
             return None
-        placeholder = f"{marker}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
+        placeholder = (
+            self._progress_markdown(pr_info, marker, self.trace.markdown())
+            if self.trace
+            else f"{marker}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
+        )
         existing_id = await self.provider.find_bot_comment(pr_info, marker)
         if existing_id is not None:
             if not preserve_existing:
@@ -643,17 +659,38 @@ class ReviewEngine:
         await self.provider.post_comment(pr_info, placeholder)
         return await self.provider.find_bot_comment(pr_info, marker)
 
+    @staticmethod
+    def _progress_markdown(pr_info: PRInfo, marker: str, body: str) -> str:
+        return f"{marker}\n## Mira Audit · `{pr_info.head_sha[:12]}`\n\n{body}"
+
+    async def _track_stage(self, stage: str, work: Awaitable[_T]) -> _T:
+        return await self.trace.track(stage, work) if self.trace else await work
+
     async def _finalize_placeholder(
-        self, pr_info: PRInfo, comment_id: int, marker: str, reason: str
+        self,
+        pr_info: PRInfo,
+        comment_id: int,
+        marker: str,
+        reason: str,
+        *,
+        cancelled: bool = False,
     ) -> None:
         """Replace the in-progress placeholder with a short final note.
 
         Keeps the PR from sitting on "Reviewing this PR…" when no walkthrough
         can be shown. Best effort: a failure here is only logged.
         """
-        if not self.provider or not self._can_publish():
+        if not self.provider or (not cancelled and not self._can_publish()):
             return
-        markdown = f"{marker}\n## Mira PR Walkthrough\n\n{reason}\n"
+        if self.trace:
+            if cancelled:
+                self.trace.finish("cancelled")
+            await self.trace.stop_progress()
+            markdown = self._progress_markdown(
+                pr_info, marker, f"{reason}\n\n{self.trace.markdown(final=True)}"
+            )
+        else:
+            markdown = f"{marker}\n## Mira PR Walkthrough\n\n{reason}\n"
         try:
             await self.provider.update_comment(pr_info, comment_id, markdown)
         except Exception as exc:
@@ -918,12 +955,13 @@ class ReviewEngine:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def review_pr(self, pr_url: str) -> ReviewResult:
+    async def review_pr(self, pr_url: str, *, pr_info: PRInfo | None = None) -> ReviewResult:
         """Fetch PR metadata, publish a check run, and run the review pipeline."""
         if not self.provider:
             raise RuntimeError("A provider is required for PR review")
 
-        pr_info = await self.provider.get_pr_info(pr_url)
+        if pr_info is None:
+            pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
 
         import asyncio
@@ -931,10 +969,27 @@ class ReviewEngine:
         run_id = await self._start_check(pr_info)
         try:
             result = await self._review_pr(pr_info)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ReviewSnapshotChanged):
+            if self.trace and self._progress_comment:
+                # The review tracker still owns the PR while this attempt closes
+                # the comment it started. Completed same-SHA reports were never bound.
+                comment_id, marker = self._progress_comment
+                await self._finalize_placeholder(
+                    pr_info,
+                    comment_id,
+                    marker,
+                    "This audit was cancelled or superseded.",
+                    cancelled=True,
+                )
             await self._finish_check(pr_info, run_id, "cancelled", None)
             raise
-        except Exception:
+        except Exception as exc:
+            await self.cancel_background_tasks()
+            if self.trace and self._progress_comment:
+                comment_id, marker = self._progress_comment
+                await self._finalize_placeholder(
+                    pr_info, comment_id, marker, self._format_failure_notice(exc)
+                )
             await self._finish_check(pr_info, run_id, "failure", None)
             raise
         status = self._check_status_key(pr_info, result) if self._can_publish() else "cancelled"
@@ -963,6 +1018,30 @@ class ReviewEngine:
 
         previous_reviewed_sha, current_sha_already_recorded = _load_review_lineage(pr_info)
 
+        placeholder_id: int | None = None
+        if not self.dry_run:
+            try:
+                placeholder_id = await self._post_placeholder_comment(
+                    pr_info,
+                    walkthrough_marker,
+                    preserve_existing=current_sha_already_recorded,
+                )
+            except Exception as exc:
+                logger.warning("Failed to post walkthrough placeholder: %s", exc)
+
+        if self.trace and placeholder_id is not None and not current_sha_already_recorded:
+            self._progress_comment = (placeholder_id, walkthrough_marker)
+
+            async def publish_progress(body: str) -> None:
+                if self.provider and self._can_publish():
+                    await self.provider.update_comment(
+                        pr_info,
+                        placeholder_id,
+                        self._progress_markdown(pr_info, walkthrough_marker, body),
+                    )
+
+            self.trace.bind_progress(publish_progress)
+
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
         ]:
@@ -984,27 +1063,22 @@ class ReviewEngine:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
                 return 0, 0, [], []
 
-        thread_result, diff_text = await _asyncio.gather(
-            _resolve_threads(),
-            self.provider.get_pr_diff(pr_info),
-        )
+        diff_work = self._track_stage("ingestion", self.provider.get_pr_diff(pr_info))
+        if self._snapshot_guard is not None:
+            # The GitHub pull diff endpoint follows the live branch. Check the
+            # head again after fetching the diff, before any model or thread action.
+            diff_text = await diff_work
+            if not await self._snapshot_guard():
+                raise ReviewSnapshotChanged("The PR changed during ingestion")
+            thread_result = await _resolve_threads()
+        else:
+            thread_result, diff_text = await _asyncio.gather(_resolve_threads(), diff_work)
 
         threads_checked, llm_resolved, unresolved_threads, thread_decisions = thread_result
 
         _lines_changed = sum(
             1 for line in diff_text.splitlines() if line.startswith("+") or line.startswith("-")
         )
-
-        placeholder_id: int | None = None
-        if not self.dry_run:
-            try:
-                placeholder_id = await self._post_placeholder_comment(
-                    pr_info,
-                    walkthrough_marker,
-                    preserve_existing=current_sha_already_recorded,
-                )
-            except Exception as exc:
-                logger.warning("Failed to post walkthrough placeholder: %s", exc)
 
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
@@ -1140,7 +1214,9 @@ class ReviewEngine:
                     self.config.review.ocr_timeout_seconds,
                     self.config.review.ocr_max_rule_groups,
                 )
-                self._ocr_plan = await ocr.prepare(self.provider, pr_info)
+                self._ocr_plan = await self._track_stage(
+                    "ingestion", ocr.prepare(self.provider, pr_info)
+                )
                 if self._ocr_plan.status == "used":
                     selected_paths = set(self._ocr_plan.reviewed_paths)
                     diff_text = _restrict_diff_to_paths(diff_text, selected_paths)
@@ -1212,7 +1288,8 @@ class ReviewEngine:
             # in-progress banner and append the failure notice — preserves
             # walkthrough content while removing the stuck "in progress" state.
             if (
-                placeholder_id is not None
+                self.trace is None
+                and placeholder_id is not None
                 and not current_sha_already_recorded
                 and self._can_publish()
             ):
@@ -1271,6 +1348,13 @@ class ReviewEngine:
                 result.comments = kept
                 if result.key_issues:
                     result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
+
+        if self.trace:
+            if result.failed_chunks:
+                self.trace.stage_failed("review")
+            if result.security_failures:
+                self.trace.stage_failed("security")
+            await self.trace.stop_progress()
 
         unverified = (
             result.unverified_findings if self.config.review.show_unverified_findings else []
@@ -1457,6 +1541,7 @@ class ReviewEngine:
                     security_failed=bool(result.security_failures),
                     failure_notice=failure_notice,
                     unverified_findings=unverified,
+                    audit_progress=self.trace.markdown(final=True) if self.trace else "",
                 )
                 comment_id = placeholder_id
                 if comment_id is None:
@@ -1861,8 +1946,8 @@ class ReviewEngine:
                 return {}
 
         code_context_block, file_history = await _asyncio.gather(
-            _build_context(),
-            _fetch_file_history(),
+            self._track_stage("indexing", _build_context()),
+            self._track_stage("ingestion", _fetch_file_history()),
         )
 
         expanded = expand_context(filtered, self.config.review.context_lines)
@@ -2152,7 +2237,12 @@ class ReviewEngine:
                         )
                     )
 
-        review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        async def run_chunks() -> list[_ChunkOutcome]:
+            return await self._track_stage(
+                "review", _asyncio.gather(*(_review_chunk(i, c) for i, c in enumerate(chunks)))
+            )
+
+        review_task = _asyncio.create_task(run_chunks())
         self._review_tasks.append(review_task)
         # Per-chunk executors (fresh per call) so each chunk gets its own
         # 50KB tool-output budget; one shared executor would let an early
@@ -2229,13 +2319,13 @@ class ReviewEngine:
         from mira.security.pr_scan import scan_manifest_changes
 
         osv_task = _asyncio.create_task(
-            scan_manifest_changes(manifest_files, pr_source_fetcher)
+            self._track_stage("security", scan_manifest_changes(manifest_files, pr_source_fetcher))
             if manifest_files and self.config.review.osv_scan and pr_source_fetcher is not None
             else _asyncio.sleep(0, result=[])
         )
 
         secrets_task = _asyncio.create_task(
-            scan_secrets(filtered)
+            self._track_stage("security", scan_secrets(filtered))
             if filtered and self.config.review.secrets_scan
             else _asyncio.sleep(0, result=[])
         )

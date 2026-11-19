@@ -309,6 +309,154 @@ async def test_snapshot_and_scenario_bindings_are_independent(store):
     assert fresh.for_scenario("summary").snapshot["summary"]["nodes"][0]["model"] == "summary-model"
 
 
+async def test_review_workers_share_the_flow_and_use_an_available_fallback(store):
+    claude, claude_credential = connection(store)
+    codex, _ = connection(store, "codex-cli", secret="a-distinct-test-secret")
+    fid = chain(store, claude, ("claude-test", "codex-test"))
+    flow = store.flow(fid)
+    flow["nodes"][1]["connection_id"] = codex
+    store.publish(
+        FlowInput(name="Mixed flow", nodes=flow["nodes"], edges=flow["edges"], expected_version=1),
+        1,
+        fid,
+    )
+    runtime = AIRuntime(store)
+    primary = runtime.provider(LLMConfig())
+    secondary = runtime.provider(LLMConfig())
+    primary.shared["worker"] = 1
+    secondary.shared["worker"] = 2
+    assert runtime.review_capacity() == 2
+    assert primary.snapshot == secondary.snapshot
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def invoke(config):
+        calls.append(config.provider)
+        if config.provider == "claude-cli" and not started.is_set():
+            started.set()
+            await release.wait()
+        return '{"ok":true}'
+
+    mock_broker(runtime, invoke)
+    task = asyncio.create_task(primary.complete([]))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(secondary.for_scenario("security").complete([]), 2)
+        assert calls == ["claude-cli", "codex-cli"]
+        assert store.runs()[0]["steps"][0]["cause"] == "capacity_busy"
+    finally:
+        release.set()
+        await task
+
+    await secondary.complete([])
+    assert calls[-1] == "claude-cli"  # The next job starts at the same first node.
+    store.set_state(f"quota:{claude_credential}:claude-test", {"until": time.time() + 120})
+    assert runtime.review_capacity() == 1
+
+
+async def test_buffered_review_trace_coalesces_and_retries_without_holding_review(
+    store, monkeypatch
+):
+    from mira.ai.audit import AuditWriter, ReviewTrace
+
+    attempts = []
+    save_runs = store.save_runs
+
+    def save(batch):
+        attempts.append(batch)
+        if len(attempts) == 1:
+            raise ConnectionError("synthetic database interruption")
+        save_runs(batch)
+
+    monkeypatch.setattr(store, "save_runs", save)
+    writer = AuditWriter(store, interval=0.001)
+    trace = ReviewTrace(writer, 42, 1, 2)
+    run = {
+        "id": "first-run",
+        "job_id": "42",
+        "created_at": time.time(),
+        "scenario": "security",
+        "status": "running",
+        "steps": [],
+    }
+    trace.observe(run)
+    run["status"] = "success"
+    run["finished_at"] = time.time()
+    run["steps"].append(
+        {
+            "result": "success",
+            "provider": "codex-cli",
+            "model": "sol",
+            "duration_ms": 50,
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6},
+        }
+    )
+    trace.observe(run)
+    trace.finish("completed")
+    assert not attempts  # The review submits events without waiting for storage.
+    await writer.close()
+    assert len(attempts) == 2
+    assert len(attempts[-1]) == 2
+    final = store.review_trace(42)
+    stage = next(s for s in final["stages"] if s["id"] == "security")
+    assert stage["status"] == "completed"
+    assert stage["models"][0]["input_tokens"] == 5
+    assert stage["models"][0]["output_tokens"] == 6
+    assert [r["id"] for r in store.runs("42")] == ["first-run"]
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_review_progress_waits_for_inflight_edit_before_final_report(
+    monkeypatch, cancel_waiter
+):
+    from mira.ai.audit import ReviewTrace
+
+    wait_for = asyncio.wait_for
+
+    async def shorten_progress_timeout(awaitable, timeout):
+        # Exercise the old ten-second deadline without adding ten seconds to CI.
+        return await wait_for(awaitable, 0.01 if timeout == 10 else timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", shorten_progress_timeout)
+    trace = ReviewTrace(SimpleNamespace(submit=lambda snapshot: None), 42, 1, 2)
+    edit_started, release_edit = asyncio.Event(), asyncio.Event()
+    writes = []
+
+    async def edit():
+        edit_started.set()
+        await release_edit.wait()
+        writes.append("progress")
+
+    async def publish(_body):
+        # A provider edit already running in a thread survives cancellation
+        # of the awaiting coroutine.
+        await asyncio.shield(asyncio.create_task(edit()))
+
+    async def finalize():
+        await trace.stop_progress()
+        writes.append("final report")
+
+    trace.bind_progress(publish, interval=0)
+    await wait_for(edit_started.wait(), 2)
+    if cancel_waiter:
+        waiter = asyncio.create_task(trace.stop_progress())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    final = asyncio.create_task(finalize())
+    try:
+        with pytest.raises(TimeoutError):
+            await wait_for(asyncio.shield(final), 0.05)
+        assert writes == []
+    finally:
+        release_edit.set()
+        await wait_for(final, 2)
+        trace.finish("completed")
+    assert writes == ["progress", "final report"]
+
+
 async def test_live_trace_records_failed_and_running_nodes_before_provider_finishes(store):
     cid, _ = connection(store)
     chain(store, cid, ("invalid", "working"))
@@ -1225,6 +1373,22 @@ async def test_postgres_versions_encryption_and_cross_process_locks(tmp_path):
         assert not acquired.is_set()
     await asyncio.wait_for(task, 2)
     assert acquired.is_set()
+
+    job_id = int(fid[:12], 16)
+    recent = {"job_id": str(job_id), "created_at": time.time()}
+    run = {**recent, "id": f"run:{fid}"}
+    trace = {**recent, "id": f"audit:{fid}:latest", "stages": []}
+    store.save_runs(
+        [
+            {**trace, "id": f"audit:{fid}:previous", "created_at": recent["created_at"] - 1},
+            {**recent, "id": f"metrics:{fid}"},
+            run,
+            trace,
+        ]
+    )
+    assert store.review_trace(job_id) == trace
+    assert store.runs(str(job_id)) == [run]
+    assert all(not row["id"].startswith(("audit:", "metrics:")) for row in store.runs())
 
 
 def test_connection_transport_cannot_redirect_opaque_credentials_but_metadata_can_change(store):

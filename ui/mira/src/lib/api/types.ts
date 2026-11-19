@@ -451,3 +451,33 @@ export interface OpenPr {
   waiting_on: string[]
   reviewers: OpenPrReviewer[]
 }
+
+export interface ReviewAuditTrace {
+  attempt: number
+  worker: number | null
+  created_at: number
+  updated_at: number
+  finished_at: number | null
+  status: string
+  stages: ReviewAuditStage[]
+}
+
+export interface ReviewAuditStage {
+  id: string
+  label: string
+  status: "pending" | "running" | "completed" | "failed" | "cancelled" | "skipped"
+  duration_ms: number | null
+  started_at: number | null
+  finished_at: number | null
+  phases: string[]
+  models: {
+    provider: string
+    model: string
+    calls: number
+    duration_ms: number
+    input_tokens: number
+    output_tokens: number
+    usage_reported: boolean
+    calls_with_usage: number
+  }[]
+}
