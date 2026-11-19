@@ -89,9 +89,11 @@ Use connections with independent quota to gain actual parallel inference.
 
 Advisory Jobs keeps one expandable card per SHA. The latest attempt shows its
 worker, active stages, model and provider, time, and input and output tokens
-reported by the client. A duration in progress includes waiting for a
-connection or model response. Parallel stages can overlap, so their durations
-do not add up to the elapsed audit time. The GitHub audit comment tracks the
+reported by the client. Each model attempt reports connection wait separately
+from inference. The node timeout caps each phase independently, including any
+credential renewal, so time in the session queue does not shorten inference.
+Parallel stages can overlap. Per-model totals sum attempts, while the stage
+duration measures elapsed time. The GitHub audit comment tracks the
 same SHA and is updated in place as stages change.
 
 The trace writer combines repeated updates and asynchronously persists small
