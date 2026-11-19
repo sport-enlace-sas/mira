@@ -470,6 +470,14 @@ export interface ReviewAuditStage {
   started_at: number | null
   finished_at: number | null
   phases: string[]
+  issues?: {
+    provider: string
+    model: string
+    cause: string
+    label: string
+    result: "failed" | "skipped"
+    count: number
+  }[]
   models: {
     provider: string
     model: string

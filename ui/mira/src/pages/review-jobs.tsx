@@ -72,6 +72,21 @@ const PHASE_LABEL: Record<string, string> = {
   requesting: "Esperando respuesta del modelo",
 }
 
+const ISSUE_LABEL: Record<string, string> = {
+  access: "Modelo sin acceso",
+  auth: "La conexión necesita autenticación",
+  capacity_busy: "Conexión ocupada por otra revisión",
+  connection_disabled: "Conexión deshabilitada",
+  context_incompatible: "Límite de contexto excedido",
+  invalid: "Respuesta del modelo inválida",
+  provider: "Error del proveedor",
+  quota: "Cuota no disponible",
+  reasoning_incompatible: "Nivel de razonamiento incompatible",
+  timeout: "Tiempo de espera agotado",
+  tools_incompatible: "Herramientas incompatibles",
+  vault: "Almacén de credenciales no disponible",
+}
+
 function relativeTime(epoch: number, now: number) {
   const seconds = Math.max(0, Math.floor(now / 1000 - epoch))
   if (seconds < 60) return "Ahora"
@@ -106,11 +121,15 @@ function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number;
     )
   }
   const active = data.stages.filter((stage) => stage.status === "running")
+  const incomplete = data.finished_at != null && data.stages.some((stage) => stage.status === "failed")
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <p className="text-sm font-medium">Recorrido de auditoría</p>
+          <p className="flex flex-wrap items-center gap-2 text-sm font-medium">
+            Recorrido de auditoría
+            {incomplete && <Badge variant="destructive">Con incidencias</Badge>}
+          </p>
           <p className="text-xs text-muted-foreground">
             Intento {data.attempt}{data.worker ? ` · Worker ${data.worker}` : ""}
             {active.length > 0 && ` · En curso · ${active.map((stage) => STAGE_LABEL[stage.id] ?? stage.label).join(", ")}`}
@@ -157,6 +176,18 @@ function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number;
                       </li>
                     ))}
                   </ul>
+                )}
+                {!!stage.issues?.length && (
+                  <details className="mt-2 border-t pt-2 text-xs text-muted-foreground">
+                    <summary className="cursor-pointer">Intentos omitidos o fallidos</summary>
+                    <ul className="mt-1 space-y-1 pl-3">
+                      {stage.issues.map((issue) => (
+                        <li key={`${issue.provider}/${issue.model}/${issue.cause}/${issue.result}`}>
+                          <span className="break-all font-mono">{issue.model}</span> · {ISSUE_LABEL[issue.cause] ?? issue.label} · {issue.count}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 )}
               </div>
             </li>

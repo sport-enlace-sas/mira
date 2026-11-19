@@ -31,6 +31,21 @@ AUDIT_STAGES = {
     "overlap": "PR overlap",
 }
 
+ISSUE_LABELS = {
+    "access": "Model unavailable",
+    "auth": "Connection needs authentication",
+    "capacity_busy": "Connection in use by another review",
+    "connection_disabled": "Connection disabled",
+    "context_incompatible": "Context limit exceeded",
+    "invalid": "Invalid model response",
+    "provider": "Provider error",
+    "quota": "Quota unavailable",
+    "reasoning_incompatible": "Reasoning level unsupported",
+    "timeout": "Timed out",
+    "tools_incompatible": "Tool use unsupported",
+    "vault": "Credential storage unavailable",
+}
+
 
 class AuditWriter:
     """Coalesce live updates and persist small batches off the request loop."""
@@ -207,11 +222,26 @@ class ReviewTrace:
                 else "pending"
             )
             models: dict[tuple[str, str], dict] = {}
+            issues: dict[tuple[str, str, str, str], dict] = {}
             for run in runs:
                 for step in run["steps"]:
+                    provider, model = step["provider"], step["model"]
+                    cause = step.get("cause", "")
+                    if cause in ISSUE_LABELS and step["result"] in {"failed", "skipped"}:
+                        issue = issues.setdefault(
+                            (provider, model, cause, step["result"]),
+                            {
+                                "provider": provider,
+                                "model": model,
+                                "cause": cause,
+                                "label": ISSUE_LABELS[cause],
+                                "result": step["result"],
+                                "count": 0,
+                            },
+                        )
+                        issue["count"] += 1
                     if step["result"] == "skipped":
                         continue
-                    provider, model = step["provider"], step["model"]
                     item = models.setdefault(
                         (provider, model),
                         {
@@ -250,6 +280,7 @@ class ReviewTrace:
                     "started_at": started,
                     "finished_at": ended if status != "running" else None,
                     "models": list(models.values()),
+                    "issues": list(issues.values()),
                     "phases": sorted(phases),
                 }
             )
@@ -281,6 +312,9 @@ class ReviewTrace:
             if final and status == "pending":
                 status = "skipped"
             status_text = status.title()
+            if status == "failed" and stage["issues"]:
+                labels = sorted({issue["label"] for issue in stage["issues"]})
+                status_text += " · " + ", ".join(labels)
             if status == "running":
                 phases = stage["phases"]
                 if "requesting" in phases:
