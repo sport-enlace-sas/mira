@@ -308,3 +308,93 @@ def test_dashboard_job_list_includes_ocr_provenance(tmp_path) -> None:
     assert listed.ocr_version == "open-code-review dev linux/amd64"
     assert listed.ocr_duration_ms == 91
     assert listed.ocr_error == "invalid_preview"
+
+
+def test_dashboard_job_list_batches_latest_trace_summaries(tmp_path, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from mira.ai.api import get_store
+    from mira.dashboard import api
+    from mira.dashboard.routers.core import list_review_jobs
+
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    monkeypatch.setattr(api, "_app_db", db)
+    store = get_store(db)
+
+    def claim(number):
+        assert db.enqueue_review_job(
+            owner="o",
+            repo="r",
+            pr_number=number,
+            head_sha="a" * 40,
+            pr_url=f"https://github.com/o/r/pull/{number}",
+            pr_title="review",
+            installation_id=1,
+            is_private=True,
+        )
+        job = db.claim_next_review_job()
+        assert job is not None
+        return job
+
+    def trace(job, worker, status, stages):
+        return {
+            "id": f"audit:{job.id}:{now}",
+            "job_id": job.id,
+            "created_at": now,
+            "updated_at": now,
+            "attempt": job.attempts,
+            "worker": worker,
+            "status": status,
+            "stages": stages,
+        }
+
+    historical = claim(1)
+    store.save_run(trace(historical, 1, "failed", []))
+    db.finish_review_job(historical.id, error="provider outage")
+    now += 10
+    assert db.retry_review_job(historical.id)
+    retry = db.claim_next_review_job()
+    assert retry is not None and retry.attempts == historical.attempts
+
+    active = claim(2)
+    model = {"provider": "codex-cli", "model": "example", "active_attempts": 1}
+    stages = [
+        {"id": "review", "status": "running", "phases": ["waiting_for_session"], "models": [model]},
+        {"id": "security", "status": "running", "phases": ["requesting"], "models": [model]},
+    ]
+    store.save_run(trace(active, 2, "running", stages))
+    legacy = claim(3)
+    store.save_run(trace(legacy, 1, "completed", [{"status": "failed", "models": []}]))
+    db.finish_review_job(legacy.id)
+    rows = Mock(wraps=store.rows)
+    monkeypatch.setattr(store, "rows", rows)
+
+    jobs = {job.id: job for job in list_review_jobs()}
+    rows.assert_called_once()
+    assert jobs[historical.id].audit_summary is None
+    summary = jobs[active.id].audit_summary
+    assert summary is not None and summary.worker == 2
+    assert [stage.id for stage in summary.active_stages] == ["review", "security"]
+    assert summary.models[0].active_attempts == 2
+    assert len(summary.models) == 1
+    historical_summary = jobs[legacy.id].audit_summary
+    assert historical_summary is not None and historical_summary.has_stage_failures
+    assert historical_summary.result is None
+    assert list_review_jobs(limit=1)[0].id == legacy.id
+    assert list_review_jobs(limit=1, prioritize_active=True)[0].id == active.id
+
+    now += 20
+    store.save_run(
+        {
+            **trace(active, 2, "completed", []),
+            "result": {"conclusion": "findings", "files_reviewed": 3, "files_total": 5},
+        }
+    )
+    db.finish_review_job(active.id)
+    summary = next(job.audit_summary for job in list_review_jobs() if job.id == active.id)
+    assert summary is not None and summary.result is not None
+    assert summary.active_stages == []
+    assert summary.result.conclusion == "findings"
+    assert summary.result.files_total == 5

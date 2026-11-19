@@ -38,6 +38,7 @@ from mira.models import (
     PRInfo,
     ReviewChunk,
     ReviewComment,
+    ReviewResult,
     Severity,
     UnresolvedThread,
     WalkthroughConfidenceScore,
@@ -978,9 +979,14 @@ class TestReviewEngine:
     async def test_review_publishes_one_compact_report_per_sha(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 1)
+        mock_provider.post_comment.return_value = 73
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, trace=trace
+        )
 
         await engine.review_pr("https://github.com/test/repo/pull/1")
+        trace.finish("completed")
 
         posted_bodies = [call.args[1] for call in mock_provider.post_comment.call_args_list]
         updated_bodies = [call.args[2] for call in mock_provider.update_comment.call_args_list]
@@ -989,6 +995,9 @@ class TestReviewEngine:
         assert any("## Mira Audit · `aaaaaaaaaaaa`" in body for body in all_bodies)
         assert not any("mira-report:evolution" in body for body in all_bodies)
         assert not any("mira-report:impact" in body for body in all_bodies)
+        result = trace.snapshot()["result"]
+        assert result["report_url"] == "https://github.com/test/repo/pull/1#issuecomment-73"
+        assert result["report_kind"] == "walkthrough"
 
     @pytest.mark.asyncio
     async def test_walkthrough_creates_when_no_existing(
@@ -1293,6 +1302,38 @@ class TestCheckRunLifecycle:
             provider=mock_provider,
             dry_run=dry_run,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("published", [True, False])
+    async def test_audit_result_links_only_a_confirmed_check(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock, published: bool
+    ):
+        trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 2)
+        mock_provider.start_check_run.return_value = 42
+        if not published:
+            mock_provider.finish_check_run.side_effect = ProviderError("publication rejected")
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, trace=trace
+        )
+        engine._review_pr = AsyncMock(
+            return_value=ReviewResult(
+                reviewed_files=2,
+                total_paths=["src/a.py", "src/b.py", "src/c.py"],
+                walkthrough=WalkthroughResult(summary="Review complete"),
+            )
+        )
+
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+        trace.finish("completed")
+
+        assert trace.snapshot()["result"] == {
+            "conclusion": "success",
+            "files_reviewed": 2,
+            "files_total": 3,
+            "findings_count": 0,
+            "report_url": "https://github.com/test/repo/runs/42" if published else None,
+            "report_kind": "check" if published else None,
+        }
 
     @pytest.mark.asyncio
     async def test_review_pr_starts_and_completes_check_run(

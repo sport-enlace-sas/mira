@@ -75,7 +75,7 @@ const navItems = [
   {
     to: "/advisory-jobs",
     icon: ClipboardList,
-    label: "Advisory jobs",
+    label: "Revisiones de PR",
     adminOnly: true,
   },
   { to: "/repos", icon: Database, label: "Repositories" },
@@ -99,7 +99,7 @@ const settingsSubItems = [
 
 const PAGE_LABELS: Record<string, string> = {
   activity: "Activity",
-  "advisory-jobs": "Advisory jobs",
+  "advisory-jobs": "Revisiones de PR",
   repos: "Repositories",
   contributors: "Reviewers",
   packages: "Packages",

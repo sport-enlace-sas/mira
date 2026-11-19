@@ -6,7 +6,7 @@ export const reviewJobsApi = {
     fetchJson<ReviewAuditTrace | null>(`/api/review-jobs/${encodeURIComponent(jobId)}/trace`),
   listReviewJobs: (limit = 200) =>
     fetchJson<ReviewJobModel[]>(
-      `/api/review-jobs?limit=${encodeURIComponent(limit)}`
+      `/api/review-jobs?limit=${encodeURIComponent(limit)}&prioritize_active=true`
     ),
   retryReviewJob: (jobId: number) =>
     postJson<ReviewJobModel>(

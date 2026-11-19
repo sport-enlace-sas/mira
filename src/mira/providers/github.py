@@ -618,18 +618,18 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to post review: {e}") from e
 
-    async def post_comment(self, pr_info: PRInfo, body: str) -> None:
+    async def post_comment(self, pr_info: PRInfo, body: str) -> int:
         token = await self._resolve_token()
         gh = self._make_client(token)
 
         @_retry_transient
-        def _post_comment() -> None:
+        def _post_comment() -> int:
             gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             issue = gh_repo.get_issue(pr_info.number)
-            issue.create_comment(body)
+            return issue.create_comment(body).id
 
         try:
-            await asyncio.to_thread(_post_comment)
+            return await asyncio.to_thread(_post_comment)
         except ProviderError:
             raise
         except Exception as e:

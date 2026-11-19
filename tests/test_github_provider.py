@@ -577,14 +577,21 @@ class TestPostComment:
         pr_info = _make_pr_info()
 
         mock_issue = MagicMock()
+        mock_issue.create_comment.return_value.id = 73
         mock_repo = MagicMock()
         mock_repo.get_issue.return_value = mock_issue
 
         mock_gh = MagicMock()
         mock_gh.get_repo.return_value = mock_repo
 
-        with patch("mira.providers.github.Github", return_value=mock_gh):
-            await provider.post_comment(pr_info, "Hello world")
+        async def run_mocked_call(call):
+            return call()
+
+        with (
+            patch("mira.providers.github.Github", return_value=mock_gh),
+            patch("mira.providers.github.asyncio.to_thread", side_effect=run_mocked_call),
+        ):
+            assert await provider.post_comment(pr_info, "Hello world") == 73
 
         mock_repo.get_issue.assert_called_once_with(1)
         mock_issue.create_comment.assert_called_once_with("Hello world")

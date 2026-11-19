@@ -52,7 +52,7 @@ class BaseProvider(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def post_comment(self, pr_info: PRInfo, body: str) -> None:
+    async def post_comment(self, pr_info: PRInfo, body: str) -> int | None:
         """Post a top-level comment on a pull request."""
 
     @abc.abstractmethod

@@ -8,6 +8,7 @@ import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -220,6 +221,38 @@ class ActivityResponse(BaseModel):
     repos: list[str]
 
 
+class ReviewAuditResult(BaseModel):
+    conclusion: str
+    files_reviewed: int | None = None
+    files_total: int | None = None
+    findings_count: int | None = None
+    report_url: str | None = None
+    report_kind: Literal["walkthrough", "check"] | None = None
+
+
+class ReviewAuditActiveStage(BaseModel):
+    id: str
+    phases: list[str]
+
+
+class ReviewAuditModelSummary(BaseModel):
+    provider: str
+    model: str
+    active_attempts: int
+
+
+class ReviewAuditSummary(BaseModel):
+    attempt: int
+    worker: int | None
+    status: str
+    created_at: float
+    updated_at: float
+    active_stages: list[ReviewAuditActiveStage]
+    models: list[ReviewAuditModelSummary]
+    has_stage_failures: bool
+    result: ReviewAuditResult | None = None
+
+
 class ReviewJobModel(BaseModel):
     id: int
     platform: str
@@ -245,6 +278,7 @@ class ReviewJobModel(BaseModel):
     next_attempt_at: float
     created_at: float
     updated_at: float
+    audit_summary: ReviewAuditSummary | None = None
 
 
 class ReviewCommentModel(BaseModel):
