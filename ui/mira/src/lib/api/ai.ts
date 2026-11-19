@@ -66,6 +66,7 @@ export type Run = {
   status: string
   steps: Step[]
   job_id: string
+  output?: string
 }
 export type Model = {
   id: string
@@ -101,7 +102,11 @@ export type DiagnosticInput = {
   reasoning_effort?: string
   action: "connection" | "model" | "rotation" | "flow"
   faults?: Record<string, string>
+  prompt?: string
 }
+
+const credentialQuery = (credential?: string) =>
+  credential ? `?credential_id=${encodeURIComponent(credential)}` : ""
 
 export const aiApi = {
   status: () =>
@@ -119,6 +124,7 @@ export const aiApi = {
     id
       ? putJson<{ id: string }>(`/api/ai/connections/${id}`, body)
       : postJson<{ id: string }>("/api/ai/connections", body),
+  deleteConnection: (id: string) => deleteJson(`/api/ai/connections/${id}`),
   importCredential: (id: string, kind: string, secret: unknown) =>
     postJson<{ id: string }>(`/api/ai/connections/${id}/credentials`, {
       kind,
@@ -129,13 +135,15 @@ export const aiApi = {
       `/api/ai/connections/${connection}/credentials/${credential}/activate`,
       {}
     ),
-  models: (id: string) =>
+  deleteCredential: (connection: string, credential: string) =>
+    deleteJson(`/api/ai/connections/${connection}/credentials/${credential}`),
+  models: (id: string, credential?: string) =>
     fetchJson<{ models: Model[]; status: string; checked_at: number | null }>(
-      `/api/ai/connections/${id}/models`
+      `/api/ai/connections/${id}/models${credentialQuery(credential)}`
     ),
-  refreshModels: (id: string) =>
+  refreshModels: (id: string, credential?: string) =>
     postJson<{ models: Model[] }>(
-      `/api/ai/connections/${id}/models/refresh`,
+      `/api/ai/connections/${id}/models/refresh${credentialQuery(credential)}`,
       {}
     ),
   login: (id: string) => postJson<Login>(`/api/ai/connections/${id}/login`, {}),

@@ -153,12 +153,20 @@ def curated(provider: str) -> list[dict]:
     return models
 
 
-def catalog_view(store: AIStore, connection_id: str) -> dict:
+def _catalog_connection(
+    store: AIStore, connection_id: str, credential_id: str | None
+) -> tuple[dict, str]:
+    connection = store.connection(connection_id)
+    if credential_id and store.credential_metadata(credential_id)["connection_id"] != connection_id:
+        raise ValueError("La sesión no pertenece a esta conexión")
+    return connection, credential_id or connection["active_credential"]
+
+
+def catalog_view(store: AIStore, connection_id: str, credential_id: str | None = None) -> dict:
     """Keep discovery and proven access separate, including unlisted working models."""
     from mira.ai.runtime import quota_key
 
-    connection = store.connection(connection_id)
-    credential_id = connection["active_credential"]
+    connection, credential_id = _catalog_connection(store, connection_id, credential_id)
     provider = connection["provider"]
     result = store.state(
         f"catalog:{credential_id}",
@@ -206,9 +214,8 @@ def catalog_view(store: AIStore, connection_id: str) -> dict:
     return {**result, "models": list(models.values())}
 
 
-async def discover(store: AIStore, connection_id: str) -> dict:
-    connection = store.connection(connection_id)
-    credential_id = connection["active_credential"]
+async def discover(store: AIStore, connection_id: str, credential_id: str | None = None) -> dict:
+    connection, credential_id = _catalog_connection(store, connection_id, credential_id)
     if not credential_id:
         return {
             "models": curated(connection["provider"]),

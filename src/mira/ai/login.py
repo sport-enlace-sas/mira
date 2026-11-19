@@ -145,6 +145,7 @@ class LoginManager:
         process, master, slave = None, None, None
         try:
             async with self.store.session_lock("login:" + session["connection_id"]):
+                self.store.connection(session["connection_id"])
                 with tempfile.TemporaryDirectory(prefix="mira-login-") as temporary:
                     env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
                     env.update(

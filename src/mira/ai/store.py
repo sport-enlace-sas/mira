@@ -110,7 +110,7 @@ class AIStore:
                     cur.execute(statement)
 
     @contextmanager
-    def transaction(self) -> Iterator[Any]:
+    def transaction(self, *, write: bool = False) -> Iterator[Any]:
         if self.db._backend == "sqlite":
             with self._mutex:
                 # File databases need their own transaction: unrelated dashboard
@@ -123,6 +123,8 @@ class AIStore:
                 conn.execute("PRAGMA foreign_keys=ON")
                 cursor = conn.cursor()
                 try:
+                    if write:
+                        cursor.execute("BEGIN IMMEDIATE")
                     yield cursor
                     conn.commit()
                 except BaseException:
@@ -202,25 +204,105 @@ class AIStore:
         return {**json.loads(rows[0][0]), "id": connection_id, "active_credential": rows[0][1]}
 
     def save_connection(self, data: dict, actor: int, connection_id: str | None = None) -> str:
-        connection_id = connection_id or new_id()
-        action = "connection.created"
-        if self.rows("SELECT id FROM ai_connections WHERE id=?", (connection_id,)):
-            previous = self.connection(connection_id)
-            action = "connection.updated"
-            if previous["enabled"] != data["enabled"]:
-                action = "connection.enabled" if data["enabled"] else "connection.disabled"
-            if previous["provider"] != data["provider"]:
-                raise ValueError("El proveedor de una conexión existente no puede cambiar")
-            if any(previous[field] != data[field] for field in ("base_url", "region")):
-                raise ValueError(
-                    "El destino de una conexión existente no puede cambiar; crea una conexión nueva"
+        if connection_id is None:
+            connection_id = new_id()
+            self.execute(
+                "INSERT INTO ai_connections(id,data) VALUES(?,?)",
+                (connection_id, json.dumps(data)),
+            )
+            action = "connection.created"
+        else:
+            with self.transaction(write=True) as cur:
+                previous, _ = self._lock_connection(cur, connection_id)
+                action = "connection.updated"
+                if previous["enabled"] != data["enabled"]:
+                    action = "connection.enabled" if data["enabled"] else "connection.disabled"
+                if previous["provider"] != data["provider"]:
+                    raise ValueError("El proveedor de una conexión existente no puede cambiar")
+                if any(previous[field] != data[field] for field in ("base_url", "region")):
+                    raise ValueError(
+                        "El destino de una conexión existente no puede cambiar; crea una conexión nueva"
+                    )
+                cur.execute(
+                    self.sql("UPDATE ai_connections SET data=? WHERE id=?"),
+                    (json.dumps(data), connection_id),
                 )
-        self.execute(
-            "INSERT INTO ai_connections(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-            (connection_id, json.dumps(data)),
-        )
         self.audit(actor, action, connection_id)
         return connection_id
+
+    def _lock_connection(self, cur: Any, connection_id: str) -> tuple[dict, str]:
+        query = "SELECT data,active_credential FROM ai_connections WHERE id=?"
+        if self.db._backend != "sqlite":
+            query += " FOR UPDATE"
+        cur.execute(self.sql(query), (connection_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("Conexión inexistente")
+        return json.loads(row[0]), row[1]
+
+    def _require_unused_connection(self, cur: Any, connection_id: str) -> None:
+        # Keep published versions usable. Older versions remain in history.
+        cur.execute(
+            "SELECT v.data FROM ai_flows f JOIN ai_flow_versions v "
+            "ON f.id=v.flow_id AND f.version=v.version"
+        )
+        if any(
+            node["connection_id"] == connection_id
+            for (data,) in cur.fetchall()
+            for node in json.loads(data)["nodes"]
+        ):
+            raise ConflictError(
+                "Esta conexión pertenece a un flujo publicado. Cambia la conexión del flujo "
+                "o activa otra sesión antes de eliminar la sesión activa."
+            )
+
+    def delete_credential(self, connection_id: str, credential_id: str, actor: int) -> None:
+        with self.transaction(write=True) as cur:
+            _, active = self._lock_connection(cur, connection_id)
+            cur.execute(
+                self.sql("SELECT id FROM ai_credentials WHERE id=? AND connection_id=?"),
+                (credential_id, connection_id),
+            )
+            if cur.fetchone() is None:
+                raise ValueError("La sesión no pertenece a esta conexión")
+            if active == credential_id:
+                self._require_unused_connection(cur, connection_id)
+                cur.execute(
+                    self.sql("UPDATE ai_connections SET active_credential='' WHERE id=?"),
+                    (connection_id,),
+                )
+            cur.execute(
+                self.sql("DELETE FROM ai_session_aliases WHERE credential_id=?"), (credential_id,)
+            )
+            cur.execute(
+                self.sql("DELETE FROM ai_state WHERE id=? OR id LIKE ? OR id LIKE ?"),
+                (
+                    f"catalog:{credential_id}",
+                    f"access:{credential_id}:%",
+                    f"quota:{credential_id}:%",
+                ),
+            )
+            cur.execute(self.sql("DELETE FROM ai_credentials WHERE id=?"), (credential_id,))
+            cur.execute(
+                self.sql("INSERT INTO ai_audit VALUES(?,?,?,?,?)"),
+                (new_id(), time.time(), actor, "credential.deleted", credential_id),
+            )
+
+    def delete_connection(self, connection_id: str, actor: int) -> None:
+        with self.transaction(write=True) as cur:
+            self._lock_connection(cur, connection_id)
+            cur.execute(
+                self.sql("SELECT 1 FROM ai_credentials WHERE connection_id=? LIMIT 1"),
+                (connection_id,),
+            )
+            if cur.fetchone():
+                raise ConflictError("Elimina las sesiones de esta conexión antes de borrarla")
+            self._require_unused_connection(cur, connection_id)
+            cur.execute(self.sql("DELETE FROM ai_connections WHERE id=?"), (connection_id,))
+            cur.execute(
+                self.sql("INSERT INTO ai_audit VALUES(?,?,?,?,?)"),
+                (new_id(), time.time(), actor, "connection.deleted", connection_id),
+            )
 
     def credentials(self, connection_id: str) -> list[dict]:
         # Explicit projection excludes ciphertext.
@@ -265,10 +347,10 @@ class AIStore:
         return {**json.loads(rows[0][0]), "id": flow_id, "version": version}
 
     def publish(self, flow: FlowInput, actor: int, flow_id: str | None = None) -> str:
-        for node in flow.nodes:
-            self.connection(node.connection_id)
         flow_id = flow_id or new_id()
-        with self.transaction() as cur:
+        with self.transaction(write=True) as cur:
+            for connection_id in sorted({node.connection_id for node in flow.nodes}):
+                self._lock_connection(cur, connection_id)
             if flow.expected_version == 0:
                 cur.execute(
                     self.sql("INSERT INTO ai_flows VALUES(?,?,0) ON CONFLICT(id) DO NOTHING"),
@@ -464,7 +546,6 @@ class Vault:
         return secret, rows[0][1]
 
     def stage(self, connection_id: str, kind: str, secret: dict | str, actor: int) -> str:
-        self.store.connection(connection_id)
         from mira.ai.credentials import normalize_secret
 
         data = normalize_secret(self.store.connection(connection_id)["provider"], kind, secret)
@@ -480,7 +561,8 @@ class Vault:
             "expires_at": reported_expiry(data),
         }
         alias = self._session_alias(data)
-        with self.store.transaction() as cur:
+        with self.store.transaction(write=True) as cur:
+            self.store._lock_connection(cur, connection_id)
             cur.execute(
                 self.store.sql("INSERT INTO ai_credentials VALUES(?,?,1,?,?)"),
                 (credential_id, connection_id, ciphertext, json.dumps(metadata)),

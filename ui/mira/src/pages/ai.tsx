@@ -1,12 +1,8 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Link, useSearchParams } from "react-router"
 import {
-  ArrowRight,
   Check,
-  CheckCircle2,
   ChevronDown,
-  CircleAlert,
-  Clock3,
   Database,
   ExternalLink,
   FlaskConical,
@@ -18,7 +14,7 @@ import {
   ShieldCheck,
   Sparkles,
   TerminalSquare,
-  Unplug,
+  Trash2,
 } from "lucide-react"
 import {
   Background,
@@ -38,10 +34,12 @@ import "@xyflow/react/dist/style.css"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { Input } from "@/components/ui/input"
 import {
   aiApi,
   type Connection,
+  type Credential,
   type Diagnostic,
   type DiagnosticInput,
   type Flow,
@@ -239,41 +237,51 @@ const successTone =
   "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
 const pendingTone =
   "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-const preferredCredential = (connection: Connection) =>
-  connection.active_credential ||
-  [...connection.credentials].sort(
-    (a, b) => (b.created_at || 0) - (a.created_at || 0)
-  )[0]?.id ||
-  ""
 
-function ConnectionCard({
-  connection,
-  canManage,
-  canTest,
-  reload,
-  perform,
-  diagnostic,
-  testing,
-  onViewResult,
-}: {
+const credentialKind: Record<string, string> = {
+  session: "Sesión",
+  api_key: "Clave API",
+  oauth_token: "Token OAuth",
+  aws: "Credencial AWS",
+}
+
+function friendlyError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  try {
+    const detail = JSON.parse(message.replace(/^API error \d+: /, "")).detail
+    if (typeof detail === "string") return detail
+  } catch {
+    return message
+  }
+  return message
+}
+
+type ConnectionControls = {
   connection: Connection
   canManage: boolean
   canTest: boolean
   reload: () => Promise<void>
   perform: (input: DiagnosticInput) => Promise<void>
-  diagnostic: Diagnostic | null
   testing: boolean
-  onViewResult: () => void
-}) {
-  const native = ["claude-cli", "codex-cli"].includes(connection.provider)
-  const providerName = providerNames[connection.provider] || connection.provider
-  const [kind, setKind] = useState(
-    connection.provider === "bedrock" ? "aws" : native ? "session" : "api_key"
-  )
-  const [secret, setSecret] = useState("")
-  const [credential, setCredential] = useState(() =>
-    preferredCredential(connection)
-  )
+  now: number
+}
+
+function SessionCard({
+  connection,
+  session,
+  canManage,
+  canTest,
+  reload,
+  perform,
+  testing,
+  now,
+  diagnostic,
+}: ConnectionControls & { session: Credential; diagnostic?: Diagnostic }) {
+  const [expanded, setExpanded] = useState(false)
+  const [confirm, setConfirm] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+  const [models, setModels] = useState<Model[]>([])
   const [model, setModel] = useState(
     connection.provider === "codex-cli"
       ? "gpt-6.1-sol"
@@ -284,50 +292,415 @@ function ConnectionCard({
   const [effort, setEffort] = useState(
     connection.provider === "codex-cli" ? "max" : "off"
   )
-  const [models, setModels] = useState<Model[]>([])
+  const [prompt, setPrompt] = useState("")
+  const active = session.id === connection.active_credential
+  const expired = !!session.expires_at && session.expires_at <= now
+  const providerName = providerNames[connection.provider] || connection.provider
+  const label = credentialKind[session.kind] || "Sesión"
+  const reference = session.id.slice(0, 8)
+  const running = diagnostic?.status === "running"
+  const disabled = busy || testing
+  const canProbe = canTest && connection.enabled && !!model.trim() && !disabled
+
+  useEffect(() => {
+    if (!expanded) return
+    let stale = false
+    void aiApi
+      .models(connection.id, session.id)
+      .then((catalog) => {
+        if (!stale) setModels(catalog.models)
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [connection.id, session.id, expanded, diagnostic?.status])
+
+  const action = async (fn: () => Promise<void>) => {
+    setError("")
+    setBusy(true)
+    try {
+      await fn()
+    } catch (failure) {
+      setError(friendlyError(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const probe = (action: "model" | "rotation", message?: string) =>
+    perform({
+      action,
+      mode: "real",
+      connection_id: connection.id,
+      credential_id: session.id,
+      model: model.trim(),
+      reasoning_effort: effort,
+      prompt: message,
+    })
+
+  return (
+    <article className="relative min-w-0 overflow-hidden rounded-xl border border-border bg-card shadow-xs">
+      <details
+        className="group/session"
+        onToggle={(event) => setExpanded(event.currentTarget.open)}
+      >
+        <summary className="flex min-h-20 cursor-pointer list-none items-center gap-3 p-3 pr-16 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring sm:p-4 sm:pr-17 [&::-webkit-details-marker]:hidden">
+          <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open/session:rotate-180 motion-reduce:transition-none" />
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="font-medium">
+                {label} de {providerName}
+              </span>
+              <span className="rounded border bg-muted/40 px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+                {reference}
+              </span>
+              {active && (
+                <Badge
+                  variant="outline"
+                  className={connection.enabled ? successTone : ""}
+                >
+                  {connection.enabled ? "En uso" : "Seleccionada"}
+                </Badge>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {session.renewable
+                ? "Renovación automática"
+                : "Renovación manual"}
+              {" · "}
+              {session.checked_at
+                ? `Probada el ${date(session.checked_at)}`
+                : "Pendiente de prueba"}
+            </p>
+          </div>
+          <Badge
+            variant="outline"
+            className={
+              session.status === "ready" && (!expired || session.renewable)
+                ? successTone
+                : pendingTone
+            }
+          >
+            {expired && !session.renewable
+              ? "Vencida"
+              : statusLabel[session.status] || session.status}
+          </Badge>
+        </summary>
+        <div className="space-y-4 border-t bg-background/40 p-4 sm:p-5">
+          <dl className="grid grid-cols-2 gap-3 rounded-lg border bg-muted/20 p-3 text-xs sm:grid-cols-3">
+            <div>
+              <dt className="text-muted-foreground">Guardada</dt>
+              <dd className="mt-1">{date(session.created_at)}</dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">Vigencia informada</dt>
+              <dd className="mt-1">
+                {session.expires_at ? date(session.expires_at) : "Sin fecha"}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">Revisión</dt>
+              <dd className="mt-1 tabular-nums">{session.revision}</dd>
+            </div>
+          </dl>
+          <div className="space-y-3 rounded-lg border bg-background p-3 sm:p-4">
+            <h4 className="flex items-center gap-2 text-sm font-semibold">
+              <FlaskConical className="size-4 text-muted-foreground" />
+              Probar esta sesión
+            </h4>
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+              <div className="space-y-1.5">
+                <Label htmlFor={`model-${session.id}`}>Modelo</Label>
+                <Input
+                  id={`model-${session.id}`}
+                  list={`models-${session.id}`}
+                  value={model}
+                  placeholder="Selecciona o escribe un modelo"
+                  disabled={disabled}
+                  onChange={(event) => setModel(event.target.value)}
+                />
+                <datalist id={`models-${session.id}`}>
+                  {models.map((entry) => (
+                    <option key={entry.id} value={entry.id}>
+                      {entry.name}
+                    </option>
+                  ))}
+                </datalist>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor={`effort-${session.id}`}>Razonamiento</Label>
+                <select
+                  id={`effort-${session.id}`}
+                  className={selectClass}
+                  value={effort}
+                  disabled={disabled}
+                  onChange={(event) => setEffort(event.target.value)}
+                >
+                  {efforts.map((level) => (
+                    <option key={level} value={level}>
+                      {effortNames[level]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                disabled={!canProbe}
+                onClick={() => void action(() => probe("model"))}
+              >
+                {running ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <FlaskConical className="size-4" />
+                )}
+                Probar modelo
+              </Button>
+              {!active && canManage && (
+                <Button
+                  disabled={!canProbe}
+                  onClick={() => void action(() => probe("rotation"))}
+                >
+                  <ShieldCheck className="size-4" /> Probar y activar
+                </Button>
+              )}
+              {!connection.enabled && (
+                <span className="self-center text-xs text-muted-foreground">
+                  Habilita la conexión para probar.
+                </span>
+              )}
+            </div>
+            <details className="group/prompt rounded-lg border">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-2 p-3 text-sm font-medium focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+                Mensaje de prueba
+                <ChevronDown className="size-4 transition-transform group-open/prompt:rotate-180 motion-reduce:transition-none" />
+              </summary>
+              <div className="space-y-2 border-t p-3">
+                <Label htmlFor={`prompt-${session.id}`}>
+                  Mensaje para el modelo
+                </Label>
+                <textarea
+                  id={`prompt-${session.id}`}
+                  value={prompt}
+                  maxLength={1000}
+                  disabled={disabled}
+                  onChange={(event) => setPrompt(event.target.value)}
+                  className="min-h-20 w-full rounded-md border border-input bg-background p-2.5 text-sm focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
+                  placeholder="Escribe un mensaje corto"
+                />
+                <Button
+                  variant="outline"
+                  disabled={!canProbe || !prompt.trim()}
+                  onClick={() =>
+                    void action(() => probe("model", prompt.trim()))
+                  }
+                >
+                  Enviar mensaje
+                </Button>
+              </div>
+            </details>
+            <p className="text-xs text-muted-foreground">
+              Las pruebas hacen solicitudes reales y consumen cuota.
+            </p>
+          </div>
+          {diagnostic && (
+            <div
+              className="space-y-2 rounded-lg border bg-background p-3"
+              aria-live="polite"
+            >
+              {running ? (
+                <div className="flex flex-wrap items-center gap-3">
+                  <p className="flex items-center gap-2 text-sm">
+                    <Loader2 className="size-4 animate-spin" /> Prueba en curso
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() =>
+                      void action(() => aiApi.cancelDiagnostic(diagnostic.id))
+                    }
+                  >
+                    Cancelar prueba
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm font-medium">
+                    {statusLabel[diagnostic.status] || diagnostic.status}
+                  </p>
+                  {diagnostic.error && (
+                    <p className="text-sm text-destructive">
+                      {diagnostic.error}
+                    </p>
+                  )}
+                  {diagnostic.result?.output && (
+                    <pre className="max-h-56 overflow-auto rounded-lg border bg-muted/30 p-3 font-mono text-xs wrap-anywhere whitespace-pre-wrap">
+                      {diagnostic.result.output}
+                    </pre>
+                  )}
+                  {diagnostic.result && (
+                    <details className="rounded-lg border">
+                      <summary className="cursor-pointer p-3 text-sm font-medium">
+                        Ver recorrido
+                      </summary>
+                      <div className="border-t p-2 sm:p-3">
+                        <RunTrace run={diagnostic.result} />
+                      </div>
+                    </details>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+          <details className="group/catalog rounded-lg border bg-background">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-2 p-3 text-sm font-medium focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+              <span>
+                Modelos y comprobaciones{" "}
+                <span className="text-xs text-muted-foreground">
+                  ({models.length})
+                </span>
+              </span>
+              <ChevronDown className="size-4 text-muted-foreground transition-transform group-open/catalog:rotate-180 motion-reduce:transition-none" />
+            </summary>
+            <div className="space-y-3 border-t p-3">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!canTest || disabled || !connection.enabled}
+                onClick={() =>
+                  void action(async () => {
+                    const catalog = await aiApi.refreshModels(
+                      connection.id,
+                      session.id
+                    )
+                    setModels(catalog.models)
+                  })
+                }
+              >
+                <RefreshCw className="size-3.5" /> Actualizar catálogo
+              </Button>
+              {models.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  Puedes escribir el identificador del modelo para probarlo.
+                </p>
+              )}
+              <div className="max-h-72 divide-y overflow-auto rounded-lg border empty:hidden">
+                {models.map((entry) => (
+                  <div key={entry.id} className="space-y-1 p-3 text-xs">
+                    <p className="font-mono break-all">{entry.id}</p>
+                    {Object.entries(entry.access || {}).map(
+                      ([level, access]) => (
+                        <p key={level} className="text-muted-foreground">
+                          {effortNames[level] || level} ·{" "}
+                          {statusLabel[access.status || ""] || access.status} ·{" "}
+                          {date(access.checked_at)}
+                        </p>
+                      )
+                    )}
+                    {entry.quota?.until && entry.quota.until > now && (
+                      <p className="text-muted-foreground">
+                        Próximo intento desde {date(entry.quota.until)}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </details>
+        </div>
+      </details>
+      {canManage && (
+        <Button
+          type="button"
+          size="icon"
+          variant="outline"
+          aria-label={`Eliminar ${label.toLowerCase()} de ${providerName} ${reference}`}
+          title="Eliminar sesión"
+          disabled={busy || running}
+          className="absolute top-4 right-3 size-10 text-destructive hover:text-destructive"
+          onClick={() => {
+            setError("")
+            setConfirm(true)
+          }}
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      )}
+      {error && (
+        <p
+          role="alert"
+          className="border-t bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={(open) => {
+          if (!busy) setConfirm(open)
+        }}
+        destructive
+        loading={busy}
+        title="¿Eliminar esta sesión?"
+        description={`La sesión ${reference} de ${providerName} se eliminará de MIRA. Los informes anteriores seguirán disponibles.${active ? " Si la conexión está en un flujo publicado, activa otra sesión primero." : ""}`}
+        confirmLabel="Eliminar sesión"
+        cancelLabel="Cancelar"
+        onConfirm={() =>
+          void action(async () => {
+            setConfirm(false)
+            await aiApi.deleteCredential(connection.id, session.id)
+            await reload()
+          })
+        }
+      />
+    </article>
+  )
+}
+
+function ConnectionCard({
+  connection,
+  canManage,
+  canTest,
+  reload,
+  perform,
+  testing,
+  now,
+  diagnostics,
+}: ConnectionControls & { diagnostics: Record<string, Diagnostic> }) {
+  const native = ["claude-cli", "codex-cli"].includes(connection.provider)
+  const providerName = providerNames[connection.provider] || connection.provider
+  const [kind, setKind] = useState(
+    connection.provider === "bedrock" ? "aws" : native ? "session" : "api_key"
+  )
+  const [secret, setSecret] = useState("")
   const [login, setLogin] = useState<Login | null>(null)
   const [code, setCode] = useState("")
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
-  const [now, setNow] = useState(() => Date.now() / 1000)
-  const active = connection.credentials.find(
-    (c) => c.id === connection.active_credential
-  )
-  const selected = connection.credentials.find((c) => c.id === credential)
-  const operational = connection.enabled && active?.status === "ready"
-  const candidate = !!selected && selected.id !== connection.active_credential
+  const [adding, setAdding] = useState(connection.credentials.length === 0)
+  const [confirm, setConfirm] = useState(false)
   const loginPending = login?.status === "pending" && login.expires_at > now
   const disabled = busy || testing
-  const title = !connection.enabled
-    ? "Desactivada"
-    : operational
-      ? "Activa y comprobada"
-      : active?.status === "auth_blocked"
-        ? "Necesita reconexión"
-        : connection.credentials.length
-          ? "Pendiente de activar"
-          : "Sin conectar"
+  const sessions = [...connection.credentials].sort(
+    (a, b) =>
+      Number(b.id === connection.active_credential) -
+        Number(a.id === connection.active_credential) ||
+      (b.created_at || 0) - (a.created_at || 0)
+  )
+
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now() / 1000), 30000)
-    return () => clearInterval(timer)
-  }, [])
-  useEffect(() => {
-    if (canManage)
+    if (canManage && native) {
       void aiApi
         .resumeLogin(connection.id)
         .then((value) => {
           setLogin(value)
-          if (value?.status === "connected" && value.credential_id)
-            setCredential(value.credential_id)
+          if (value?.status === "pending") setAdding(true)
         })
         .catch(() => {})
-  }, [connection.id, canManage])
-  useEffect(() => {
-    void aiApi
-      .models(connection.id)
-      .then((data) => setModels(data.models))
-      .catch(() => {})
-  }, [connection.id, connection.active_credential, diagnostic?.status])
+    }
+  }, [connection.id, canManage, native])
   useEffect(() => {
     if (!login || login.status !== "pending") return
     const timer = setInterval(() => {
@@ -336,556 +709,77 @@ function ConnectionCard({
         .then(async (value) => {
           setLogin(value)
           if (value.status === "connected") {
-            setCredential(value.credential_id || "")
+            setAdding(false)
             await reload()
           }
         })
-        .catch((e) => setError(String(e)))
+        .catch((failure) => setError(friendlyError(failure)))
     }, 1500)
     return () => clearInterval(timer)
   }, [login, reload])
+
   const action = async (fn: () => Promise<unknown>) => {
-    setBusy(true)
     setError("")
+    setBusy(true)
     try {
       await fn()
-    } catch (e) {
-      setError(String(e))
+    } catch (failure) {
+      setError(friendlyError(failure))
     } finally {
       setBusy(false)
     }
   }
-  const probe = (rotation = false) =>
-    perform({
-      mode: "real",
-      action: rotation ? "rotation" : "model",
-      connection_id: connection.id,
-      credential_id: credential || undefined,
-      model,
-      reasoning_effort: effort,
-    })
-  const orderedCredentials = [...connection.credentials].sort(
-    (a, b) => (b.created_at || 0) - (a.created_at || 0)
-  )
-  const lastStep = diagnostic?.result?.steps.at(-1)
+  const save = async () => {
+    let value: unknown = secret.trim()
+    if (["session", "aws"].includes(kind)) {
+      try {
+        value = JSON.parse(secret)
+      } catch {
+        throw new Error("El archivo debe contener JSON válido.")
+      }
+    }
+    await aiApi.importCredential(connection.id, kind, value)
+    setSecret("")
+    setAdding(false)
+    await reload()
+  }
+
   return (
-    <Card className="h-fit overflow-hidden rounded-2xl border-border/80">
-      <CardHeader className="gap-4 border-b bg-muted/20 pb-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div
-              className={`flex size-11 items-center justify-center rounded-xl ${connection.provider === "claude-cli" ? "bg-orange-500/10 text-orange-600 dark:text-orange-300" : "bg-primary/10 text-primary"}`}
-            >
-              {connection.provider === "codex-cli" ? (
-                <TerminalSquare className="size-5" />
-              ) : (
-                <Sparkles className="size-5" />
-              )}
-            </div>
-            <div>
-              <CardTitle className="text-lg">{providerName}</CardTitle>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {connection.name}
-              </p>
-            </div>
-          </div>
-          <Badge
-            className={operational ? successTone : pendingTone}
-            variant="outline"
-          >
-            {operational ? (
-              <CheckCircle2 className="mr-1 size-3.5" />
-            ) : (
-              <CircleAlert className="mr-1 size-3.5" />
-            )}
-            {title}
-          </Badge>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          {operational
-            ? "Esta cuenta ya se puede usar en tus flujos de IA."
-            : connection.credentials.length
-              ? "La sesión está guardada. Prueba y activa la credencial para empezar a usarla."
-              : "Conecta una cuenta y comprueba que responde antes de usarla en un flujo."}
-        </p>
-        {active && (
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span className="inline-flex items-center gap-1.5">
-              <ShieldCheck className="size-3.5" />
-              {active.renewable
-                ? "Sesión con renovación automática"
-                : "Reemplazo manual"}
-            </span>
-            <span className="inline-flex items-center gap-1.5">
-              <Clock3 className="size-3.5" />
-              Última prueba: {date(active.checked_at)}
-            </span>
-          </div>
-        )}
-      </CardHeader>
-      <CardContent className="space-y-5 pt-5">
-        {loginPending && login && (
+    <section className="min-w-0 space-y-3 rounded-2xl border bg-muted/15 p-3 sm:p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3 px-1 py-1">
+        <div className="flex min-w-0 items-center gap-3">
           <div
-            className="space-y-3 rounded-xl border border-primary/20 bg-primary/5 p-4"
-            role="status"
+            className={`flex size-10 shrink-0 items-center justify-center rounded-lg border ${connection.provider === "claude-cli" ? "border-orange-500/20 bg-orange-500/10 text-orange-700 dark:text-orange-300" : "bg-muted text-foreground"}`}
           >
-            <p className="font-medium">Autoriza tu cuenta de {providerName}</p>
-            <p className="text-sm text-muted-foreground">
-              Abre el acceso oficial y completa la verificación. MIRA guardará
-              su propia sesión al terminar.
+            {connection.provider === "codex-cli" ? (
+              <TerminalSquare className="size-4" />
+            ) : (
+              <KeyRound className="size-4" />
+            )}
+          </div>
+          <div className="min-w-0">
+            <h3 className="font-semibold wrap-anywhere">{connection.name}</h3>
+            <p className="text-xs text-muted-foreground">
+              {providerName} · {sessions.length}{" "}
+              {sessions.length === 1 ? "sesión" : "sesiones"}
+              {!connection.enabled && " · desactivada"}
             </p>
-            {login.url ? (
-              <Button asChild className="w-full">
-                <a href={login.url} target="_blank" rel="noreferrer">
-                  Abrir acceso oficial
-                  <ExternalLink className="ml-2 size-4" />
-                </a>
-              </Button>
-            ) : (
-              <p className="flex items-center gap-2 text-sm">
-                <Loader2 className="size-4 animate-spin" />
-                Preparando el enlace…
-              </p>
-            )}
-            {login.user_code && (
-              <div className="rounded-lg border bg-background p-3">
-                <p className="mb-1 text-xs text-muted-foreground">
-                  Introduce este código en la página de Codex
-                </p>
-                <code className="text-xl font-semibold tracking-widest">
-                  {login.user_code}
-                </code>
-              </div>
-            )}
-            {connection.provider === "claude-cli" && (
-              <div className="space-y-2">
-                <Label htmlFor={`login-code-${connection.id}`}>
-                  Si Claude muestra un código, pégalo aquí
-                </Label>
-                <div className="flex gap-2">
-                  <Input
-                    id={`login-code-${connection.id}`}
-                    type="password"
-                    autoComplete="off"
-                    placeholder="Código de autorización"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value)}
-                  />
-                  <Button
-                    disabled={!code || busy}
-                    onClick={() =>
-                      void action(async () => {
-                        await aiApi.loginCode(login.id, code)
-                        setCode("")
-                      })
-                    }
-                  >
-                    Enviar
-                  </Button>
-                </div>
-              </div>
-            )}
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-              <span>
-                El acceso vence a las{" "}
-                {new Date(login.expires_at * 1000).toLocaleTimeString()}
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() =>
-                  void action(async () => {
-                    await aiApi.cancelLogin(login.id)
-                    setLogin(null)
-                  })
-                }
-              >
-                Cancelar conexión
-              </Button>
-            </div>
           </div>
-        )}
-        {login?.status === "connected" && candidate && (
-          <div
-            className={`flex gap-2 rounded-lg border p-3 text-sm ${successTone}`}
-            role="status"
-          >
-            <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
-            <span>
-              Cuenta autorizada. Elige un modelo y pulsa <b>Probar y activar</b>{" "}
-              para terminar.
-            </span>
-          </div>
-        )}
-        {login &&
-          !loginPending &&
-          ["pending", "failed"].includes(login.status) && (
-            <div
-              className={`rounded-lg border p-3 text-sm ${pendingTone}`}
-              role="status"
-            >
-              El acceso no se completó o ha caducado. Pulsa Conectar cuenta para
-              intentarlo de nuevo.
-            </div>
-          )}
-        <div className="space-y-4">
-          <div className="flex items-center gap-2">
-            <FlaskConical className="size-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">Comprobar modelo</h3>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor={`credential-${connection.id}`}>
-              Credencial para la prueba
-            </Label>
-            <select
-              id={`credential-${connection.id}`}
-              className={selectClass}
-              value={credential}
-              disabled={disabled}
-              onChange={(e) => setCredential(e.target.value)}
-            >
-              <option value="">Selecciona una credencial</option>
-              {orderedCredentials.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.id === connection.active_credential
-                    ? "Activa"
-                    : "Guardada · sin activar"}{" "}
-                  · {c.renewable ? "sesión renovable" : "credencial manual"} ·{" "}
-                  {date(c.created_at)} · {c.id.slice(0, 6)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_145px]">
-            <div className="min-w-0 space-y-1.5">
-              <Label htmlFor={`model-${connection.id}`}>Modelo</Label>
-              <Input
-                id={`model-${connection.id}`}
-                list={`models-${connection.id}`}
-                disabled={disabled}
-                value={model}
-                placeholder="Selecciona o escribe un modelo"
-                onChange={(e) => setModel(e.target.value)}
-              />
-              <datalist id={`models-${connection.id}`}>
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-              </datalist>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor={`effort-${connection.id}`}>Razonamiento</Label>
-              <select
-                id={`effort-${connection.id}`}
-                className={selectClass}
-                value={effort}
-                disabled={disabled}
-                onChange={(e) => setEffort(e.target.value)}
-              >
-                {efforts.map((e) => (
-                  <option key={e} value={e}>
-                    {effortNames[e]}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+        </div>
+        {canManage && (
           <div className="flex flex-wrap gap-2">
-            <Button
-              disabled={
-                !canTest ||
-                !credential ||
-                !model ||
-                disabled ||
-                (candidate && !canManage)
-              }
-              onClick={() => void action(() => probe(candidate))}
-            >
-              {testing && diagnostic?.status === "running" ? (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              ) : candidate ? (
-                <ShieldCheck className="mr-2 size-4" />
-              ) : (
-                <FlaskConical className="mr-2 size-4" />
-              )}
-              {candidate ? "Probar y activar" : "Probar modelo"}
-            </Button>
-            {candidate && (
-              <Button
-                variant="outline"
-                disabled={!canTest || !credential || !model || disabled}
-                onClick={() => void action(() => probe())}
-              >
-                Solo probar
-              </Button>
-            )}
-            {native && (
-              <Button
-                variant="outline"
-                disabled={!canManage || disabled || loginPending}
-                onClick={() =>
-                  void action(async () =>
-                    setLogin(await aiApi.login(connection.id))
-                  )
-                }
-              >
-                <KeyRound className="mr-2 size-4" />
-                {active ? "Cambiar cuenta" : "Conectar cuenta"}
-              </Button>
-            )}
-          </div>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {candidate
-              ? "Probar y activar hace una solicitud real y solo cambia la credencial si responde correctamente. Solo probar no la activa."
-              : "La prueba hace una solicitud real y consume uso del proveedor. La cuenta y el modelo se comprueban por separado."}
-          </p>
-        </div>
-        {diagnostic && (
-          <div
-            className={`space-y-2 rounded-xl border p-3 text-sm ${diagnostic.status === "success" ? successTone : diagnostic.status === "running" ? "bg-muted/30" : pendingTone}`}
-            role="status"
-          >
-            <p className="flex items-center gap-2 font-medium">
-              {diagnostic.status === "running" ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : diagnostic.status === "success" ? (
-                <CheckCircle2 className="size-4" />
-              ) : (
-                <CircleAlert className="size-4" />
-              )}
-              {diagnostic.status === "running"
-                ? "Probando la conexión…"
-                : diagnostic.status === "success"
-                  ? "El modelo respondió correctamente"
-                  : diagnostic.status === "cancelled"
-                    ? "Prueba cancelada"
-                    : "La prueba no se completó"}
-            </p>
-            {lastStep && (
-              <p className="text-xs">
-                {lastStep.model} · {lastStep.reasoning_effort} ·{" "}
-                {(lastStep.duration_ms / 1000).toFixed(1)} s
-                {lastStep.cause ? ` · ${lastStep.action}` : ""}
-              </p>
-            )}
-            {diagnostic.error && <p>{diagnostic.error}</p>}
-            <div className="flex gap-2">
-              <Button size="sm" variant="ghost" onClick={onViewResult}>
-                Ver recorrido
-                <ArrowRight className="ml-1 size-3.5" />
-              </Button>
-              {diagnostic.status === "running" && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() =>
-                    void action(() => aiApi.cancelDiagnostic(diagnostic.id))
-                  }
-                >
-                  Cancelar prueba
-                </Button>
-              )}
-            </div>
-          </div>
-        )}
-        <details className="group rounded-xl border">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 p-3 text-sm font-medium">
-            <span>
-              Modelos y comprobaciones{" "}
-              <span className="ml-1 text-xs text-muted-foreground">
-                {models.length}
-              </span>
-            </span>
-            <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
-          </summary>
-          <div className="space-y-3 border-t p-3">
             <Button
               size="sm"
               variant="outline"
-              disabled={!canTest || disabled}
-              onClick={() =>
-                void action(async () => {
-                  await aiApi.refreshModels(connection.id)
-                  const data = await aiApi.models(connection.id)
-                  setModels(data.models)
-                })
-              }
+              aria-expanded={adding}
+              onClick={() => setAdding((value) => !value)}
             >
-              <RefreshCw
-                className={`mr-2 size-3.5 ${busy ? "animate-spin" : ""}`}
-              />
-              Actualizar catálogo
+              <Plus className="size-4" /> {adding ? "Cerrar" : "Añadir sesión"}
             </Button>
-            <p className="text-xs text-muted-foreground">
-              Catálogo de la credencial activa. Un modelo listado todavía puede
-              necesitar una prueba. Los modelos que ya respondieron se conservan
-              aunque el cliente no los liste.
-            </p>
-            <div className="max-h-72 space-y-2 overflow-auto">
-              {models.map((m) => {
-                const checks = Object.entries(m.access || {}).filter(
-                  ([, a]) => a.status
-                )
-                return (
-                  <div
-                    key={m.id}
-                    className="space-y-1 rounded-lg bg-muted/30 p-2.5"
-                  >
-                    <p className="text-xs font-medium break-all">{m.id}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {m.status === "listed"
-                        ? "Listado por el proveedor"
-                        : "Sin listado del proveedor"}
-                      {checks.length === 0 ? " · Sin probar" : ""}
-                    </p>
-                    {checks.map(([level, access]) => (
-                      <p
-                        key={level}
-                        className={`text-xs ${access.status === "verified" ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300"}`}
-                      >
-                        {effortNames[level] || level}:{" "}
-                        {access.status === "quota"
-                          ? "Última prueba con cuota agotada"
-                          : statusLabel[access.status!] || access.status}{" "}
-                        · {date(access.checked_at)}
-                      </p>
-                    ))}
-                    {m.quota?.until && m.quota.until > now ? (
-                      <p className="text-xs text-muted-foreground">
-                        Próximo intento desde {date(m.quota.until)}
-                      </p>
-                    ) : null}
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        </details>
-        <details className="group rounded-xl border">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 p-3 text-sm font-medium">
-            <span>Credenciales y opciones avanzadas</span>
-            <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
-          </summary>
-          <div className="space-y-4 border-t p-3">
-            <div className="space-y-2">
-              {orderedCredentials.map((c) => (
-                <div
-                  key={c.id}
-                  className="rounded-lg bg-muted/30 p-2.5 text-xs"
-                >
-                  <p className="font-medium">
-                    {c.id === connection.active_credential
-                      ? "Credencial activa"
-                      : "Credencial guardada"}{" "}
-                    · {statusLabel[c.status] || c.status}
-                  </p>
-                  <p className="mt-1 text-muted-foreground">
-                    {c.id.slice(0, 8)} · revisión {c.revision} · comprobación:{" "}
-                    {date(c.checked_at)}
-                  </p>
-                  {c.expires_at && (
-                    <p className="mt-1 text-muted-foreground">
-                      Vigencia informada: {date(c.expires_at)}
-                      {c.renewable ? " · renovable automáticamente" : ""}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-            {canManage && (
-              <details open={!native && connection.credentials.length === 0}>
-                <summary className="cursor-pointer text-sm font-medium">
-                  Importar API key o archivo de sesión
-                </summary>
-                <div className="mt-3 space-y-3">
-                  <Label htmlFor={`kind-${connection.id}`}>
-                    Tipo de credencial
-                  </Label>
-                  <select
-                    id={`kind-${connection.id}`}
-                    className={selectClass}
-                    value={kind}
-                    onChange={(e) => {
-                      setKind(e.target.value)
-                      setSecret("")
-                    }}
-                  >
-                    {connection.provider !== "bedrock" && (
-                      <option value="api_key">API key</option>
-                    )}
-                    {native && (
-                      <option value="session">Archivo de sesión JSON</option>
-                    )}
-                    {connection.provider === "claude-cli" && (
-                      <option value="oauth_token">
-                        Token manual sin renovación
-                      </option>
-                    )}
-                    {connection.provider === "bedrock" && (
-                      <option value="aws">Credenciales AWS JSON</option>
-                    )}
-                  </select>
-                  {["session", "aws"].includes(kind) ? (
-                    <Input
-                      type="file"
-                      aria-label={`Archivo de credenciales de ${providerName}`}
-                      accept="application/json,.json"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0]
-                        if (file) void file.text().then(setSecret)
-                        e.target.value = ""
-                      }}
-                    />
-                  ) : (
-                    <Input
-                      type="password"
-                      aria-label={`Clave de ${providerName}`}
-                      autoComplete="new-password"
-                      placeholder="El secreto no volverá a mostrarse"
-                      value={secret}
-                      onChange={(e) => setSecret(e.target.value)}
-                    />
-                  )}
-                  <Button
-                    disabled={!secret || disabled}
-                    onClick={() =>
-                      void action(async () => {
-                        let value: unknown = secret
-                        if (["session", "aws"].includes(kind)) {
-                          try {
-                            value = JSON.parse(secret)
-                          } catch {
-                            throw new Error(
-                              "El archivo no contiene JSON válido. Revisa su formato y vuelve a importarlo."
-                            )
-                          }
-                        }
-                        const result = await aiApi.importCredential(
-                          connection.id,
-                          kind,
-                          value
-                        )
-                        setSecret("")
-                        setCredential(result.id)
-                        await reload()
-                      })
-                    }
-                  >
-                    Guardar sin activar
-                  </Button>
-                  <p className="text-xs text-muted-foreground">
-                    La credencial actual seguirá activa hasta que la nueva
-                    supere una prueba real.
-                  </p>
-                </div>
-              </details>
-            )}
             <Button
               size="sm"
-              variant="ghost"
-              disabled={!canManage || disabled}
+              variant="outline"
+              disabled={disabled}
               onClick={() =>
                 void action(async () => {
                   await aiApi.saveConnection(
@@ -902,23 +796,243 @@ function ConnectionCard({
                 })
               }
             >
-              <Unplug className="mr-2 size-3.5" />
-              {connection.enabled
-                ? "Desactivar conexión"
-                : "Habilitar conexión"}
+              {connection.enabled ? "Desactivar" : "Habilitar"}
             </Button>
+            {sessions.length === 0 && (
+              <Button
+                size="icon-sm"
+                variant="outline"
+                aria-label={`Eliminar conexión ${connection.name}`}
+                title="Eliminar conexión"
+                className="text-destructive hover:text-destructive"
+                disabled={busy || loginPending}
+                onClick={() => setConfirm(true)}
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            )}
           </div>
-        </details>
-        {error && (
-          <p
-            role="alert"
-            className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive"
-          >
-            {error}
-          </p>
         )}
-      </CardContent>
-    </Card>
+      </div>
+      {sessions.map((session) => (
+        <SessionCard
+          key={session.id}
+          connection={connection}
+          session={session}
+          canManage={canManage}
+          canTest={canTest}
+          reload={reload}
+          perform={perform}
+          testing={testing}
+          now={now}
+          diagnostic={diagnostics[session.id]}
+        />
+      ))}
+      {sessions.length === 0 && (!adding || !canManage) && (
+        <p className="px-1 pb-2 text-sm text-muted-foreground">
+          Esta conexión todavía no tiene sesiones.
+        </p>
+      )}
+      {canManage && adding && (
+        <div className="space-y-3 rounded-xl border bg-card p-4">
+          {native && !loginPending && (
+            <Button
+              variant="outline"
+              disabled={disabled}
+              onClick={() =>
+                void action(async () =>
+                  setLogin(await aiApi.login(connection.id))
+                )
+              }
+            >
+              <KeyRound className="size-4" /> Conectar cuenta de {providerName}
+            </Button>
+          )}
+          {loginPending && login && (
+            <div
+              className="space-y-3 rounded-lg border bg-muted/30 p-3"
+              role="status"
+            >
+              <p className="text-sm font-medium">
+                Autoriza tu cuenta de {providerName}
+              </p>
+              {login.url ? (
+                <Button asChild variant="outline" size="sm">
+                  <a href={login.url} target="_blank" rel="noreferrer">
+                    Abrir acceso oficial <ExternalLink className="size-3.5" />
+                  </a>
+                </Button>
+              ) : (
+                <p className="flex items-center gap-2 text-sm">
+                  <Loader2 className="size-4 animate-spin" /> Preparando el
+                  enlace…
+                </p>
+              )}
+              {login.user_code && (
+                <div className="rounded-lg border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">
+                    Introduce este código en la página de Codex
+                  </p>
+                  <code className="text-xl font-semibold tracking-widest">
+                    {login.user_code}
+                  </code>
+                </div>
+              )}
+              {connection.provider === "claude-cli" && (
+                <div className="space-y-2">
+                  <Label htmlFor={`login-code-${connection.id}`}>
+                    Código de autorización de Claude
+                  </Label>
+                  <div className="flex flex-wrap gap-2">
+                    <Input
+                      id={`login-code-${connection.id}`}
+                      type="password"
+                      autoComplete="off"
+                      value={code}
+                      className="min-w-44 flex-1"
+                      onChange={(event) => setCode(event.target.value)}
+                    />
+                    <Button
+                      variant="outline"
+                      disabled={!code || busy}
+                      onClick={() =>
+                        void action(async () => {
+                          await aiApi.loginCode(login.id, code)
+                          setCode("")
+                        })
+                      }
+                    >
+                      Enviar código
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>
+                  Vence a las{" "}
+                  {new Date(login.expires_at * 1000).toLocaleTimeString()}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() =>
+                    void action(async () => {
+                      await aiApi.cancelLogin(login.id)
+                      setLogin(null)
+                      setCode("")
+                    })
+                  }
+                >
+                  Cancelar conexión
+                </Button>
+              </div>
+            </div>
+          )}
+          {login &&
+            !loginPending &&
+            ["pending", "failed"].includes(login.status) && (
+              <p role="status" className="text-sm text-destructive">
+                La autorización venció o falló. Puedes volver a conectar la
+                cuenta.
+              </p>
+            )}
+          <details
+            open={native ? undefined : true}
+            className="rounded-lg border"
+          >
+            <summary className="cursor-pointer p-3 text-sm font-medium">
+              Importar clave o archivo de sesión
+            </summary>
+            <div className="space-y-3 border-t p-3">
+              <Label htmlFor={`kind-${connection.id}`}>
+                Tipo de credencial
+              </Label>
+              <select
+                id={`kind-${connection.id}`}
+                className={selectClass}
+                value={kind}
+                onChange={(event) => {
+                  setKind(event.target.value)
+                  setSecret("")
+                }}
+              >
+                {connection.provider !== "bedrock" && (
+                  <option value="api_key">Clave API</option>
+                )}
+                {native && (
+                  <option value="session">Archivo de sesión JSON</option>
+                )}
+                {connection.provider === "claude-cli" && (
+                  <option value="oauth_token">Token OAuth manual</option>
+                )}
+                {connection.provider === "bedrock" && (
+                  <option value="aws">Credencial AWS JSON</option>
+                )}
+              </select>
+              {["session", "aws"].includes(kind) ? (
+                <Input
+                  type="file"
+                  aria-label={`Archivo de credenciales de ${providerName}`}
+                  accept="application/json,.json"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0]
+                    setSecret("")
+                    if (file)
+                      void file
+                        .text()
+                        .then(setSecret)
+                        .catch(() => setError("No se pudo leer el archivo."))
+                  }}
+                />
+              ) : (
+                <Input
+                  type="password"
+                  aria-label={`Clave de ${providerName}`}
+                  autoComplete="new-password"
+                  value={secret}
+                  onChange={(event) => setSecret(event.target.value)}
+                />
+              )}
+              <Button
+                variant="outline"
+                disabled={!secret.trim() || disabled}
+                onClick={() => void action(save)}
+              >
+                Guardar sesión
+              </Button>
+            </div>
+          </details>
+        </div>
+      )}
+      {error && (
+        <p
+          role="alert"
+          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={(open) => {
+          if (!busy) setConfirm(open)
+        }}
+        destructive
+        loading={busy}
+        title="¿Eliminar esta conexión?"
+        description={`La conexión «${connection.name}» se eliminará de MIRA. Los informes anteriores seguirán disponibles.`}
+        confirmLabel="Eliminar conexión"
+        cancelLabel="Cancelar"
+        onConfirm={() =>
+          void action(async () => {
+            setConfirm(false)
+            await aiApi.deleteConnection(connection.id)
+            await reload()
+          })
+        }
+      />
+    </section>
   )
 }
 
@@ -1243,6 +1357,11 @@ export function AIPage() {
   useDocumentTitle("Configuración de IA")
   const { user } = useAuth()
   const [query] = useSearchParams()
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 30000)
+    return () => clearInterval(timer)
+  }, [])
   const [section, setSection] = useState(
     query.has("job") || query.has("run") ? "diagnostics" : "connections"
   )
@@ -1266,7 +1385,13 @@ export function AIPage() {
   const [diagnostic, setDiagnostic] = useState<Diagnostic | null>(null)
   const [diagnosticInput, setDiagnosticInput] =
     useState<DiagnosticInput | null>(null)
+  const [sessionDiagnostics, setSessionDiagnostics] = useState<
+    Record<string, Diagnostic>
+  >({})
+  const [startingDiagnostic, setStartingDiagnostic] = useState(false)
+  const startingRef = useRef(false)
   const [showConnectionForm, setShowConnectionForm] = useState(false)
+  const [firstConnection, setFirstConnection] = useState("")
   const [mode, setMode] = useState<"simulation" | "real">("simulation")
   const [faults, setFaults] = useState<Record<string, string>>({})
   const [connectionName, setConnectionName] = useState("")
@@ -1298,17 +1423,28 @@ export function AIPage() {
   }, [reload])
   useEffect(() => {
     if (!diagnostic || diagnostic.status !== "running") return
+    let stale = false
     const timer = setInterval(() => {
       aiApi
         .diagnostic(diagnostic.id)
         .then(async (result) => {
+          if (stale) return
           setDiagnostic(result)
+          const credential = diagnosticInput?.credential_id
+          if (credential)
+            setSessionDiagnostics((previous) => ({
+              ...previous,
+              [credential]: result,
+            }))
           if (result.status !== "running") await reload()
         })
         .catch((e) => setError(String(e)))
     }, 1500)
-    return () => clearInterval(timer)
-  }, [diagnostic, reload])
+    return () => {
+      stale = true
+      clearInterval(timer)
+    }
+  }, [diagnostic, diagnosticInput, reload])
   const action = async (fn: () => Promise<unknown>) => {
     setBusy(true)
     setError("")
@@ -1322,10 +1458,28 @@ export function AIPage() {
     }
   }
   const perform = async (input: DiagnosticInput) => {
-    const started = await aiApi.diagnose(input)
-    setDiagnosticInput(input)
-    setDiagnostic(started)
-    if (input.action === "flow") setSection("diagnostics")
+    if (startingRef.current || diagnostic?.status === "running") {
+      throw new Error("Ya hay una prueba en curso.")
+    }
+    startingRef.current = true
+    setStartingDiagnostic(true)
+    try {
+      const started = await aiApi.diagnose(input)
+      setDiagnosticInput(input)
+      setDiagnostic(started)
+      if (input.credential_id) {
+        const credential = input.credential_id
+        setSessionDiagnostics((previous) => ({
+          ...previous,
+          [credential]: started,
+        }))
+      }
+      if (input.action === "flow") setSection("diagnostics")
+      if (started.status !== "running") await reload()
+    } finally {
+      setStartingDiagnostic(false)
+      startingRef.current = false
+    }
   }
   const chooseFlow = async (id: string) => {
     setVersions(id ? await aiApi.versions(id) : [])
@@ -1377,7 +1531,7 @@ export function AIPage() {
       </div>
     )
   return (
-    <div className="mx-auto max-w-7xl space-y-6 p-4 sm:p-6">
+    <div className="mx-auto w-full max-w-7xl space-y-6 px-4 py-5 sm:px-6 lg:px-8">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <div className="mt-1 flex size-11 shrink-0 items-center justify-center rounded-xl border bg-muted/40">
@@ -1508,7 +1662,7 @@ export function AIPage() {
         {[
           {
             key: "connections",
-            label: "Proveedores y credenciales",
+            label: "Conexiones y sesiones",
             description: "Cuentas, acceso y modelos",
             icon: KeyRound,
           },
@@ -1529,7 +1683,7 @@ export function AIPage() {
             key={key}
             type="button"
             aria-current={section === key ? "page" : undefined}
-            className={`flex items-center gap-3 rounded-xl border px-3 py-3 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${section === key ? "border-border bg-background shadow-sm" : "border-transparent text-muted-foreground hover:bg-background/60 hover:text-foreground"}`}
+            className={`flex items-center gap-3 rounded-xl border px-3 py-3 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${section === key ? "border-primary/40 bg-background shadow-sm" : "border-border bg-card/60 text-muted-foreground hover:bg-background hover:text-foreground"}`}
             onClick={() => setSection(key)}
           >
             <Icon
@@ -1558,13 +1712,10 @@ export function AIPage() {
         <>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 className="font-semibold">Tus proveedores</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Una cuenta puede servir a varios modelos y flujos.
-              </p>
+              <h2 className="font-semibold">Conexiones guardadas</h2>
             </div>
             <Button
-              variant="outline"
+              aria-expanded={showConnectionForm}
               disabled={!can("ai.credentials.manage")}
               onClick={() => setShowConnectionForm((value) => !value)}
             >
@@ -1572,8 +1723,9 @@ export function AIPage() {
               {showConnectionForm ? "Cerrar formulario" : "Añadir conexión"}
             </Button>
           </div>
-          {(showConnectionForm || connections.length === 0) && (
-            <Card className="rounded-2xl border-dashed">
+          {(showConnectionForm ||
+            (connections.length === 0 && can("ai.credentials.manage"))) && (
+            <Card className="rounded-2xl border">
               <CardHeader>
                 <CardTitle className="text-base">Añadir una conexión</CardTitle>
                 <p className="text-sm text-muted-foreground">
@@ -1586,8 +1738,8 @@ export function AIPage() {
                   onSubmit={(e) => {
                     e.preventDefault()
                     void action(async () => {
-                      await aiApi.saveConnection({
-                        name: connectionName,
+                      const created = await aiApi.saveConnection({
+                        name: connectionName.trim(),
                         provider,
                         base_url: endpoint,
                         region,
@@ -1595,6 +1747,7 @@ export function AIPage() {
                       })
                       setConnectionName("")
                       setShowConnectionForm(false)
+                      setFirstConnection(created.id)
                       await reload()
                       setMessage(
                         "Conexión creada. Conecta la cuenta o importa su credencial para continuar."
@@ -1603,9 +1756,13 @@ export function AIPage() {
                   }}
                 >
                   <div className="space-y-1">
-                    <Label>Nombre de la conexión</Label>
+                    <Label htmlFor="new-connection-name">
+                      Nombre de la conexión
+                    </Label>
                     <Input
+                      id="new-connection-name"
                       required
+                      maxLength={120}
                       value={connectionName}
                       onChange={(e) => setConnectionName(e.target.value)}
                     />
@@ -1633,8 +1790,9 @@ export function AIPage() {
                   </div>
                   {["openai", "responses"].includes(provider) && (
                     <div className="space-y-1">
-                      <Label>Endpoint</Label>
+                      <Label htmlFor="new-connection-endpoint">Endpoint</Label>
                       <Input
+                        id="new-connection-endpoint"
                         required
                         type="url"
                         value={endpoint}
@@ -1644,36 +1802,50 @@ export function AIPage() {
                   )}
                   {provider === "bedrock" && (
                     <div className="space-y-1">
-                      <Label>Región AWS</Label>
+                      <Label htmlFor="new-connection-region">Región AWS</Label>
                       <Input
+                        id="new-connection-region"
                         value={region}
                         onChange={(e) => setRegion(e.target.value)}
                       />
                     </div>
                   )}
-                  <Button disabled={!can("ai.credentials.manage") || busy}>
+                  <Button
+                    type="submit"
+                    disabled={
+                      !can("ai.credentials.manage") ||
+                      busy ||
+                      !connectionName.trim()
+                    }
+                  >
                     Crear conexión
                   </Button>
                 </form>
               </CardContent>
             </Card>
           )}
-          <div className="grid items-start gap-5 lg:grid-cols-2">
-            {connections.map((c) => (
-              <ConnectionCard
-                key={c.id}
-                connection={c}
-                canManage={can("ai.credentials.manage")}
-                canTest={can("ai.diagnostics.run")}
-                reload={reload}
-                perform={perform}
-                diagnostic={
-                  diagnosticInput?.connection_id === c.id ? diagnostic : null
-                }
-                testing={diagnostic?.status === "running"}
-                onViewResult={() => setSection("diagnostics")}
-              />
-            ))}
+          <div className="grid min-w-0 items-start gap-4">
+            {[...connections]
+              .sort(
+                (a, b) =>
+                  Number(b.id === firstConnection) -
+                  Number(a.id === firstConnection)
+              )
+              .map((c) => (
+                <ConnectionCard
+                  key={c.id}
+                  connection={c}
+                  canManage={can("ai.credentials.manage")}
+                  canTest={can("ai.diagnostics.run")}
+                  reload={reload}
+                  perform={perform}
+                  diagnostics={sessionDiagnostics}
+                  now={now}
+                  testing={
+                    startingDiagnostic || diagnostic?.status === "running"
+                  }
+                />
+              ))}
           </div>
           {user?.is_admin && status?.mode !== "managed" && (
             <Card>
