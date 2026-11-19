@@ -1,13 +1,12 @@
 import {
   AlertCircle, ArrowDownLeft, ArrowUpRight, ChevronDown, ChevronLeft, ChevronRight,
-  Clock3, Code2, ExternalLink, FileCheck2, GitPullRequest, ListChecks, LoaderCircle,
+  Clock3, Code2, ExternalLink, FileCheck2, ListChecks, LoaderCircle,
   Play, RefreshCw, RotateCcw, Search, Square, X,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
 
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
@@ -133,14 +132,6 @@ function JobActions({
   }
   return (
     <div role="group" aria-label={"Acciones de PR #" + job.pr_number} className="flex min-w-0 flex-wrap gap-2">
-      <CollapsibleTrigger asChild>
-        <Button variant="outline" className="group/trace h-9 px-3">
-          <ListChecks aria-hidden="true" />
-          <span className="group-data-[state=open]/trace:hidden">Ver recorrido</span>
-          <span className="hidden group-data-[state=open]/trace:inline">Ocultar recorrido</span>
-          <ChevronDown aria-hidden="true" className="size-3.5 group-data-[state=open]/trace:rotate-180" />
-        </Button>
-      </CollapsibleTrigger>
       {ACTIONS.map(({ id, label, busy, icon: Icon }) => {
         const reason = actionAvailability(job, isAdmin, id, hasNewer)
         const blocked = !!reason || !!acting
@@ -223,50 +214,63 @@ function JobCard({
           ? name + " espera conexión" : name
       }) : undefined
 
+  const header = useRef<HTMLButtonElement>(null)
+  const changeOpen = (next: boolean) => {
+    const button = header.current
+    const main = button?.closest("main.overflow-auto")
+    const scroller = main && main.scrollHeight > main.clientHeight ? main : document.scrollingElement
+    const top = button?.getBoundingClientRect().top
+    setOpen(next)
+    if (button && scroller && top != null) {
+      // Opening a row also closes the previous one, which may be above it.
+      window.requestAnimationFrame(() => {
+        scroller.scrollTop += button.getBoundingClientRect().top - top
+      })
+    }
+  }
+  const title = job.pr_title || "Pull request #" + job.pr_number
+  const conclusion = result ? CONCLUSION[result.conclusion] : null
+
   return (
     <li className="min-w-0">
-      <Collapsible open={open} onOpenChange={setOpen}>
+      <Collapsible open={open} onOpenChange={changeOpen}>
         <article aria-labelledby={"review-title-" + job.id} className={cn(
-          "overflow-hidden rounded-xl border bg-card shadow-xs",
-          open && "border-sky-600/30 dark:border-sky-400/30",
+          "overflow-hidden rounded-xl border bg-card",
+          open && "border-sky-600/35 dark:border-sky-400/35",
         )}>
-          <div className="grid min-w-0 @4xl:grid-cols-[minmax(0,1fr)_minmax(15rem,20rem)] @4xl:gap-x-4">
-            <div className="min-w-0 px-4 pb-3 pt-4 sm:px-5 @4xl:col-start-1 @4xl:row-start-1">
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-                <span className="inline-flex min-w-0 items-center gap-1.5 font-semibold text-sky-800 dark:text-sky-300">
-                  <GitPullRequest aria-hidden="true" className="size-3.5 shrink-0" />
-                  <span className="[overflow-wrap:anywhere]">{job.repo} #{job.pr_number}</span>
+          <h2 id={"review-title-" + job.id}>
+            <CollapsibleTrigger asChild>
+              <button ref={header} type="button" className="group flex w-full min-w-0 items-center gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring sm:gap-3 sm:px-4">
+                <span className={cn(
+                  "grid size-7 shrink-0 place-items-center rounded-md border bg-muted/40 text-muted-foreground",
+                  open && "border-sky-600/25 bg-sky-500/10 text-sky-800 dark:text-sky-200",
+                )}>
+                  <ChevronDown aria-hidden="true" className="size-4 transition-transform group-data-[state=open]:rotate-180 motion-reduce:transition-none" />
                 </span>
-                <span className="text-muted-foreground [overflow-wrap:anywhere]">{job.owner}</span>
-              </div>
-              <h2 id={"review-title-" + job.id} className="mt-1 text-pretty text-base font-semibold leading-snug [overflow-wrap:anywhere]">
-                {job.pr_title || "Pull request #" + job.pr_number}
-              </h2>
-              <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs">
-                <Badge variant="outline" className={cn("h-6 gap-1.5 px-2", status.color)}>
-                  <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />{status.label}
-                </Badge>
-                {result && CONCLUSION[result.conclusion] && (
-                  <Badge variant="secondary" className="h-6 px-2">{CONCLUSION[result.conclusion]}</Badge>
-                )}
-                {!result && summary?.has_stage_failures && (
-                  <Badge variant="outline" className="h-6 border-amber-500/30 px-2 text-amber-800 dark:text-amber-200">Etapas con incidencias</Badge>
-                )}
-                <code title={job.head_sha} aria-label={"SHA " + job.head_sha} className="rounded bg-muted px-1.5 py-0.5 font-mono text-muted-foreground">
-                  {job.head_sha.slice(0, 12)}
-                </code>
-                <time dateTime={new Date(job.created_at * 1000).toISOString()} title={formatDateTime(job.created_at)} className="text-muted-foreground">
-                  {relativeTime(job.created_at, now)}
-                </time>
-              </div>
-              {focusStages && focusStages.length > 0 && (
-                <p className="mt-2 flex items-start gap-1.5 text-xs text-sky-800 dark:text-sky-200">
-                  <Clock3 aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />{focusStages.join(" · ")}
-                </p>
-              )}
-              {note && <p className="mt-2 text-sm text-muted-foreground [overflow-wrap:anywhere]">{note}</p>}
-            </div>
-            <div className="grid gap-2 border-t px-4 py-3 sm:px-5 @4xl:col-span-2 @4xl:row-start-2 @4xl:flex @4xl:flex-wrap @4xl:items-center @4xl:justify-between">
+                <span className="min-w-0 flex-1">
+                  <span title={title} className="block truncate text-sm font-semibold leading-snug">{title}</span>
+                  <span className="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                    <span title={job.owner + "/" + job.repo + " #" + job.pr_number} className="truncate text-sky-800 dark:text-sky-300">
+                      {job.repo} #{job.pr_number}
+                    </span>
+                    <code title={job.head_sha} className="hidden shrink-0 font-mono @sm:inline">{job.head_sha.slice(0, 8)}</code>
+                    {job.status !== "pending" && summary?.worker != null && (
+                      <span className="hidden shrink-0 @md:inline">Worker {summary.worker}</span>
+                    )}
+                  </span>
+                </span>
+                <span className="flex shrink-0 flex-col items-end gap-0.5">
+                  <span className={cn("inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs font-medium sm:px-2", status.color)}>
+                    <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />{status.label}
+                  </span>
+                  {conclusion && <span className="hidden text-xs text-muted-foreground @lg:inline">{conclusion}</span>}
+                </span>
+              </button>
+            </CollapsibleTrigger>
+          </h2>
+          <CollapsibleContent className="space-y-4 border-t bg-muted/20 p-3 sm:px-5 sm:py-4">
+            <p className="text-sm font-medium wrap-anywhere">{title}</p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <JobActions job={job} acting={acting} isAdmin={isAdmin} canDiagnose={canDiagnose} hasNewer={hasNewer} onAction={onAction} />
               <div className="flex flex-wrap gap-2">
                 {result?.report_url && (
@@ -281,39 +285,49 @@ function JobCard({
                 </Button>
               </div>
             </div>
-            <div className="min-w-0 px-4 pb-4 sm:px-5 @4xl:col-start-2 @4xl:row-start-1 @4xl:pl-0 @4xl:pt-4">
-              <dl className="grid min-w-0 grid-cols-2 gap-x-3 gap-y-2 rounded-lg border bg-muted/35 p-3">
-                <div className="min-w-0">
-                  <dt className="text-xs text-muted-foreground">Worker</dt>
-                  <dd className="mt-0.5 text-sm font-medium tabular-nums">
-                    {job.status === "pending" ? "Por asignar" : summary?.worker != null ? "Worker " + summary.worker : "Sin registro"}
-                  </dd>
-                </div>
-                <div className="min-w-0">
-                  <dt className="text-xs text-muted-foreground">{started != null ? "Intento en curso" : "Duración acumulada"}</dt>
-                  <dd className="mt-0.5 text-sm font-medium tabular-nums">
-                    {elapsed == null ? "—" : formatDuration(elapsed)}
-                  </dd>
-                </div>
-                {modelNames.length > 0 && (
-                  <div className="col-span-2 min-w-0 border-t pt-2">
-                    <dt className="text-xs text-muted-foreground">{job.status === "pending" ? "Modelos del último intento" : "Modelos registrados"}</dt>
-                    <dd className="mt-0.5 font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">{modelNames.join(" · ")}</dd>
-                  </div>
-                )}
-                {hasTokens && (
-                  <div className="col-span-2 min-w-0 text-xs">
-                    <dt className="mb-0.5 text-muted-foreground">Tokens acumulados</dt>
-                    <dd className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-muted-foreground">
-                      <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.input_tokens)} entrada</span>
-                      <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.output_tokens)} salida</span>
-                    </dd>
-                  </div>
-                )}
-              </dl>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span className="wrap-anywhere">{job.owner}/{job.repo} #{job.pr_number}</span>
+              <code title={job.head_sha} className="font-mono">{job.head_sha.slice(0, 12)}</code>
+              <time dateTime={new Date(job.created_at * 1000).toISOString()} title={formatDateTime(job.created_at)}>
+                {relativeTime(job.created_at, now)}
+              </time>
+              {!result && summary?.has_stage_failures && <span className="text-amber-800 dark:text-amber-200">Etapas con incidencias</span>}
             </div>
-          </div>
-          <CollapsibleContent className="space-y-5 border-t bg-muted/20 px-4 py-5 sm:px-5">
+            {focusStages && focusStages.length > 0 && (
+              <p className="flex items-start gap-1.5 text-xs text-sky-800 dark:text-sky-200">
+                <Clock3 aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />{focusStages.join(" · ")}
+              </p>
+            )}
+            {note && <p className="text-sm text-muted-foreground wrap-anywhere">{note}</p>}
+            <dl className="grid min-w-0 grid-cols-2 gap-x-3 gap-y-2 rounded-lg border bg-muted/35 p-3">
+              <div className="min-w-0">
+                <dt className="text-xs text-muted-foreground">Worker</dt>
+                <dd className="mt-0.5 text-sm font-medium tabular-nums">
+                  {job.status === "pending" ? "Por asignar" : summary?.worker != null ? "Worker " + summary.worker : "Sin registro"}
+                </dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs text-muted-foreground">{started != null ? "Intento en curso" : "Duración acumulada"}</dt>
+                <dd className="mt-0.5 text-sm font-medium tabular-nums">
+                  {elapsed == null ? "—" : formatDuration(elapsed)}
+                </dd>
+              </div>
+              {modelNames.length > 0 && (
+                <div className="col-span-2 min-w-0 border-t pt-2">
+                  <dt className="text-xs text-muted-foreground">{job.status === "pending" ? "Modelos del último intento" : "Modelos registrados"}</dt>
+                  <dd className="mt-0.5 font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">{modelNames.join(" · ")}</dd>
+                </div>
+              )}
+              {hasTokens && (
+                <div className="col-span-2 min-w-0 text-xs">
+                  <dt className="mb-0.5 text-muted-foreground">Tokens acumulados</dt>
+                  <dd className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-muted-foreground">
+                    <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.input_tokens)} entrada</span>
+                    <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.output_tokens)} salida</span>
+                  </dd>
+                </div>
+              )}
+            </dl>
             {result && (
               <section aria-label="Resultado de la revisión" className="rounded-lg border border-sky-600/20 bg-sky-600/5 px-3.5 py-3">
                 <h3 className="text-sm font-semibold">Resultado de MIRA</h3>
@@ -523,7 +537,7 @@ export function ReviewJobsPage() {
       )}
 
       {displayed.length > 0 && (
-        <ul aria-label="Revisiones por SHA" className="space-y-3">
+        <ul aria-label="Revisiones por SHA" className="space-y-2">
           {displayed.map((job) => (
             <JobCard key={job.id} job={job} open={expandedJob === job.id}
               setOpen={(isOpen) => setExpandedJob(isOpen ? job.id : null)}
