@@ -7,7 +7,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from jsonschema import validate
@@ -33,6 +33,10 @@ class FlowExhaustedError(LLMError):
         super().__init__("ai_flow_exhausted", run_id=self.run_id)
 
 
+class _SessionTimeoutError(TimeoutError):
+    """The node exhausted its budget while acquiring its exclusive session."""
+
+
 def configure(store: AIStore) -> AIRuntime:
     global _runtime
     if _runtime is None or _runtime.store.db is not store.db:
@@ -56,6 +60,8 @@ def quota_key(provider: str, model: str) -> str:
 
 def classify(error: Exception) -> tuple[str, str]:
     """Return only fixed codes/actions; upstream text can contain tokens."""
+    if isinstance(error, _SessionTimeoutError):
+        return "session_timeout", "Revisar la espera por la sesión o elegir otra conexión"
     if isinstance(error, TimeoutError):
         return "timeout", "Revisar timeout o proveedor"
     if isinstance(error, (json.JSONDecodeError, SchemaValidationError)) or str(error).startswith(
@@ -374,6 +380,8 @@ class FlowProvider:
         metadata: dict,
         step: dict,
         run: dict,
+        *,
+        worker: int | None,
     ) -> Any:
         config = self.config.model_copy(
             update={
@@ -394,28 +402,57 @@ class FlowProvider:
                 "max_context_tokens": node.context_window,
             }
         )
-        for renewal in range(2):
-            try:
-                step["phase"] = "waiting_for_session"
-                self._publish_run(run)
-                async with self.runtime.broker.provider(connection, config, active_id) as provider:
-                    step["phase"] = "requesting"
+        session_remaining = inference_remaining = float(node.timeout)
+        # Keep the worker's reservation across credential renewal. The broker
+        # still holds its own lock through inference and persists each refresh.
+        async with AsyncExitStack() as reservation:
+            for renewal in range(2):
+                try:
+                    step["phase"] = "waiting_for_session"
                     self._publish_run(run)
-                    try:
-                        async with asyncio.timeout(node.timeout):
-                            result = await getattr(provider, method)(messages, **kwargs)
-                    finally:
-                        usage = provider.usage
-                        step["usage"] = usage if getattr(provider, "usage_available", True) else {}
-                        self.shared["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                        self.shared["completion_tokens"] += usage.get("completion_tokens", 0)
-                self._validate(method, result, kwargs)
-                return result
-            except Exception as error:
-                if renewal == 0 and metadata.get("renewable") and classify(error)[0] == "auth":
-                    step["refresh_attempted"] = True
-                    continue  # Native client refreshes once on a freshly loaded snapshot.
-                raise
+                    async with AsyncExitStack() as session:
+                        wait_started = time.monotonic()
+                        try:
+                            if session_remaining <= 0:
+                                raise TimeoutError()
+                            async with asyncio.timeout(session_remaining):
+                                if renewal == 0:
+                                    await reservation.enter_async_context(
+                                        self.runtime.worker_connection(node.connection_id, worker)
+                                    )
+                                provider = await session.enter_async_context(
+                                    self.runtime.broker.provider(connection, config, active_id)
+                                )
+                        except TimeoutError as error:
+                            raise _SessionTimeoutError() from error
+                        finally:
+                            session_remaining -= time.monotonic() - wait_started
+                            step["session_wait_ms"] = int((node.timeout - session_remaining) * 1000)
+
+                        step["phase"] = "requesting"
+                        self._publish_run(run)
+                        inference_started = time.monotonic()
+                        try:
+                            if inference_remaining <= 0:
+                                raise TimeoutError()
+                            async with asyncio.timeout(inference_remaining):
+                                result = await getattr(provider, method)(messages, **kwargs)
+                        finally:
+                            inference_remaining -= time.monotonic() - inference_started
+                            step["inference_ms"] = int((node.timeout - inference_remaining) * 1000)
+                            usage = provider.usage
+                            step["usage"] = (
+                                usage if getattr(provider, "usage_available", True) else {}
+                            )
+                            self.shared["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                            self.shared["completion_tokens"] += usage.get("completion_tokens", 0)
+                    self._validate(method, result, kwargs)
+                    return result
+                except Exception as error:
+                    if renewal == 0 and metadata.get("renewable") and classify(error)[0] == "auth":
+                        step["refresh_attempted"] = True
+                        continue  # Native client refreshes once on a freshly loaded snapshot.
+                    raise
 
         raise LLMError("ai_provider_failed")
 
@@ -503,6 +540,8 @@ class FlowProvider:
                         "cause": "",
                         "action": "",
                         "duration_ms": 0,
+                        "session_wait_ms": 0,
+                        "inference_ms": 0,
                         "usage": {},
                         "refresh_attempted": False,
                         "input_tokens_estimated": request_size,
@@ -590,25 +629,18 @@ class FlowProvider:
                                 )
                             result = '{"ok":true}'
                         else:
-                            # The node budget includes waiting for its session,
-                            # native refresh and inference, not only HTTP time.
-                            step["phase"] = "waiting_for_session"
-                            self._publish_run(run)
-                            async with (
-                                asyncio.timeout(node.timeout),
-                                self.runtime.worker_connection(node.connection_id, worker),
-                            ):
-                                result = await self._execute_node(
-                                    connection,
-                                    node,
-                                    method,
-                                    messages,
-                                    kwargs,
-                                    active_id,
-                                    metadata,
-                                    step,
-                                    run,
-                                )
+                            result = await self._execute_node(
+                                connection,
+                                node,
+                                method,
+                                messages,
+                                kwargs,
+                                active_id,
+                                metadata,
+                                step,
+                                run,
+                                worker=worker,
+                            )
                             await self.runtime.broker.health(active_id, "ready")
                             self.runtime.store.set_state(
                                 f"access:{active_id}:{node.model}:{node.reasoning_effort}",
