@@ -239,7 +239,7 @@ export function ReviewJobsPage() {
             width. CLI-backed token counts are estimates.
           </p>
         </CardHeader>
-        <CardContent className="p-0">
+        <CardContent className="px-3 sm:px-5">
           {error ? (
             <p className="p-6 text-sm text-destructive">
               Could not load review jobs.
@@ -253,6 +253,7 @@ export function ReviewJobsPage() {
           ) : (
             <Table
               className="table-fixed"
+              containerClassName="rounded-lg border"
               style={{ width: tableWidth, minWidth: tableWidth }}
             >
               <colgroup>
@@ -451,12 +452,11 @@ export function ReviewJobsPage() {
                             {acting === job.id ? "Programando…" : "Reintentar"}
                           </Button>
                         )}
-                      <Link
-                        className="block text-xs text-primary underline"
-                        to={`/settings/ai?job=${job.id}`}
-                      >
-                        Recorrido de IA
-                      </Link>
+                      <Button asChild variant="outline" size="sm">
+                        <Link to={`/settings/ai?job=${job.id}`}>
+                          Recorrido de IA
+                        </Link>
+                      </Button>
                     </TableCell>
                     <TableCell className="overflow-hidden text-sm text-muted-foreground">
                       {relativeTime(job.updated_at)}

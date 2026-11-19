@@ -127,3 +127,17 @@ class DiagnosticInput(BaseModel):
         default_factory=dict
     )
     action: Literal["connection", "model", "rotation", "flow"] = "flow"
+    prompt: str | None = Field(default=None, max_length=1000, repr=False)
+
+    @model_validator(mode="after")
+    def session_prompt(self) -> DiagnosticInput:
+        if self.prompt is not None and (
+            not self.prompt.strip()
+            or self.action != "model"
+            or self.mode != "real"
+            or not self.connection_id
+            or not self.credential_id
+            or self.flow_id
+        ):
+            raise ValueError("El mensaje de prueba requiere una sesión y un modelo concretos")
+        return self

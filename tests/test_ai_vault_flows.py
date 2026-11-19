@@ -673,6 +673,123 @@ def test_failed_rotation_preserves_active_then_valid_rotation_activates(store, m
         assert store.connection(cid)["active_credential"] == candidate
 
 
+def test_delete_saved_session_preserves_active_and_other_catalogs(store):
+    cid, active = connection(store, "codex-cli")
+    saved = Vault(store).stage(
+        cid,
+        "session",
+        {"tokens": {"access_token": "old-access", "refresh_token": "old-refresh"}},
+        1,
+    )
+    store.set_state(f"access:{active}:active-model:off", {"status": "verified"})
+    store.set_state(f"access:{saved}:old-model:off", {"status": "verified"})
+    store.set_state(f"quota:{saved}:old-model", {"until": 200})
+    chain(store, cid)
+
+    with api_client(store, SimpleNamespace(id=1, is_admin=True)) as client:
+        path = f"/api/ai/connections/{cid}"
+        models = client.get(f"{path}/models", params={"credential_id": saved}).json()["models"]
+        assert "old-model" in {model["id"] for model in models}
+        assert "active-model" not in {model["id"] for model in models}
+        assert client.delete(f"{path}/credentials/{saved}").status_code == 204
+        assert client.delete(f"{path}/credentials/{active}").status_code == 409
+        assert client.delete(path).status_code == 409
+
+    assert store.connection(cid)["active_credential"] == active
+    assert [entry["id"] for entry in store.credentials(cid)] == [active]
+    assert not store.rows("SELECT 1 FROM ai_session_aliases WHERE credential_id=?", (saved,))
+    assert not store.state(f"access:{saved}:old-model:off")
+    assert not store.state(f"quota:{saved}:old-model")
+    assert store.state(f"access:{active}:active-model:off")["status"] == "verified"
+    assert ("credential.deleted",) in store.rows(
+        "SELECT action FROM ai_audit WHERE resource=?", (saved,)
+    )
+
+
+def test_delete_connection_requires_permissions_and_removes_only_owned_sessions(store):
+    cid, active = connection(store)
+    other, other_credential = connection(store)
+    path = f"/api/ai/connections/{cid}"
+    store.grant(2, ["ai.view"], 1)
+    with api_client(store, SimpleNamespace(id=2, is_admin=False)) as client:
+        assert client.delete(path).status_code == 403
+        assert client.delete(f"{path}/credentials/{active}").status_code == 403
+
+    with api_client(store, SimpleNamespace(id=1, is_admin=True)) as client:
+        assert client.delete(f"{path}/credentials/{other_credential}").status_code == 400
+        assert client.delete(f"{path}/credentials/{active}").status_code == 204
+        assert store.connection(cid)["active_credential"] == ""
+        assert client.delete(path).status_code == 204
+    assert store.connection(other)["active_credential"] == other_credential
+    with pytest.raises(ValueError, match="Conexión inexistente"):
+        store.connection(cid)
+
+
+def test_session_message_targets_saved_credential_without_persisting_message(store):
+    from mira.ai.runtime import current
+
+    cid, active = connection(store)
+    saved = Vault(store).stage(cid, "oauth_token", "saved-secret", 1)
+    invoke = AsyncMock(return_value="respuesta exclusiva para la prueba")
+    with api_client(store, SimpleNamespace(id=1, is_admin=True)) as client:
+
+        @asynccontextmanager
+        async def provider(connection, config, credential_id=None):
+            assert credential_id == saved
+            yield FakeProvider(invoke)
+
+        current().broker.provider = provider
+        body = {
+            "mode": "real",
+            "action": "model",
+            "connection_id": cid,
+            "credential_id": saved,
+            "model": "haiku",
+            "prompt": "mensaje exclusivo para la prueba",
+        }
+        response = client.post("/api/ai/diagnostics", json=body)
+        assert response.status_code == 200
+        assert response.json()["status"] == "success"
+        assert response.json()["output"] == invoke.return_value
+        assert invoke.await_args.args[0] == [{"role": "user", "content": body["prompt"]}]
+        history = client.get("/api/ai/runs").text
+        assert body["prompt"] not in history
+        assert invoke.return_value not in history
+        assert (
+            client.post("/api/ai/diagnostics", json={**body, "mode": "simulation"}).status_code
+            == 422
+        )
+    assert store.connection(cid)["active_credential"] == active
+
+
+@pytest.mark.skipif(
+    not os.environ.get("AI_TEST_DATABASE_URL"), reason="requires temporary PostgreSQL"
+)
+def test_postgres_retirement_preserves_the_current_flow_and_its_history(tmp_path):
+    db = AppDatabase(os.environ["AI_TEST_DATABASE_URL"], admin_password="test-only")
+    store = AIStore(db, tmp_path / "private")
+    cid, active = connection(store, "openai")
+    other, replacement = connection(store, "responses")
+    flow_id = chain(store, cid, models=("test-model",))
+    old = store.flow(flow_id)
+
+    with pytest.raises(ConflictError, match="flujo publicado"):
+        store.delete_credential(cid, active, 1)
+    assert store.connection(cid)["active_credential"] == active
+
+    node = {**old["nodes"][0], "connection_id": other}
+    store.publish(
+        FlowInput(name=old["name"], nodes=[node], edges=[], expected_version=old["version"]),
+        1,
+        flow_id,
+    )
+    store.delete_credential(cid, active, 1)
+    store.delete_connection(cid, 1)
+    assert store.flow(flow_id)["nodes"][0]["connection_id"] == other
+    assert store.flow(flow_id, version=1)["nodes"][0]["connection_id"] == cid
+    assert store.connection(other)["active_credential"] == replacement
+
+
 @pytest.mark.parametrize("provider_type", ["responses", "openai"])
 async def test_explicit_api_key_and_sol_max_are_used_without_ambient_credentials(
     store, monkeypatch, provider_type

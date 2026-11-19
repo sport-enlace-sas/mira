@@ -129,6 +129,14 @@ def create_ai_router(db: Any) -> APIRouter:
         store.connection(connection_id)
         return {"id": store.save_connection(body.model_dump(), user.id, connection_id)}
 
+    @router.delete("/connections/{connection_id}", status_code=204)
+    async def delete_connection(connection_id: str, user: Any = manage_credentials) -> None:
+        try:
+            async with asyncio.timeout(2), store.session_lock("login:" + connection_id):
+                store.delete_connection(connection_id, user.id)
+        except TimeoutError:
+            raise ConflictError("Hay un inicio de sesión en curso para esta conexión") from None
+
     @router.post("/connections/{connection_id}/credentials")
     def stage(connection_id: str, body: CredentialInput, user: Any = manage_credentials) -> dict:
         return {"id": Vault(store).stage(connection_id, body.kind, body.secret, user.id)}
@@ -141,15 +149,27 @@ def create_ai_router(db: Any) -> APIRouter:
             Vault(store).activate(connection_id, credential_id, user.id)
         return {"ok": True}
 
+    @router.delete("/connections/{connection_id}/credentials/{credential_id}", status_code=204)
+    async def delete_credential(
+        connection_id: str, credential_id: str, user: Any = manage_credentials
+    ) -> None:
+        try:
+            async with asyncio.timeout(2), store.session_lock(credential_id):
+                store.delete_credential(connection_id, credential_id, user.id)
+        except TimeoutError:
+            raise ConflictError("La sesión está en uso. Intenta eliminarla al terminar.") from None
+
     @router.get("/connections/{connection_id}/models")
-    def models(connection_id: str, user: Any = view) -> dict:
-        return catalog_view(store, connection_id)
+    def models(connection_id: str, credential_id: str | None = None, user: Any = view) -> dict:
+        return catalog_view(store, connection_id, credential_id)
 
     @router.post("/connections/{connection_id}/models/refresh")
-    async def refresh_models(connection_id: str, user: Any = diagnostics) -> dict:
-        await discover(store, connection_id)
+    async def refresh_models(
+        connection_id: str, credential_id: str | None = None, user: Any = diagnostics
+    ) -> dict:
+        await discover(store, connection_id, credential_id)
         store.audit(user.id, "catalog.refreshed", connection_id)
-        return catalog_view(store, connection_id)
+        return catalog_view(store, connection_id, credential_id)
 
     @router.post("/connections/{connection_id}/login")
     async def start_login(connection_id: str, user: Any = manage_credentials) -> dict:
@@ -220,6 +240,11 @@ def create_ai_router(db: Any) -> APIRouter:
         elif body.connection_id:
             connection = store.connection(body.connection_id)
             credential_id = credential_id or connection["active_credential"]
+            if (
+                credential_id
+                and store.credential_metadata(credential_id)["connection_id"] != body.connection_id
+            ):
+                raise ValueError("La sesión no pertenece a esta conexión")
             model = body.model or (
                 "gpt-6.1-sol"
                 if connection["provider"] == "codex-cli"
@@ -247,31 +272,45 @@ def create_ai_router(db: Any) -> APIRouter:
             ).model_dump()
         else:
             raise ValueError("Selecciona una conexión o un flujo")
-        probe = FlowProvider(runtime, LLMConfig(max_tokens=4096), "diagnostic", {})
+        probe = FlowProvider(
+            runtime, LLMConfig(max_tokens=512 if body.prompt else 4096), "diagnostic", {}
+        )
+        output = None
         try:
-            await probe._call(
-                "complete_with_tools",
-                [{"role": "user", "content": 'Return only this JSON: {"ok": true}'}],
-                flow=target,
-                mode=body.mode,
-                faults=body.faults,
-                credential_id=credential_id,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "mira_connection_probe",
-                            "description": "Return a valid health result",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"ok": {"type": "boolean", "const": True}},
-                                "required": ["ok"],
-                                "additionalProperties": False,
+            if body.prompt:
+                output = await probe._call(
+                    "complete",
+                    [{"role": "user", "content": body.prompt}],
+                    flow=target,
+                    mode=body.mode,
+                    faults=body.faults,
+                    credential_id=credential_id,
+                    json_mode=False,
+                )
+            else:
+                await probe._call(
+                    "complete_with_tools",
+                    [{"role": "user", "content": 'Return only this JSON: {"ok": true}'}],
+                    flow=target,
+                    mode=body.mode,
+                    faults=body.faults,
+                    credential_id=credential_id,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "mira_connection_probe",
+                                "description": "Return a valid health result",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"ok": {"type": "boolean", "const": True}},
+                                    "required": ["ok"],
+                                    "additionalProperties": False,
+                                },
                             },
-                        },
-                    }
-                ],
-            )
+                        }
+                    ],
+                )
         except FlowExhaustedError as error:
             result = json.loads(
                 store.rows("SELECT data FROM ai_runs WHERE id=?", (error.run_id,))[0][0]
@@ -280,6 +319,9 @@ def create_ai_router(db: Any) -> APIRouter:
             result = json.loads(
                 store.rows("SELECT data FROM ai_runs WHERE id=?", (probe.last_run_id,))[0][0]
             )
+            if isinstance(output, str):
+                # Return the output to this request only, never to review history.
+                result["output"] = output[:4000]
         if (
             body.action == "rotation"
             and result["status"] == "success"
