@@ -591,7 +591,8 @@ async def test_session_wait_obeys_node_timeout_and_continues_to_next_provider(st
     assert released.is_set()
     assert invoked == ["working"]
     run = store.runs()[0]
-    assert run["steps"][0]["cause"] == "timeout"
+    assert run["steps"][0]["cause"] == "session_timeout"
+    assert run["steps"][0]["inference_ms"] == 0
     assert run["steps"][1]["result"] == "success"
     assert store.credential_metadata(credential)["status"] == "ready"
 
