@@ -451,12 +451,21 @@ class AIStore:
                 )
 
     def review_trace(self, job_id: int) -> dict | None:
+        return self.review_traces([job_id]).get(job_id)
+
+    def review_traces(self, job_ids: list[int]) -> dict[int, dict]:
+        if not job_ids:
+            return {}
+        placeholders = ",".join("?" for _ in job_ids)
         rows = self.rows(
-            "SELECT data FROM ai_runs WHERE job_id=? AND id LIKE ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (str(job_id), "audit:%"),
+            "SELECT job_id, data FROM ("
+            "SELECT job_id, data, ROW_NUMBER() OVER "
+            "(PARTITION BY job_id ORDER BY created_at DESC, id DESC) AS trace_rank "
+            f"FROM ai_runs WHERE id LIKE ? AND job_id IN ({placeholders})"
+            ") ranked WHERE trace_rank=1",
+            ("audit:%", *map(str, job_ids)),
         )
-        return json.loads(rows[0][0]) if rows else None
+        return {int(job_id): json.loads(data) for job_id, data in rows}
 
     def runs(self, job_id: str | None = None, limit: int = 100) -> list[dict]:
         query = "SELECT data FROM ai_runs WHERE id NOT LIKE ? AND id NOT LIKE ?"

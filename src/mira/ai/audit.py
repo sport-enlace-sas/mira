@@ -120,6 +120,7 @@ class ReviewTrace:
         self.started_at = time.time()
         self.finished_at: float | None = None
         self.status = "running"
+        self.result: dict | None = None
         self.runs: dict[str, dict] = {}
         self.spans: dict[str, list[dict]] = {}
         self.failed_stages: set[str] = set()
@@ -185,6 +186,10 @@ class ReviewTrace:
                 "job_metrics": metrics,
             }
         )
+
+    def record_result(self, result: dict) -> None:
+        self.result = result
+        self.emit()
 
     def finish(self, status: str) -> None:
         if self.finished_at is not None and self.status == status:
@@ -299,6 +304,7 @@ class ReviewTrace:
             "updated_at": now,
             "finished_at": self.finished_at,
             "status": self.status,
+            "result": self.result,
             "stages": stages,
         }
 

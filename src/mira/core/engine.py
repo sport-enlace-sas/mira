@@ -620,6 +620,7 @@ class ReviewEngine:
         self.trace = trace
         self._snapshot_guard = snapshot_guard
         self._progress_comment: tuple[int, str] | None = None
+        self._published_walkthrough_id: int | None = None
         self._can_publish = can_publish or (lambda: True)
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
         # is not the same as `_index_was_empty` (whole-repo: no data at all).
@@ -694,6 +695,7 @@ class ReviewEngine:
             markdown = f"{marker}\n## Mira PR Walkthrough\n\n{reason}\n"
         try:
             await self.provider.update_comment(pr_info, comment_id, markdown)
+            self._published_walkthrough_id = comment_id
         except Exception as exc:
             logger.warning("Failed to finalize walkthrough placeholder: %s", exc)
 
@@ -813,25 +815,53 @@ class ReviewEngine:
     async def _finish_check(
         self, pr_info: PRInfo, run_id: int | None, status_key: str, result: ReviewResult | None
     ) -> None:
-        """Best-effort: complete the check run (success/failure/neutral)."""
-        if run_id is None:
+        """Publish the final check best-effort and record the audit's outcome."""
+        check_finished = False
+        if run_id is not None:
+            conclusion, title, summary = self._CHECK_CONCLUSIONS[status_key]
+            summary = summary.format(mention=self._mention())
+            if pr_info.platform == "github":
+                summary += f" Advisory review for `{pr_info.head_sha[:12]}`."
+            try:
+                assert self.provider is not None
+                await self.provider.finish_check_run(
+                    pr_info,
+                    run_id,
+                    conclusion,
+                    title=title,
+                    summary=summary,
+                    details=self._check_details(result),
+                )
+                check_finished = True
+            except Exception as exc:
+                logger.warning("Failed to finish check run for %s: %s", pr_info.url, exc)
+
+        if self.trace is None:
             return
-        conclusion, title, summary = self._CHECK_CONCLUSIONS[status_key]
-        summary = summary.format(mention=self._mention())
+        report_url = report_kind = None
         if pr_info.platform == "github":
-            summary += f" Advisory review for `{pr_info.head_sha[:12]}`."
-        try:
-            assert self.provider is not None
-            await self.provider.finish_check_run(
-                pr_info,
-                run_id,
-                conclusion,
-                title=title,
-                summary=summary,
-                details=self._check_details(result),
-            )
-        except Exception as exc:
-            logger.warning("Failed to finish check run for %s: %s", pr_info.url, exc)
+            if self._published_walkthrough_id is not None:
+                report_url = f"{pr_info.url}#issuecomment-{self._published_walkthrough_id}"
+                report_kind = "walkthrough"
+            elif check_finished:
+                repo_url = pr_info.url.rsplit("/pull/", 1)[0]
+                report_url = f"{repo_url}/runs/{run_id}"
+                report_kind = "check"
+
+        self.trace.record_result(
+            {
+                "conclusion": "skipped"
+                if status_key == "success" and result is not None and result.skipped_reason
+                else status_key,
+                "files_reviewed": result.reviewed_files if result is not None else None,
+                "files_total": len(result.total_paths)
+                if result is not None and result.total_paths
+                else None,
+                "findings_count": len(result.comments) if result is not None else None,
+                "report_url": report_url,
+                "report_kind": report_kind,
+            }
+        )
 
     @staticmethod
     def _format_failure_notice(exc: BaseException) -> str:
@@ -964,6 +994,7 @@ class ReviewEngine:
         if pr_info is None:
             pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
+        self._published_walkthrough_id = None
 
         import asyncio
 
@@ -1545,8 +1576,11 @@ class ReviewEngine:
                     comment_id = await self.provider.find_bot_comment(pr_info, walkthrough_marker)
                 if comment_id is not None:
                     await self.provider.update_comment(pr_info, comment_id, markdown)
+                    self._published_walkthrough_id = comment_id
                 else:
-                    await self.provider.post_comment(pr_info, markdown)
+                    posted_id = await self.provider.post_comment(pr_info, markdown)
+                    if isinstance(posted_id, int):
+                        self._published_walkthrough_id = posted_id
             except Exception as exc:
                 logger.warning("Failed to publish compact audit report: %s", exc)
                 if placeholder_id is not None:

@@ -17,6 +17,9 @@ from mira.dashboard.api import (
     CostEstimate,
     IndexStatusModel,
     OrgStatsModel,
+    ReviewAuditActiveStage,
+    ReviewAuditModelSummary,
+    ReviewAuditSummary,
     ReviewJobModel,
     ReviewStatsModel,
     TimeSeriesPoint,
@@ -25,6 +28,7 @@ from mira.dashboard.api import (
     logger,
     router,
 )
+from mira.dashboard.db import ReviewJobStatus
 from mira.index.store import IndexStore
 
 
@@ -200,7 +204,48 @@ def list_activity(limit: int = 200, repo: str = "", q: str = "") -> ActivityResp
 @router.get("/api/review-jobs", response_model=list[ReviewJobModel])
 def list_review_jobs(limit: int = 200) -> list[ReviewJobModel]:
     """Durable advisory queue, including SHA state and provider provenance."""
-    return [ReviewJobModel(**job.__dict__) for job in _api._app_db.list_review_jobs(limit)]
+    from mira.ai.api import get_store
+
+    jobs = _api._app_db.list_review_jobs(limit)
+    traces = get_store(_api._app_db).review_traces([job.id for job in jobs if job.attempts])
+    return [
+        ReviewJobModel(**job.__dict__, audit_summary=_audit_summary(job, traces.get(job.id)))
+        for job in jobs
+    ]
+
+
+def _audit_summary(job: ReviewJobStatus, trace: dict | None) -> ReviewAuditSummary | None:
+    if trace is None or trace["attempt"] != job.attempts:
+        return None
+    if job.status == "running" and (
+        trace["status"] != "running" or trace["updated_at"] < job.updated_at
+    ):
+        # Manual retries reset the attempt counter. Until the new trace is
+        # flushed, the previous execution can carry the same attempt number.
+        return None
+    active = job.status in {"running", "cancelling"}
+    active_stages = []
+    models: dict[tuple[str, str], int] = {}
+    for stage in trace["stages"]:
+        if active and stage["status"] == "running":
+            active_stages.append(ReviewAuditActiveStage(id=stage["id"], phases=stage["phases"]))
+        for model in stage["models"]:
+            key = model["provider"], model["model"]
+            models[key] = models.get(key, 0) + (model.get("active_attempts", 0) if active else 0)
+    return ReviewAuditSummary(
+        attempt=trace["attempt"],
+        worker=trace.get("worker"),
+        status=trace["status"],
+        created_at=trace["created_at"],
+        updated_at=trace["updated_at"],
+        active_stages=active_stages,
+        models=[
+            ReviewAuditModelSummary(provider=provider, model=model, active_attempts=active)
+            for (provider, model), active in models.items()
+        ],
+        has_stage_failures=any(stage["status"] == "failed" for stage in trace["stages"]),
+        result=trace.get("result"),
+    )
 
 
 @router.get("/api/review-jobs/{job_id}/trace")
