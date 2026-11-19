@@ -249,6 +249,7 @@ class ReviewTrace:
                             "provider": provider,
                             "model": model,
                             "calls": 0,
+                            "active_attempts": 0,
                             "duration_ms": 0,
                             "input_tokens": 0,
                             "output_tokens": 0,
@@ -258,6 +259,7 @@ class ReviewTrace:
                     )
                     usage = step.get("usage") or {}
                     item["calls"] += 1
+                    item["active_attempts"] += int(step["result"] == "running")
                     item["duration_ms"] += step.get("duration_ms", 0)
                     item["input_tokens"] += usage.get("prompt_tokens", 0)
                     item["output_tokens"] += usage.get("completion_tokens", 0)
@@ -332,7 +334,13 @@ class ReviewTrace:
             if any("session_wait_ms" in model for model in models):
                 wait = sum(model.get("session_wait_ms", 0) for model in models) / 1000
                 inference = sum(model.get("inference_ms", 0) for model in models) / 1000
-                elapsed += f" · wait {wait:.1f}s / model {inference:.1f}s"
+                timings = [
+                    f"{label} {value:.1f}s"
+                    for label, value in (("wait", wait), ("model", inference))
+                    if status != "running" or value
+                ]
+                if timings:
+                    elapsed += " · " + " / ".join(timings)
             reported = [model for model in models if model["usage_reported"]]
             usage = (
                 f"{sum(model['input_tokens'] for model in reported):,} / "

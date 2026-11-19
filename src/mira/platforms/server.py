@@ -209,10 +209,17 @@ async def _consume_review_jobs(
     while True:
         if worker > 1 and _app_db.has_claimable_review_jobs():
             runtime = current()
-            if runtime is None or not runtime.managed() or runtime.review_capacity() < worker:
+            try:
+                available = (
+                    runtime is not None and runtime.managed() and runtime.review_capacity() > 0
+                )
+            except ValueError:
+                # Configuration can change between the assignment and credential reads.
+                available = False
+            if not available:
                 if not waiting_for_capacity:
                     logger.info(
-                        "Review worker %s waiting for another available AI connection", worker
+                        "Review worker %s waiting for an available managed AI connection", worker
                     )
                     waiting_for_capacity = True
                 await asyncio.sleep(_REVIEW_WORKER_RESTART_SECONDS)

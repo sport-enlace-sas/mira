@@ -343,7 +343,10 @@ async def test_superseded_sha_only_requeues_when_github_confirms_the_head(
     assert db.get_review_job(newer.id).status == "completed"
 
 
-async def test_workers_claim_distinct_reviews_with_available_capacity(queue_db, monkeypatch):
+@pytest.mark.parametrize("initial_capacity", [0, None], ids=["empty", "configuration-changed"])
+async def test_workers_claim_distinct_reviews_with_one_shared_connection(
+    queue_db, monkeypatch, initial_capacity
+):
     from mira.ai.audit import AuditWriter
     from mira.ai.store import AIStore
 
@@ -351,10 +354,16 @@ async def test_workers_claim_distinct_reviews_with_available_capacity(queue_db, 
     second = enqueue(queue_db, number=102)
     monkeypatch.setattr(api, "_app_db", queue_db)
     writer = AuditWriter(AIStore(queue_db), interval=0.001)
-    capacity = 1
+    capacity = initial_capacity
+
+    def review_capacity():
+        if capacity is None:
+            raise ValueError("Connection changed between reads")
+        return capacity
+
     runtime = SimpleNamespace(
         managed=lambda: True,
-        review_capacity=lambda: capacity,
+        review_capacity=review_capacity,
         audit_writer=writer,
     )
     monkeypatch.setattr("mira.ai.runtime.current", lambda: runtime)
@@ -383,7 +392,7 @@ async def test_workers_claim_distinct_reviews_with_available_capacity(queue_db, 
         await asyncio.wait_for(first_started.wait(), 2)
         assert running == {1: first.id}
         assert queue_db.get_review_job(second.id).status == "pending"
-        capacity = 2
+        capacity = 1
         await asyncio.wait_for(both_started.wait(), 2)
         assert running == {1: first.id, 2: second.id}
         assert queue_db.get_review_job(first.id).status == "running"

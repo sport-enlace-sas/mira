@@ -482,6 +482,7 @@ export interface ReviewAuditStage {
     provider: string
     model: string
     calls: number
+    active_attempts?: number
     duration_ms: number
     session_wait_ms?: number
     inference_ms?: number

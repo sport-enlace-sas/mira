@@ -81,11 +81,12 @@ SHA becomes eligible after 90 seconds without a newer push. Replayed deliveries
 do not reset the timer. Explicit review commands remain available.
 
 The deployment setting `review.queue_workers` enables two consumers of the same
-managed review flows. The second waits while the assigned review flow has fewer
-than two available active connections. When the first connection is busy with a
-different review, a worker can continue through later nodes of that same flow.
-If the alternatives fail, it may wait for the busy node within its usual timeout.
-Use connections with independent quota to gain actual parallel inference.
+managed review flows. Both can prepare reviews when the assigned review flow has
+at least one available connection. AI attempts that share a connection enter it
+in arrival order. The broker serializes access to the credential, including its
+renewal. When another review holds a connection, a worker can try later nodes of
+the same flow and return to the busy node if the alternatives fail. Available
+connections with independent quota allow concurrent inference.
 
 Advisory Jobs keeps one expandable card per SHA. The latest attempt shows its
 worker, active stages, model and provider, time, and input and output tokens

@@ -164,24 +164,33 @@ function JobTrace({ job, refresh, now }: { job: ReviewJobModel; refresh: number;
                 )}
                 {stage.models.length > 0 && (
                   <ul className="mt-2 divide-y border-t">
-                    {stage.models.map((model) => (
-                      <li key={`${model.provider}/${model.model}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5 text-xs">
-                        <span className="min-w-0 break-all font-mono">{model.model} <span className="text-muted-foreground">· {model.provider}</span></span>
-                        <span className="tabular-nums text-muted-foreground">
-                          {model.calls} {model.calls === 1 ? "intento" : "intentos"} · {formatDuration(model.duration_ms)}
-                          {" · "}
-                          {model.usage_reported
-                            ? `${model.calls_with_usage < model.calls ? "≥ " : ""}${TOKEN_FORMATTER.format(model.input_tokens)} entrada / ${TOKEN_FORMATTER.format(model.output_tokens)} salida`
-                            : "tokens sin reporte"}
-                        </span>
-                        {model.session_wait_ms != null && (
-                          <span className="w-full tabular-nums text-muted-foreground">
-                            Espera de conexión · {formatDuration(model.session_wait_ms)}
-                            {model.inference_ms != null && ` · Tiempo del modelo · ${formatDuration(model.inference_ms)}`}
+                    {stage.models.map((model) => {
+                      const active = model.active_attempts ?? 0
+                      const hasFinished = model.calls > active
+                      const wait = model.session_wait_ms
+                      const inference = model.inference_ms
+                      const showWait = wait != null && (wait > 0 || hasFinished)
+                      const showInference = inference != null && (inference > 0 || hasFinished)
+                      return (
+                        <li key={`${model.provider}/${model.model}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5 text-xs">
+                          <span className="min-w-0 break-all font-mono">{model.model} <span className="text-muted-foreground">· {model.provider}</span></span>
+                          <span className="tabular-nums text-muted-foreground">
+                            {model.calls} {model.calls === 1 ? "intento" : "intentos"}
+                            {active > 0 && ` · ${active} en curso`}
+                            {hasFinished && ` · ${formatDuration(model.duration_ms)}`}
+                            {model.usage_reported
+                              ? ` · ${model.calls_with_usage < model.calls ? "≥ " : ""}${TOKEN_FORMATTER.format(model.input_tokens)} entrada / ${TOKEN_FORMATTER.format(model.output_tokens)} salida`
+                              : hasFinished && " · tokens sin reporte"}
                           </span>
-                        )}
-                      </li>
-                    ))}
+                          {(showWait || showInference) && (
+                            <span className="flex w-full flex-wrap gap-x-3 tabular-nums text-muted-foreground">
+                              {showWait && <span>Espera de conexión · {formatDuration(wait)}</span>}
+                              {showInference && <span>Tiempo del modelo · {formatDuration(inference)}</span>}
+                            </span>
+                          )}
+                        </li>
+                      )
+                    })}
                   </ul>
                 )}
                 {!!stage.issues?.length && (

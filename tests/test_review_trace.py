@@ -62,3 +62,31 @@ async def test_review_trace_counts_skips_separately_from_actual_model_usage():
     assert "Model response timed out" in markdown
     assert "wait 1.2s / model 3.0s" in markdown
     assert "private provider details" not in markdown
+
+
+async def test_review_trace_reports_active_attempt_before_times_are_available():
+    trace = ReviewTrace(SimpleNamespace(submit=MagicMock()), 42, 1, 2)
+    trace.observe(
+        {
+            "id": "scan",
+            "scenario": "security",
+            "created_at": time.time(),
+            "status": "running",
+            "steps": [
+                {
+                    "result": "running",
+                    "phase": "waiting_for_session",
+                    "provider": "codex-cli",
+                    "model": "test-model",
+                    "session_wait_ms": 0,
+                    "inference_ms": 0,
+                }
+            ],
+        }
+    )
+    stage = next(item for item in trace.snapshot()["stages"] if item["id"] == "security")
+    assert stage["models"][0]["active_attempts"] == 1
+    markdown = trace.markdown()
+    assert "Waiting for connection" in markdown
+    assert "wait 0.0s" not in markdown
+    assert "model 0.0s" not in markdown

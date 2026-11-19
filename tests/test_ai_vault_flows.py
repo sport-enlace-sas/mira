@@ -385,8 +385,109 @@ async def test_review_workers_share_the_flow_and_use_an_available_fallback(store
 
     await secondary.complete([])
     assert calls[-1] == "claude-cli"  # The next job starts at the same first node.
+
+    arrival = asyncio.Queue()
+    reserve = runtime.worker_connection
+
+    @asynccontextmanager
+    async def watched_reservation(connection_id, worker):
+        arrival.put_nowait(connection_id)
+        async with reserve(connection_id, worker):
+            yield
+
+    runtime.worker_connection = watched_reservation
+    async with reserve(codex, 2):
+        async with reserve(claude, 1):
+            task = asyncio.create_task(secondary.complete([]))
+            queued_connection = await asyncio.wait_for(arrival.get(), 2)
+        await asyncio.wait_for(task, 2)
+    assert queued_connection == claude  # Worker 2 already had an attempt on Codex.
+    assert calls == ["claude-cli", "codex-cli", "claude-cli", "claude-cli"]
+
     store.set_state(f"quota:{claude_credential}:claude-test", {"until": time.time() + 120})
     assert runtime.review_capacity() == 1
+
+
+@pytest.mark.parametrize("cancel", [None, "waiting", "holding"])
+async def test_shared_connection_queues_review_attempts_in_order(store, cancel):
+    cid, credential = connection(store)
+    chain(store, cid, ("shared-model",))
+    runtime = AIRuntime(store)
+    first_review = runtime.provider(LLMConfig())
+    second_review = runtime.provider(LLMConfig())
+    first_review.shared.update(worker=1, job_id="1")
+    second_review.shared.update(worker=2, job_id="2")
+    arrival = asyncio.Queue()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    broker_entries = []
+    inferred = []
+    tasks = []
+    reserve = runtime.worker_connection
+
+    @asynccontextmanager
+    async def watched_reservation(connection_id, worker):
+        arrival.put_nowait((connection_id, worker))
+        async with reserve(connection_id, worker):
+            yield
+
+    async def infer(messages, **kwargs):
+        label = messages[0]["content"]
+        inferred.append(label)
+        if label == "first":
+            first_started.set()
+            await release_first.wait()
+        return '{"ok":true}'
+
+    @asynccontextmanager
+    async def broker(connection, config, credential_id):
+        broker_entries.append(credential_id)
+        async with store.session_lock(credential_id):
+            yield FakeProvider(infer)
+
+    runtime.worker_connection = watched_reservation
+    runtime.broker.provider = broker
+
+    async def launch(review, label):
+        task = asyncio.create_task(review.complete([{"role": "user", "content": label}]))
+        tasks.append(task)
+        assert await asyncio.wait_for(arrival.get(), 2) == (cid, review.shared["worker"])
+        return task
+
+    try:
+        first = await launch(first_review, "first")
+        await asyncio.wait_for(first_started.wait(), 2)
+        second = await launch(second_review, "second")
+        await launch(first_review, "late")
+        assert broker_entries == [credential]
+        assert inferred == ["first"]
+
+        cancelled = {"waiting": second, "holding": first}.get(cancel)
+        if cancelled is not None:
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+        if cancel != "holding":
+            release_first.set()
+        remaining = [task for task in tasks if task is not cancelled]
+        assert await asyncio.wait_for(asyncio.gather(*remaining), 2) == ['{"ok":true}'] * len(
+            remaining
+        )
+        assert inferred == (
+            ["first", "late"] if cancel == "waiting" else ["first", "second", "late"]
+        )
+        assert runtime.worker_connection_free(cid)
+        async with asyncio.timeout(2), store.session_lock(credential):
+            pass
+        assert sum(run["status"] == "cancelled" for run in store.runs()) == int(
+            cancelled is not None
+        )
+    finally:
+        release_first.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_buffered_review_trace_coalesces_and_retries_without_holding_review(
