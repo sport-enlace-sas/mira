@@ -46,6 +46,7 @@ export interface ReviewJobModel {
   next_attempt_at: number
   created_at: number
   updated_at: number
+  audit_summary?: ReviewAuditSummary | null
 }
 
 export interface SymbolModel {
@@ -452,6 +453,27 @@ export interface OpenPr {
   reviewers: OpenPrReviewer[]
 }
 
+export interface ReviewAuditResult {
+  conclusion: string
+  files_reviewed: number | null
+  files_total: number | null
+  findings_count: number | null
+  report_url: string | null
+  report_kind: "walkthrough" | "check" | null
+}
+
+export interface ReviewAuditSummary {
+  attempt: number
+  worker: number | null
+  status: string
+  created_at: number
+  updated_at: number
+  has_stage_failures: boolean
+  active_stages: { id: string; phases: string[] }[]
+  models: { provider: string; model: string; active_attempts: number }[]
+  result: ReviewAuditResult | null
+}
+
 export interface ReviewAuditTrace {
   attempt: number
   worker: number | null
@@ -460,6 +482,7 @@ export interface ReviewAuditTrace {
   finished_at: number | null
   status: string
   stages: ReviewAuditStage[]
+  result?: ReviewAuditResult | null
 }
 
 export interface ReviewAuditStage {
