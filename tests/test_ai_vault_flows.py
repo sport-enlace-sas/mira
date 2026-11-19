@@ -899,6 +899,58 @@ def test_catalog_keeps_verified_unlisted_models_after_native_refresh(store, monk
             assert "test-secret-never-returned" not in response.text
 
 
+async def test_auto_catalog_refreshes_active_session_on_version_change_and_expiry(
+    store, monkeypatch
+):
+    from mira.ai import catalog
+
+    _, credential = connection(store, "codex-cli")
+    _, inactive = connection(store, "codex-cli")
+    inactive_connection = store.credential_metadata(inactive)["connection_id"]
+    disabled = store.connection(inactive_connection)
+    store.save_connection({**disabled, "enabled": False}, 1, connection_id=inactive_connection)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(catalog.time, "time", lambda: now)
+    monkeypatch.setenv("MIRA_CODEX_CLI_VERSION", "0.170.0")
+    models = [{"id": "gpt-6.2-sol", "source": "codex:model/list", "status": "listed"}]
+    native = AsyncMock(return_value=models)
+    monkeypatch.setattr(catalog, "codex_models", native)
+    key = f"catalog:{credential}"
+    store.set_state(key, {"models": [], "checked_at": now, "client_version": "0.154.0"})
+
+    async with store.session_lock(credential):
+        await catalog.refresh_due_codex_catalogs(store)
+        native.assert_not_awaited()
+
+    await catalog.refresh_due_codex_catalogs(store)
+    verified = store.state(key, {})
+    assert verified["models"] == models
+    assert verified["client_version"] == "0.170.0"
+    assert verified["refresh_mode"] == "automatic"
+    assert verified["checked_at"] == now
+    await catalog.refresh_due_codex_catalogs(store)
+    native.assert_awaited_once()
+
+    now += catalog.CODEX_CATALOG_TTL
+    native.side_effect = RuntimeError("temporary outage")
+    await catalog.refresh_due_codex_catalogs(store)
+    failed = store.state(key, {})
+    assert failed["models"] == models
+    assert failed["checked_at"] == verified["checked_at"]
+    assert failed["last_attempt_at"] == now
+    assert failed["cause"] == "catalog_unavailable"
+    await catalog.refresh_due_codex_catalogs(store)
+    assert native.await_count == 2
+
+    now += catalog.CODEX_CATALOG_POLL_INTERVAL
+    native.side_effect = None
+    await catalog.refresh_due_codex_catalogs(store)
+    assert native.await_count == 3
+    assert store.state(key, {})["checked_at"] == now
+    assert store.state(key, {}).get("cause") is None
+    assert store.state(f"catalog:{inactive}", {}) == {}
+
+
 def test_catalog_groups_claude_aliases_without_sharing_access_across_credentials(store):
     from mira.ai.catalog import catalog_view
 
@@ -1665,6 +1717,9 @@ async def test_postgres_versions_encryption_and_cross_process_locks(tmp_path):
             acquired.set()
 
     async with store.session_lock(credential):
+        with pytest.raises(ConflictError):
+            async with store.session_lock(credential, wait=False):
+                pytest.fail("An occupied session must not be acquired by catalog refresh")
         task = asyncio.create_task(acquire())
         await asyncio.sleep(0.05)
         assert not acquired.is_set()

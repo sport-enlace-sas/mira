@@ -78,6 +78,12 @@ export type Model = {
   access?: Record<string, { status?: string; checked_at?: number }>
   quota?: { until?: number }
 }
+export type ModelCatalog = {
+  models: Model[]
+  status: string
+  checked_at: number | null
+  cause?: string
+}
 export type Login = {
   id: string
   connection_id: string
@@ -138,11 +144,11 @@ export const aiApi = {
   deleteCredential: (connection: string, credential: string) =>
     deleteJson(`/api/ai/connections/${connection}/credentials/${credential}`),
   models: (id: string, credential?: string) =>
-    fetchJson<{ models: Model[]; status: string; checked_at: number | null }>(
+    fetchJson<ModelCatalog>(
       `/api/ai/connections/${id}/models${credentialQuery(credential)}`
     ),
   refreshModels: (id: string, credential?: string) =>
-    postJson<{ models: Model[] }>(
+    postJson<ModelCatalog>(
       `/api/ai/connections/${id}/models/refresh${credentialQuery(credential)}`,
       {}
     ),

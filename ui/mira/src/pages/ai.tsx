@@ -29,7 +29,7 @@ import {
   type DiagnosticInput,
   type Flow,
   type Login,
-  type Model,
+  type ModelCatalog,
   type Run,
 } from "@/lib/api/ai"
 import { useAuth } from "@/lib/auth"
@@ -226,7 +226,8 @@ function SessionCard({
   const [confirm, setConfirm] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
-  const [models, setModels] = useState<Model[]>([])
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null)
+  const models = modelCatalog?.models ?? []
   const [model, setModel] = useState(
     connection.provider === "codex-cli"
       ? "gpt-6.1-sol"
@@ -239,6 +240,7 @@ function SessionCard({
   )
   const [prompt, setPrompt] = useState("")
   const active = session.id === connection.active_credential
+  const autoCatalog = active && connection.enabled && connection.provider === "codex-cli" && session.status === "ready"
   const expired = !!session.expires_at && session.expires_at <= now
   const providerName = providerNames[connection.provider] || connection.provider
   const label = credentialKind[session.kind] || "Sesión"
@@ -248,18 +250,24 @@ function SessionCard({
   const canProbe = canTest && connection.enabled && !!model.trim() && !disabled
 
   useEffect(() => {
-    if (!expanded) return
+    if (!expanded || busy) return
     let stale = false
-    void aiApi
-      .models(connection.id, session.id)
-      .then((catalog) => {
-        if (!stale) setModels(catalog.models)
-      })
-      .catch(() => {})
+    const readCatalog = () => {
+      void aiApi.models(connection.id, session.id)
+        .then((catalog) => {
+          if (!stale) setModelCatalog(catalog)
+        })
+        .catch(() => {})
+    }
+    readCatalog()
+    const poll = autoCatalog ? window.setInterval(() => {
+      if (document.visibilityState === "visible") readCatalog()
+    }, 30_000) : undefined
     return () => {
       stale = true
+      window.clearInterval(poll)
     }
-  }, [connection.id, session.id, expanded, diagnostic?.status])
+  }, [connection.id, session.id, expanded, diagnostic?.status, busy, autoCatalog])
 
   const action = async (fn: () => Promise<void>) => {
     setError("")
@@ -520,12 +528,19 @@ function SessionCard({
                       connection.id,
                       session.id
                     )
-                    setModels(catalog.models)
+                    setModelCatalog(catalog)
                   })
                 }
               >
                 <RefreshCw className="size-3.5" /> Actualizar catálogo
               </Button>
+              <div className="space-y-1 text-xs text-muted-foreground">
+                {autoCatalog && <p>Actualización automática cada hora</p>}
+                {modelCatalog?.checked_at != null && <p>Última consulta válida · {date(modelCatalog.checked_at)}</p>}
+                {modelCatalog?.cause === "catalog_unavailable" && (
+                  <p role="status">El proveedor no respondió al último intento. Se conserva el listado disponible.</p>
+                )}
+              </div>
               {models.length === 0 && (
                 <p className="text-xs text-muted-foreground">
                   Puedes escribir el identificador del modelo para probarlo.
@@ -535,6 +550,11 @@ function SessionCard({
                 {models.map((entry) => (
                   <div key={entry.id} className="space-y-1 p-3 text-xs">
                     <p className="font-mono break-all">{entry.id}</p>
+                    {connection.provider === "codex-cli" && (
+                      <p className="text-muted-foreground">
+                        {entry.source === "codex:model/list" ? "Listado por Codex" : "Referencia de MIRA"}
+                      </p>
+                    )}
                     {Object.entries(entry.access || {}).map(
                       ([level, access]) => (
                         <p key={level} className="text-muted-foreground">
