@@ -359,7 +359,16 @@ def test_dashboard_job_list_batches_latest_trace_summaries(tmp_path, monkeypatch
     assert retry is not None and retry.attempts == historical.attempts
 
     active = claim(2)
-    model = {"provider": "codex-cli", "model": "example", "active_attempts": 1}
+    model = {
+        "provider": "codex-cli",
+        "model": "example",
+        "active_attempts": 1,
+        "calls": 2,
+        "calls_with_usage": 1,
+        "usage_reported": True,
+        "input_tokens": 7,
+        "output_tokens": 2,
+    }
     stages = [
         {"id": "review", "status": "running", "phases": ["waiting_for_session"], "models": [model]},
         {"id": "security", "status": "running", "phases": ["requesting"], "models": [model]},
@@ -379,6 +388,9 @@ def test_dashboard_job_list_batches_latest_trace_summaries(tmp_path, monkeypatch
     assert [stage.id for stage in summary.active_stages] == ["review", "security"]
     assert summary.models[0].active_attempts == 2
     assert len(summary.models) == 1
+    totals = jobs[active.id].audit_totals
+    assert totals is not None
+    assert (totals.input_tokens, totals.output_tokens, totals.tokens_partial) == (14, 4, True)
     historical_summary = jobs[legacy.id].audit_summary
     assert historical_summary is not None and historical_summary.has_stage_failures
     assert historical_summary.result is None
@@ -398,3 +410,60 @@ def test_dashboard_job_list_batches_latest_trace_summaries(tmp_path, monkeypatch
     assert summary.active_stages == []
     assert summary.result.conclusion == "findings"
     assert summary.result.files_total == 5
+
+
+def test_dashboard_recovers_totals_for_failed_preflight_attempts(tmp_path, monkeypatch) -> None:
+    from mira.ai.api import get_store
+    from mira.dashboard import api
+    from mira.dashboard.routers.core import list_review_jobs
+
+    now = 1_700_000_000.0
+    monkeypatch.setattr(dashboard_db.time, "time", lambda: now)
+    db = AppDatabase(str(tmp_path / "app.db"), admin_password="test-password")
+    monkeypatch.setattr(api, "_app_db", db)
+    store = get_store(db)
+    assert db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=5,
+        head_sha="a" * 40,
+        pr_url="https://github.com/o/r/pull/5",
+        pr_title="duplicate PR attempt",
+        installation_id=1,
+        is_private=True,
+    )
+    for attempt in range(1, 4):
+        job = db.claim_next_review_job()
+        assert job is not None and job.attempts == attempt
+        trace = {
+            "id": f"audit:{job.id}:{attempt}",
+            "job_id": job.id,
+            "created_at": now,
+            "updated_at": now + 1.5,
+            "finished_at": now + 1.5,
+            "attempt": attempt,
+            "status": "failed",
+            "stages": [{"id": "ingestion", "started_at": now, "status": "completed", "models": []}],
+        }
+        store.save_run(trace)
+        if attempt == 3:
+            store.save_run(
+                {
+                    **trace,
+                    "id": "metrics:" + trace["id"],
+                    "job_metrics": {
+                        "audit_duration_ms": 1500,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                }
+            )
+        db.finish_review_job(job.id, error="review already running", retry=attempt < 3)
+        now += 60
+
+    [listed] = list_review_jobs()
+    assert listed.status == "failed"
+    assert listed.audit_duration_ms == 1_500
+    totals = listed.audit_totals
+    assert totals is not None and totals.duration_ms == 4_500
+    assert (totals.input_tokens, totals.output_tokens, totals.tokens_partial) == (0, 0, False)
