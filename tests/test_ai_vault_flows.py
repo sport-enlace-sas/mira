@@ -414,7 +414,8 @@ async def test_session_wait_obeys_node_timeout_and_continues_to_next_provider(st
     assert store.credential_metadata(credential)["status"] == "ready"
 
 
-async def test_incompatible_context_is_skipped_without_truncation(store):
+@pytest.mark.parametrize("output_budget", [4096, 16384])
+async def test_incompatible_context_is_skipped_without_truncation(store, output_budget):
     cid, _ = connection(store)
     fid = chain(store, cid, ("small", "large"))
     flow = store.flow(fid)
@@ -427,13 +428,14 @@ async def test_incompatible_context_is_skipped_without_truncation(store):
     runtime = AIRuntime(store)
     invoke = AsyncMock(return_value='{"ok":true}')
     mock_broker(runtime, invoke)
-    await runtime.provider(LLMConfig()).complete([{"role": "user", "content": "whole request"}])
+    provider = runtime.provider(LLMConfig(max_tokens=output_budget))
+    await provider.complete([{"role": "user", "content": "whole request"}])
     assert invoke.await_count == 1
     assert store.runs()[0]["steps"][0]["cause"] == "context_incompatible"
     skipped = store.runs()[0]["steps"][0]
     assert skipped["context_window"] == 1024
     assert skipped["input_tokens_estimated"] < skipped["context_window"]
-    assert skipped["output_tokens_reserved"] == 4096
+    assert skipped["output_tokens_reserved"] == output_budget
     assert "1024" in skipped["action"]
 
 
