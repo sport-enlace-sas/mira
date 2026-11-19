@@ -497,7 +497,7 @@ class AIStore:
         self.root.chmod(0o700)
 
     @asynccontextmanager
-    async def session_lock(self, session: str) -> AsyncIterator[None]:
+    async def session_lock(self, session: str, *, wait: bool = True) -> AsyncIterator[None]:
         """Lock snapshot → native refresh → CAS persistence across processes."""
         if self.db._backend != "sqlite":
             from mira.db.postgres import connect
@@ -511,6 +511,8 @@ class AIStore:
                         cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
                         if cur.fetchone()[0]:
                             break
+                        if not wait:
+                            raise ConflictError("La sesión está en uso")
                         await asyncio.sleep(0.1)
                 yield
             finally:
@@ -527,6 +529,8 @@ class AIStore:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except BlockingIOError:
+                        if not wait:
+                            raise ConflictError("La sesión está en uso") from None
                         await asyncio.sleep(0.05)
                 yield
             finally:

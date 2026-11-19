@@ -1,6 +1,8 @@
+ARG CODEX_VERSION=0.170.0
+
 # ── Stage 1: build the React UI ───────────────────────────────────
 FROM node:20-slim AS ui-builder
-ARG CODEX_VERSION=0.154.0
+ARG CODEX_VERSION
 ARG CLAUDE_CODE_VERSION=2.1.282
 WORKDIR /ui
 COPY ui/mira/package.json ui/mira/package-lock.json ./
@@ -21,6 +23,8 @@ RUN git clone https://github.com/alibaba/open-code-review.git /src/ocr \
 
 # ── Stage 3: backend + bundled UI ─────────────────────────────────
 FROM python:3.12-slim
+ARG CODEX_VERSION
+ENV MIRA_CODEX_CLI_VERSION=$CODEX_VERSION
 LABEL org.opencontainers.image.source="https://github.com/miracodeai/mira"
 LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
@@ -38,7 +42,7 @@ COPY --from=ui-builder /usr/local/lib/node_modules/@openai/codex /usr/local/lib/
 COPY --from=ui-builder /usr/local/lib/node_modules/@anthropic-ai/claude-code /usr/local/lib/node_modules/@anthropic-ai/claude-code
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude \
- && codex --version \
+ && test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" \
  && claude --version
 
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up

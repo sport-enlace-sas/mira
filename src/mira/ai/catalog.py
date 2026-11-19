@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -13,8 +14,47 @@ from pathlib import Path
 
 import httpx
 
-from mira.ai.store import AIStore, Vault
+from mira.ai.store import AIStore, ConflictError, Vault
 from mira.llm.codex_cli import _SAFE_ENV_KEYS, CodexCLIProvider
+
+logger = logging.getLogger(__name__)
+CODEX_CATALOG_TTL = 3600
+CODEX_CATALOG_POLL_INTERVAL = 300
+
+
+def _codex_catalog_due(catalog: dict, version: str, now: float) -> bool:
+    if catalog.get("client_version") != version:
+        return True
+    interval = CODEX_CATALOG_POLL_INTERVAL if catalog.get("cause") else CODEX_CATALOG_TTL
+    return now - (catalog.get("last_attempt_at") or 0) >= interval
+
+
+async def refresh_due_codex_catalogs(store: AIStore) -> None:
+    """Refresh active Codex connections without waiting behind a review."""
+    version = os.environ.get("MIRA_CODEX_CLI_VERSION", "")
+    for connection in store.connections():
+        credential_id = connection["active_credential"]
+        if connection["provider"] != "codex-cli" or not connection["enabled"] or not credential_id:
+            continue
+        cached = store.state(f"catalog:{credential_id}", {})
+        if not _codex_catalog_due(cached, version, time.time()):
+            continue
+        try:
+            await discover(store, connection["id"], credential_id, automatic=True)
+        except ConflictError:
+            continue
+        except ValueError as error:
+            # A session can be removed, rotated, or temporarily inaccessible.
+            logger.warning("Automatic Codex catalog refresh skipped: %s", type(error).__name__)
+
+
+async def maintain_codex_catalogs(store: AIStore) -> None:
+    while True:
+        try:
+            await refresh_due_codex_catalogs(store)
+        except Exception as error:
+            logger.warning("Automatic Codex catalog refresh failed: %s", type(error).__name__)
+        await asyncio.sleep(CODEX_CATALOG_POLL_INTERVAL)
 
 
 async def codex_models(secret: dict, persist: Callable[[dict], None]) -> list[dict]:
@@ -214,7 +254,13 @@ def catalog_view(store: AIStore, connection_id: str, credential_id: str | None =
     return {**result, "models": list(models.values())}
 
 
-async def discover(store: AIStore, connection_id: str, credential_id: str | None = None) -> dict:
+async def discover(
+    store: AIStore,
+    connection_id: str,
+    credential_id: str | None = None,
+    *,
+    automatic: bool = False,
+) -> dict:
     connection, credential_id = _catalog_connection(store, connection_id, credential_id)
     if not credential_id:
         return {
@@ -223,7 +269,22 @@ async def discover(store: AIStore, connection_id: str, credential_id: str | None
             "status": "unverified",
         }
     vault = Vault(store)
-    async with store.session_lock(credential_id):
+    async with store.session_lock(credential_id, wait=not automatic):
+        key = f"catalog:{credential_id}"
+        cached = store.state(key, {})
+        version = os.environ.get("MIRA_CODEX_CLI_VERSION", "")
+        if automatic:
+            # Recheck inside the lock in case another process refreshed or rotated it.
+            connection, active = _catalog_connection(store, connection_id, None)
+            if (
+                active != credential_id
+                or connection["provider"] != "codex-cli"
+                or not connection["enabled"]
+                or not _codex_catalog_due(cached, version, time.time())
+            ):
+                return cached
+            if store.credential_metadata(credential_id).get("status") != "ready":
+                return cached
         secret, revision = vault.read(credential_id)
         provider = connection["provider"]
         try:
@@ -285,12 +346,18 @@ async def discover(store: AIStore, connection_id: str, credential_id: str | None
                 "status": "listed" if provider != "claude-cli" else "unverified",
             }
         except Exception:
-            # Discovery can be unsupported despite working inference. Do not quarantine.
+            # Retain the last successful list if the provider is temporarily unavailable.
             result = {
-                "models": curated(provider),
-                "checked_at": time.time(),
-                "status": "unverified",
+                **(
+                    cached
+                    or {"models": curated(provider), "checked_at": None, "status": "unverified"}
+                ),
                 "cause": "catalog_unavailable",
             }
-        store.set_state(f"catalog:{credential_id}", result)
+        result["last_attempt_at"] = time.time()
+        if provider == "codex-cli":
+            result["client_version"] = version
+            if automatic:
+                result["refresh_mode"] = "automatic"
+        store.set_state(key, result)
         return result

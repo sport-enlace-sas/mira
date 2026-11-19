@@ -315,6 +315,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        from mira.ai.api import get_store
+        from mira.ai.catalog import maintain_codex_catalogs
+        from mira.dashboard.api import _app_db
+
         # Backfill is a GitHub-installation concept; skip it on GitLab-only.
         backfill_task = (
             asyncio.create_task(backfill_missing_indexes(app_auth))
@@ -387,7 +391,12 @@ def create_app(
             )
         )
 
-        yield
+        catalog_task = asyncio.create_task(maintain_codex_catalogs(get_store(_app_db)))
+        try:
+            yield
+        finally:
+            catalog_task.cancel()
+            await asyncio.gather(catalog_task, return_exceptions=True)
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
         if review_worker_task is not None and not review_worker_task.done():
