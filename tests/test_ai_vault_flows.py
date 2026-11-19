@@ -1264,6 +1264,66 @@ async def test_schema_error_mentioning_auth_does_not_quarantine_healthy_credenti
     assert store.credential_metadata(credential)["status"] == "ready"
 
 
+@pytest.mark.parametrize("valid_reply", [True, False])
+async def test_security_pass_uses_forced_tool_in_managed_flow(store, sample_file_diff, valid_reply):
+    from mira.core.passes import security_review_pass
+    from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
+
+    cid, _ = connection(store)
+    chain(store, cid, ("security-model",))
+    runtime = AIRuntime(store)
+    reply = {"comments": [] if valid_reply else "not an array", "summary": "Security review"}
+    adapter = AsyncMock(return_value=json.dumps(reply))
+
+    @asynccontextmanager
+    async def provider(connection, config, credential_id=None):
+        yield FakeProvider(adapter)
+
+    runtime.broker.provider = provider
+    review = runtime.provider(LLMConfig())
+    files = [sample_file_diff]
+    result = await security_review_pass(
+        review, files, files, security_llm=review.for_scenario("security")
+    )
+
+    adapter.assert_awaited_once()
+    assert adapter.await_args.kwargs == {
+        "tools": [SUBMIT_REVIEW_TOOL],
+        "temperature": 0.0,
+        "force_tool": "submit_review",
+    }
+    run = store.runs()[0]
+    assert run["scenario"] == "security"
+    assert run["status"] == ("success" if valid_reply else "failed")
+    assert bool(result.failures) is not valid_reply
+    if not valid_reply:
+        assert run["steps"][0]["cause"] == "invalid"
+
+
+async def test_managed_flow_validates_the_named_tool_instead_of_the_first_tool(store):
+    from mira.llm.tool_schemas import SUBMIT_CRITIQUE_TOOL, SUBMIT_REVIEW_TOOL
+
+    cid, _ = connection(store)
+    chain(store, cid, ("security-model",))
+    runtime = AIRuntime(store)
+    reply = '{"comments": [], "summary": "Review"}'
+    adapter = AsyncMock(return_value=reply)
+
+    @asynccontextmanager
+    async def provider(connection, config, credential_id=None):
+        yield FakeProvider(adapter)
+
+    runtime.broker.provider = provider
+    review = runtime.provider(LLMConfig())
+    tools = [SUBMIT_CRITIQUE_TOOL, SUBMIT_REVIEW_TOOL]
+    assert await review.complete_with_tools([], tools, force_tool="submit_review") == reply
+    adapter.assert_awaited_once_with([], tools=tools, temperature=None, force_tool="submit_review")
+
+    with pytest.raises(ValueError, match="unknown forced tool"):
+        await review.complete_with_tools([], tools, force_tool="unknown_tool")
+    assert adapter.await_count == 1
+
+
 @pytest.mark.parametrize(
     ("provider", "url", "expected"),
     [

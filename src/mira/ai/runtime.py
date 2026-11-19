@@ -322,6 +322,13 @@ class FlowProvider:
         )
 
     @staticmethod
+    def _forced_tool(tools: list[dict], name: str) -> dict:
+        for tool in tools:
+            if tool["function"]["name"] == name:
+                return tool
+        raise ValueError("invalid_response: unknown forced tool")
+
+    @staticmethod
     def _validate(method: str, value: Any, kwargs: dict) -> None:
         from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 
@@ -341,13 +348,16 @@ class FlowProvider:
             return
         if not isinstance(value, str) or not value.strip():
             raise ValueError("invalid_response")
-        tool: Any = (
-            SUBMIT_REVIEW_TOOL
-            if method == "review"
-            else SUBMIT_WALKTHROUGH_TOOL
-            if method == "walkthrough"
-            else (kwargs.get("tools") or [None])[0]
-        )
+        tools = kwargs.get("tools") or []
+        force_tool = kwargs.get("force_tool")
+        if method == "review":
+            tool = SUBMIT_REVIEW_TOOL
+        elif method == "walkthrough":
+            tool = SUBMIT_WALKTHROUGH_TOOL
+        elif force_tool is not None:
+            tool = FlowProvider._forced_tool(tools, force_tool)
+        else:
+            tool = tools[0] if tools else None
         if tool is not None:
             validate(json.loads(value), tool["function"]["parameters"])
         elif kwargs.get("json_mode", True) and not isinstance(json.loads(value), dict):
@@ -672,10 +682,18 @@ class FlowProvider:
         )
 
     async def complete_with_tools(
-        self, messages: list, tools: list, temperature: float | None = None
+        self,
+        messages: list,
+        tools: list,
+        temperature: float | None = None,
+        force_tool: str | None = None,
     ) -> str:
+        tool_options = {}
+        if force_tool is not None:
+            self._forced_tool(tools, force_tool)
+            tool_options["force_tool"] = force_tool
         return await self._call(
-            "complete_with_tools", messages, tools=tools, temperature=temperature
+            "complete_with_tools", messages, tools=tools, temperature=temperature, **tool_options
         )
 
     async def complete_agentic(
