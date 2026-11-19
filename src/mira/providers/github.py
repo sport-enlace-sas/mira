@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -26,7 +27,7 @@ from mira.models import (
     ReviewResult,
     UnresolvedThread,
 )
-from mira.providers.base import BaseProvider
+from mira.providers.base import BaseProvider, CheckConclusion
 
 # Shared comment-formatting helpers (re-exported for back-compat — callers and
 # tests import these names from this module).
@@ -54,6 +55,7 @@ _retry_transient = retry(
 )
 
 # GitHub Enterprise: set MIRA_GITHUB_API_URL (and MIRA_GITHUB_GRAPHQL_URL if non-default).
+_GITHUB_CHECK_RUN_NAME = "Inlaze Advisory Reviewer"
 _GITHUB_API_URL = os.environ.get(
     "MIRA_GITHUB_API_URL",
     "https://api.github.com",
@@ -262,7 +264,7 @@ class GitHubProvider(BaseProvider):
         repo: str,
         username: str,
         *,
-        user_id: int | None = None,
+        user_id: int | str | None = None,
     ) -> str | None:
         """Fetch a user's collaborator permission, normalized for authz."""
         token = await self._resolve_token()
@@ -632,40 +634,108 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to post comment: {e}") from e
 
-    async def post_advisory_check(
+    def _check_run_headers(self, token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+    async def start_check_run(
         self,
         pr_info: PRInfo,
         *,
-        conclusion: str,
-        summary: str,
-        title: str = "Inlaze Advisory Reviewer",
-    ) -> None:
-        """Create the completed, informational GitHub Check Run for a PR SHA."""
+        title: str = "",
+        summary: str = "",
+        details_url: str = "",
+    ) -> int | None:
+        """Create an in-progress check run for the PR head commit.
+
+        Uses the Checks API: the run shows the bot avatar, a title/summary,
+        and a details link (clickable from the PR checks section). No retry on
+        transient errors — a missing ``checks: write`` permission surfaces as
+        a single 403 instead of a retry storm.
+        """
+        if not pr_info.head_sha:
+            return None
         token = await self._resolve_token()
-        gh = self._make_client(token)
-        # GitHub limits check output fields.  Preserve the beginning, which
-        # contains the scope and outcome, rather than failing a completed PR
-        # review because its summary is unusually verbose.
-        safe_summary = summary[:65_000]
-
-        @_retry_transient
-        def _post_check() -> None:
-            gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
-            gh_repo.create_check_run(
-                name=title,
-                head_sha=pr_info.head_sha,
-                status="completed",
-                conclusion=conclusion,
-                output={"title": title, "summary": safe_summary},
-            )
-
+        url = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/check-runs"
+        payload: dict[str, Any] = {
+            "name": _GITHUB_CHECK_RUN_NAME,
+            "head_sha": pr_info.head_sha,
+            "status": "in_progress",
+            "started_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "output": {
+                "title": title or _GITHUB_CHECK_RUN_NAME,
+                "summary": summary,
+                "text": "",
+            },
+        }
+        if details_url:
+            payload["details_url"] = details_url
         try:
-            await asyncio.to_thread(_post_check)
-        except Exception as exc:
-            # A missing Checks:write permission must not turn an advisory
-            # review into a failed job.  The walkthrough/review remains the
-            # source of feedback while the app permission is corrected.
-            logger.warning("Unable to publish advisory check run: %s", type(exc).__name__)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers=self._check_run_headers(token),
+                )
+        except (ConnectionError, TimeoutError, httpx.TransportError) as e:
+            raise ProviderError(f"GitHub POST {url} failed: {e}") from e
+        if resp.status_code == 403:
+            # Check-run write is App-only (`checks: write` is granted to
+            # GitHub App installations, not to personal tokens). Skip the
+            # check run; the engine logs no status was published.
+            logger.warning(
+                "GitHub check-run create forbidden (needs a GitHub App "
+                "installation with checks:write granted): %s",
+                resp.text[:300],
+            )
+            return None
+        if resp.status_code != 201:
+            raise ProviderError(f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}")
+        return int(resp.json()["id"])
+
+    async def finish_check_run(
+        self,
+        pr_info: PRInfo,
+        run_id: int | None,
+        conclusion: CheckConclusion,
+        *,
+        title: str = "",
+        summary: str = "",
+        details: str = "",
+    ) -> None:
+        """Complete an in-progress check run with a conclusion.
+
+        ``details`` goes into the check run's expandable DETAILS section
+        (``output.text``); an empty string leaves the box blank.
+        """
+        if run_id is None:
+            return
+        token = await self._resolve_token()
+        url = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/check-runs/{run_id}"
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload: dict[str, Any] = {
+            "status": "completed",
+            "conclusion": conclusion,
+            "completed_at": now,
+            "output": {
+                "title": title or _GITHUB_CHECK_RUN_NAME,
+                "summary": summary,
+                "text": details,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.patch(
+                    url,
+                    json=payload,
+                    headers=self._check_run_headers(token),
+                )
+        except (ConnectionError, TimeoutError, httpx.TransportError) as e:
+            raise ProviderError(f"GitHub PATCH {url} failed: {e}") from e
+        if resp.status_code != 200:
+            raise ProviderError(f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}")
 
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         token = await self._resolve_token()

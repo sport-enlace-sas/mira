@@ -86,7 +86,7 @@ def _help_message(bot_name: str) -> str:
         f"| Command | What it does |\n"
         f"|---|---|\n"
         f"| `@{bot_name} review` | Re-run the full review on this PR. Useful after force-pushes or when you want a fresh pass. |\n"
-        f"| `@{bot_name} review-rest` | Review files that were skipped on the first pass because the PR was too large. Aliases: `rest`, `continue`. |\n"
+        f"| `@{bot_name} review-rest` | Review files that were skipped or not reviewed because a chunk failed. Aliases: `rest`, `continue`. |\n"
         f"| `@{bot_name} pause` | Pause Mira on this PR. No more reviews until you resume. Adds a `mira-paused` label. |\n"
         f"| `@{bot_name} resume` | Resume Mira on a paused PR and re-review the latest diff. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
@@ -164,6 +164,10 @@ async def run_pr_review(
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
         result = await engine.review_pr(pr_url)
+        if result.all_chunks_failed:
+            from mira.exceptions import NonRetriableLLMError
+
+            raise NonRetriableLLMError("review_chunks_failed")
         review_tracker.complete(repo_full, number)
     except asyncio.CancelledError:
         await engine.cancel_background_tasks()
@@ -173,10 +177,16 @@ async def run_pr_review(
         review_tracker.fail(repo_full, number, str(exc))
         from mira.outbound_webhooks import REVIEW_FAILED, dispatch_event
 
-        await dispatch_event(
-            REVIEW_FAILED,
-            {"repo": repo_full, "pr_url": pr_url, "error": type(exc).__name__},
-        )
+        if publish_guard is None or publish_guard():
+            await dispatch_event(
+                REVIEW_FAILED,
+                {
+                    "repo": repo_full,
+                    "pr_url": pr_url,
+                    "number": number,
+                    "error": type(exc).__name__,
+                },
+            )
         raise
     finally:
         if job_id:
@@ -248,33 +258,12 @@ async def run_pr_review(
     )
 
     # A synchronize event may have superseded this SHA while its LLM calls
-    # were running.  The engine guards every GitHub mutation, and this final
-    # guard keeps the Check Run and outbound events equally SHA-correct.
+    # were running. Suppress outbound notifications for superseded jobs.
     if publish_guard is not None and not publish_guard():
         logger.info("Review became stale before publication: %s", pr_url)
         return True
 
     stats = build_review_stats(result.comments)
-    try:
-        pr_info = await provider.get_pr_info(pr_url)
-        conclusion = "neutral" if any(sev >= Severity.WARNING for sev in stats) else "success"
-        validation_mode = (
-            "Full PR revalidation completed for this SHA. "
-            if config.review.full_revalidation_on_synchronize
-            else "Incremental review completed for this SHA. "
-        )
-        await provider.post_advisory_check(
-            pr_info,
-            conclusion=conclusion,
-            summary=(
-                f"Advisory review for `{pr_info.head_sha[:12]}`. "
-                f"{validation_mode}"
-                f"{len(result.comments)} inline finding(s); "
-                "this check never blocks a merge."
-            ),
-        )
-    except Exception as exc:
-        logger.warning("Unable to prepare advisory Check Run: %s", type(exc).__name__)
     event_data = {
         "repo": repo_full,
         "pr_url": pr_url,
@@ -300,7 +289,7 @@ async def run_pr_command(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
-    user_id: int | None = None,
+    user_id: int | str | None = None,
 ) -> None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
@@ -426,7 +415,7 @@ async def run_thread_reply(
     actor: str = "",
     bot_name: str = "miracodeai",
     platform: str = "github",
-    user_id: int | None = None,
+    user_id: int | str | None = None,
 ) -> None:
     """Platform-neutral free-form thread reply with intent classification.
 

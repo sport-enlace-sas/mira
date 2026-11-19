@@ -202,6 +202,17 @@ class WalkthroughFileEntry:
 
 
 @dataclass
+class ChunkFailure:
+    """A review chunk that produced no usable structured review."""
+
+    chunk_index: int
+    paths: list[str] = field(default_factory=list)
+    reason: str = ""
+    hops: int | None = None
+    excerpt: str = ""
+
+
+@dataclass
 class WalkthroughResult:
     """Result of the PR walkthrough generation."""
 
@@ -234,10 +245,56 @@ class WalkthroughResult:
         provider_used: str = "",
         fallback_used: bool = False,
         marker: str = WALKTHROUGH_MARKER,
+        unverified_findings: list[ReviewComment] | None = None,
+        failed_paths: list[str] | None = None,
+        failed_chunks: list[ChunkFailure] | None = None,
+        total_chunks: int = 0,
+        security_failures: list[ChunkFailure] | None = None,
     ) -> str:
         """Render as a markdown PR comment."""
-        parts = [marker, "## Mira PR Walkthrough", ""]
-        parts.append(self.summary)
+        parts = [marker, "## Mira PR Walkthrough", "", self.summary]
+        bot_name = bot_name.removesuffix("[bot]")
+
+        failure_paths: list[str] = []
+        for path in failed_paths or []:
+            if path and path not in failure_paths:
+                failure_paths.append(path)
+        for failure in failed_chunks or []:
+            for path in failure.paths:
+                if path and path not in failure_paths:
+                    failure_paths.append(path)
+
+        if (failure_paths or failed_chunks) and not in_progress and not failure_notice:
+            failed_count = len(failed_chunks) if failed_chunks else 1
+            total_count = total_chunks or failed_count
+            shown_paths = min(8, len(failure_paths))
+            path_text = ", ".join(f"`{p}`" for p in failure_paths[:shown_paths])
+            if len(failure_paths) > shown_paths:
+                path_text += f" and {len(failure_paths) - shown_paths} more"
+            path_text = path_text or "the affected files"
+            parts.append("")
+            parts.append(
+                f"> ⚠️ **Review incomplete: {failed_count} of {total_count} "
+                f"chunk{'s' if total_count != 1 else ''} failed.** No findings were "
+                f"returned for {path_text}. Comment `@{bot_name} review-rest` to retry."
+            )
+
+        if security_failures and not in_progress and not failure_notice:
+            security_paths: list[str] = []
+            for failure in security_failures:
+                for path in failure.paths:
+                    if path and path not in security_paths:
+                        security_paths.append(path)
+            shown_security = min(6, len(security_paths))
+            path_text = ", ".join(f"`{p}`" for p in security_paths[:shown_security])
+            if len(security_paths) > shown_security:
+                path_text += f" and {len(security_paths) - shown_security} more"
+            suffix = f" for {path_text}" if path_text else ""
+            parts.append("")
+            parts.append(
+                "> ⚠️ **Security review incomplete:** the security pass failed"
+                f"{suffix}. Security findings may be missing from this review."
+            )
 
         # One durable summary comment carries the same evidence-first rubric
         # for every review, while actual findings remain native inline GitHub
@@ -317,6 +374,26 @@ class WalkthroughResult:
             parts.append("")
             parts.append("</details>")
 
+        if unverified_findings and not in_progress:
+            shown_findings = unverified_findings[:5]
+            parts.append("")
+            parts.append(
+                "<details>\n"
+                "<summary><b>Worth a look (not verified)</b> \u2014 "
+                f"{len(unverified_findings)}</summary>\n"
+            )
+            parts.append(
+                "_Possible issues Mira's self-check could not confirm from the diff. "
+                "Not posted as comments; check them yourself._"
+            )
+            parts.append("")
+            for f in shown_findings:
+                parts.append(f"- `{f.path}:{f.line}` \u2014 {f.title}")
+            if len(unverified_findings) > len(shown_findings):
+                parts.append(f"- _\u2026and {len(unverified_findings) - len(shown_findings)} more_")
+            parts.append("")
+            parts.append("</details>")
+
         if overlaps:
             _kind_label = {
                 "merge_conflict": "merge-conflict risk",
@@ -333,10 +410,10 @@ class WalkthroughResult:
                 link = f"[#{ov.pr_number}]({ov.url})" if ov.url else f"#{ov.pr_number}"
                 line = f"> - {link} ({label}) — {ov.reason}"
                 if ov.shared_files:
-                    shown = ", ".join(f"`{p}`" for p in ov.shared_files[:3])
+                    shown_paths = ", ".join(f"`{p}`" for p in ov.shared_files[:3])
                     if len(ov.shared_files) > 3:
-                        shown += f" +{len(ov.shared_files) - 3} more"
-                    line += f" Shared: {shown}"
+                        shown_paths += f" +{len(ov.shared_files) - 3} more"
+                    line += f" Shared: {shown_paths}"
                 parts.append(line)
             parts.append("")
 
@@ -383,11 +460,11 @@ class WalkthroughResult:
 
         if skipped_paths and not in_progress:
             total = len(total_paths) if total_paths else (reviewed_files + len(skipped_paths))
-            shown = min(8, len(skipped_paths))
+            shown_count = min(8, len(skipped_paths))
             parts.append("")
             parts.append("---")
             parts.append("")
-            parts.append(f"### \ud83d\udccb Reviewed {reviewed_files} of {total} files")
+            parts.append(f"### \U0001f4cb Reviewed {reviewed_files} of {total} files")
             parts.append("")
             parts.append(
                 "This PR is large enough that some files were skipped to keep the "
@@ -396,10 +473,10 @@ class WalkthroughResult:
             )
             parts.append("")
             parts.append("**Skipped:**")
-            for p in skipped_paths[:shown]:
+            for p in skipped_paths[:shown_count]:
                 parts.append(f"- `{p}`")
-            if len(skipped_paths) > shown:
-                parts.append(f"- _\u2026and {len(skipped_paths) - shown} more_")
+            if len(skipped_paths) > shown_count:
+                parts.append(f"- _\u2026and {len(skipped_paths) - shown_count} more_")
 
         if index_was_empty and not in_progress:
             parts.append("")
@@ -476,10 +553,25 @@ class ReviewResult:
     reviewed_paths: list[str] = field(default_factory=list)
     skipped_paths: list[str] = field(default_factory=list)
     total_paths: list[str] = field(default_factory=list)
+    # Chunks that produced no usable structured review. Kept separate from
+    # size-skipped paths so the walkthrough can say "incomplete" rather than
+    # "large PR"; both are retryable through review-rest.
+    failed_chunks: list[ChunkFailure] = field(default_factory=list)
+    failed_paths: list[str] = field(default_factory=list)
+    total_chunks: int = 0
+    security_failures: list[ChunkFailure] = field(default_factory=list)
+    dependency_failures: list[ChunkFailure] = field(default_factory=list)
     # Diagnostic trail: per-chunk draft counts and every comment dropped by a
     # filter/critique stage, so a benchmark run can show whether a missed
     # finding was never drafted or drafted-then-dropped. Not posted anywhere.
     audit: list[dict] = field(default_factory=list)
+    # Draft findings self-critique graded "plausible" but did not post. Shown
+    # in the walkthrough only with review.show_unverified_findings.
+    unverified_findings: list[ReviewComment] = field(default_factory=list)
+
+    @property
+    def all_chunks_failed(self) -> bool:
+        return self.total_chunks > 0 and len(self.failed_chunks) >= self.total_chunks
 
 
 @dataclass

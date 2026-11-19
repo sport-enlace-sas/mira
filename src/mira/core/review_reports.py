@@ -616,6 +616,12 @@ def build_compact_audit_report(
     total_paths: list[str] | None = None,
     index_was_empty: bool = False,
     overlaps: list[OverlapFinding] | None = None,
+    failed_paths: list[str] | None = None,
+    failed_chunks: int = 0,
+    total_chunks: int = 0,
+    security_failed: bool = False,
+    failure_notice: str = "",
+    unverified_findings: list[ReviewComment] | None = None,
 ) -> str:
     """Render one high-signal, immutable audit comment for a reviewed SHA."""
     parts = [
@@ -629,6 +635,24 @@ def build_compact_audit_report(
         confidence = walkthrough.confidence_score
         verdict = confidence.label or "Reviewed"
         parts.extend(["", f"**Verdict:** {verdict} · confidence {confidence.score}/5"])
+        if (failed_chunks or security_failed) and confidence.reason:
+            parts.append(_single_line(confidence.reason, 450))
+    if failure_notice:
+        parts.extend(["", "**Review failed**", "", failure_notice])
+    elif failed_chunks:
+        paths = failed_paths or []
+        shown_paths = ", ".join(f"`{_code_span(path)}`" for path in paths[:8])
+        remainder = f" and {len(paths) - 8} more" if len(paths) > 8 else ""
+        parts.extend(
+            [
+                "",
+                f"> **Review incomplete:** {failed_chunks} of {total_chunks} chunks failed. "
+                f"Affected files: {shown_paths or 'unknown'}{remainder}. "
+                f"Comment `@{bot_name} review-rest` to retry.",
+            ]
+        )
+    if security_failed:
+        parts.extend(["", "> **Security review incomplete.** Security findings may be missing."])
     context = [f"change scope **{impact.magnitude.value}**"]
     if full_pr_revalidation:
         context.append("full PR revalidation")
@@ -703,6 +727,13 @@ def build_compact_audit_report(
             f"> {len(skipped_paths)} of {total} files were skipped. "
             f"Use `@{bot_name} review-rest` for the remainder."
         )
+    if unverified_findings:
+        parts.extend(["", "<details>", "<summary>Worth a look (not verified)</summary>", ""])
+        parts.extend(
+            f"- `{_code_span(finding.path)}:{finding.line}` · {_single_line(finding.title)}"
+            for finding in unverified_findings[:5]
+        )
+        parts.extend(["", "</details>"])
     if index_was_empty:
         parts.append(
             "> Repository dependency index was unavailable; cross-file impact may be incomplete."

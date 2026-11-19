@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mira.config import CommandsConfig, MiraConfig
-from mira.models import PRInfo, ReviewComment, ReviewResult, Severity
+from mira.models import ChunkFailure, PRInfo, ReviewComment, ReviewResult, Severity
+from mira.outbound_webhooks import sample_data
 from mira.platforms.github.webhook import (
     handle_comment,
     handle_pause_resume,
@@ -230,16 +231,31 @@ async def test_blocker_comment_also_fires_high_severity(
 @patch("mira.platforms.github.webhook.create_provider")
 @patch("mira.platforms.handlers.create_llm")
 @patch("mira.platforms.handlers.load_config")
+@pytest.mark.parametrize(
+    ("result", "error_type"),
+    [
+        (RuntimeError("boom"), "RuntimeError"),
+        (
+            ReviewResult(
+                failed_chunks=[ChunkFailure(chunk_index=0, paths=["a.py"], reason="parse_error")],
+                total_chunks=1,
+            ),
+            "NonRetriableLLMError",
+        ),
+    ],
+)
 async def test_failed_review_fires_review_failed(
     mock_config: MagicMock,
     mock_llm_cls: MagicMock,
     mock_provider_cls: MagicMock,
     mock_engine_cls: MagicMock,
     mock_app_auth: AsyncMock,
+    result: ReviewResult | RuntimeError,
+    error_type: str,
 ) -> None:
-    """A review that raises fires review.failed (and not review.completed)."""
+    """A raised failure or a result with every chunk failed fires review.failed."""
     mock_config.return_value = MagicMock()
-    mock_dispatch = await _run_pr_handler(RuntimeError("boom"), mock_engine_cls, mock_app_auth)
+    mock_dispatch = await _run_pr_handler(result, mock_engine_cls, mock_app_auth)
 
     events = _events(mock_dispatch)
     assert "review.failed" in events
@@ -247,7 +263,9 @@ async def test_failed_review_fires_review_failed(
 
     data = _data_for(mock_dispatch, "review.failed")
     assert data["repo"] == "testowner/testrepo"
-    assert data["error"] == "RuntimeError"
+    assert data["error"] == error_type
+    assert data["number"] == 42
+    assert data.keys() == sample_data("review.failed").keys()
 
 
 @patch("mira.platforms.handlers.ReviewEngine")
