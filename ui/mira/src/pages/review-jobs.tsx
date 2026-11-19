@@ -54,6 +54,7 @@ const CANCELLATION_REASON: Record<string, string> = {
   pr_draft: "PR movido a borrador",
   pr_reopen_requested: "Esperando que termine la cancelación del intento anterior",
   "worker restarted": "Trabajo recuperado después de reiniciar el worker",
+  "review already running": "Ya había otra auditoría del mismo PR en curso",
 }
 
 const FILTERS: { value: Filter; label: string }[] = [
@@ -81,6 +82,7 @@ function matchesStatus(job: ReviewJobModel, status: Filter) {
 }
 
 function jobNote(job: ReviewJobModel, now: number) {
+  if (job.status === "failed") return null
   if (job.status === "pending" && job.next_attempt_at > now / 1000) {
     const delay = formatDuration(job.next_attempt_at * 1000 - now)
     const schedule = job.attempts > 0
@@ -203,10 +205,18 @@ function JobCard({
   const previousModels = job.models_attempted.split(" -> ").filter(Boolean)
   const modelNames = models.length ? models : previousModels
   const note = jobNote(job, now)
-  const hasTokens = job.input_tokens > 0 || job.output_tokens > 0
+  const totals = job.audit_totals
+  const inputTokens = totals ? totals.input_tokens : job.input_tokens || null
+  const outputTokens = totals ? totals.output_tokens : job.output_tokens || null
+  const tokensKnown = inputTokens != null || outputTokens != null
+  const tokenCount = TOKEN_FORMATTER.format((inputTokens ?? 0) + (outputTokens ?? 0))
+  const tokenTotal = tokensKnown ? (totals?.tokens_partial ? "≥ " : "") + tokenCount : null
   const working = job.status === "running" || job.status === "cancelling"
   const started = working && summary?.status === "running" ? summary.created_at : null
-  const elapsed = started != null ? Math.max(0, now - started * 1000) : job.audit_duration_ms || null
+  const recorded = totals?.duration_ms ?? (job.audit_duration_ms || null)
+  const elapsed = started != null ? (recorded ?? 0) + Math.max(0, now - started * 1000) : recorded
+  const duration = elapsed == null ? null : formatDuration(elapsed)
+  const showTotals = job.attempts > 0 || duration != null || tokensKnown
   const focusStages = working
     ? summary?.active_stages.map((stage) => {
         const name = STAGE_NAME[stage.id] ?? stage.id
@@ -258,6 +268,15 @@ function JobCard({
                       <span className="hidden shrink-0 @md:inline">Worker {summary.worker}</span>
                     )}
                   </span>
+                  {showTotals && (
+                    <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+                      <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                        <Clock3 aria-hidden="true" className="size-3" />
+                        {duration ?? "Tiempo sin registro"}
+                      </span>
+                      <span className="whitespace-nowrap">{tokenTotal == null ? "Tokens sin registro" : tokenTotal + " tokens"}</span>
+                    </span>
+                  )}
                 </span>
                 <span className="flex shrink-0 flex-col items-end gap-0.5">
                   <span className={cn("inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs font-medium sm:px-2", status.color)}>
@@ -307,9 +326,9 @@ function JobCard({
                 </dd>
               </div>
               <div className="min-w-0">
-                <dt className="text-xs text-muted-foreground">{started != null ? "Intento en curso" : "Duración acumulada"}</dt>
+                <dt className="text-xs text-muted-foreground">Duración acumulada</dt>
                 <dd className="mt-0.5 text-sm font-medium tabular-nums">
-                  {elapsed == null ? "—" : formatDuration(elapsed)}
+                  {duration ?? "Sin registro"}
                 </dd>
               </div>
               {modelNames.length > 0 && (
@@ -318,12 +337,17 @@ function JobCard({
                   <dd className="mt-0.5 font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">{modelNames.join(" · ")}</dd>
                 </div>
               )}
-              {hasTokens && (
+              {showTotals && (
                 <div className="col-span-2 min-w-0 text-xs">
-                  <dt className="mb-0.5 text-muted-foreground">Tokens acumulados</dt>
+                  <dt className="mb-0.5 text-muted-foreground">Tokens acumulados{totals?.tokens_partial && tokensKnown ? " · mínimo registrado" : ""}</dt>
                   <dd className="flex flex-wrap items-center gap-x-3 gap-y-1 tabular-nums text-muted-foreground">
-                    <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.input_tokens)} entrada</span>
-                    <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(job.output_tokens)} salida</span>
+                    <span className="font-medium text-foreground">{tokenTotal ?? "Sin registro"}</span>
+                    {tokensKnown && (
+                      <>
+                        <span className="inline-flex items-center gap-1"><ArrowDownLeft aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(inputTokens ?? 0)} entrada</span>
+                        <span className="inline-flex items-center gap-1"><ArrowUpRight aria-hidden="true" className="size-3" />{TOKEN_FORMATTER.format(outputTokens ?? 0)} salida</span>
+                      </>
+                    )}
                   </dd>
                 </div>
               )}

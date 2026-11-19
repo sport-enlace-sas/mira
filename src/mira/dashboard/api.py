@@ -253,6 +253,13 @@ class ReviewAuditSummary(BaseModel):
     result: ReviewAuditResult | None = None
 
 
+class ReviewAuditTotals(BaseModel):
+    duration_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    tokens_partial: bool = False
+
+
 class ReviewJobModel(BaseModel):
     id: int
     platform: str
@@ -279,6 +286,7 @@ class ReviewJobModel(BaseModel):
     created_at: float
     updated_at: float
     audit_summary: ReviewAuditSummary | None = None
+    audit_totals: ReviewAuditTotals | None = None
 
 
 class ReviewCommentModel(BaseModel):

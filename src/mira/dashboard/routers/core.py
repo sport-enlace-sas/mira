@@ -20,6 +20,7 @@ from mira.dashboard.api import (
     ReviewAuditActiveStage,
     ReviewAuditModelSummary,
     ReviewAuditSummary,
+    ReviewAuditTotals,
     ReviewJobModel,
     ReviewStatsModel,
     TimeSeriesPoint,
@@ -207,11 +208,72 @@ def list_review_jobs(limit: int = 200, prioritize_active: bool = False) -> list[
     from mira.ai.api import get_store
 
     jobs = _api._app_db.list_review_jobs(limit, prioritize_active=prioritize_active)
-    traces = get_store(_api._app_db).review_traces([job.id for job in jobs if job.attempts])
-    return [
-        ReviewJobModel(**job.__dict__, audit_summary=_audit_summary(job, traces.get(job.id)))
-        for job in jobs
-    ]
+    traces = get_store(_api._app_db).review_traces([job.id for job in jobs])
+    result = []
+    for job in jobs:
+        attempts = traces.get(job.id, [])
+        summary = _audit_summary(job, attempts[0][0] if attempts else None)
+        result.append(
+            ReviewJobModel(
+                **job.__dict__,
+                audit_summary=summary,
+                audit_totals=_audit_totals(job, attempts, summary),
+            )
+        )
+    return result
+
+
+def _audit_totals(
+    job: ReviewJobStatus, traces: list[tuple[dict, bool]], summary: ReviewAuditSummary | None
+) -> ReviewAuditTotals:
+    duration_ms = job.audit_duration_ms or None
+    input_tokens, output_tokens = job.input_tokens, job.output_tokens
+    has_usage = bool(input_tokens or output_tokens)
+    tokens_partial = False
+    for trace, metered in traces:
+        finished = trace.get("finished_at")
+        # A running snapshot can carry the same attempt number as a manual retry.
+        current = (
+            summary is not None
+            and trace is traces[0][0]
+            and job.status in {"running", "cancelling"}
+        )
+        if finished is None and not current:
+            tokens_partial = True
+            continue
+        if finished is not None and not metered:
+            duration_ms = (duration_ms or 0) + max(0, int((finished - trace["created_at"]) * 1000))
+        for stage in trace["stages"]:
+            for model in stage["models"]:
+                reported = model.get("usage_reported", False)
+                tokens_partial |= model.get("calls_with_usage", 0) < model.get("calls", 0)
+                has_usage |= reported
+                if reported and not metered:
+                    input_tokens += model["input_tokens"]
+                    output_tokens += model["output_tokens"]
+
+    # Preflight duplicate attempts never issue a model request. Older jobs
+    # without a complete trace must still show missing usage rather than zero.
+    duplicate_before_review = (
+        job.error == "review already running"
+        and len(traces) >= job.attempts > 0
+        and all(
+            trace.get("finished_at") is not None
+            and all(
+                not stage["models"]
+                and (stage.get("started_at") is None or stage.get("id") == "ingestion")
+                for stage in trace["stages"]
+            )
+            for trace, _ in traces
+        )
+    )
+    has_usage |= duplicate_before_review
+    return ReviewAuditTotals(
+        duration_ms=duration_ms,
+        input_tokens=input_tokens if has_usage else None,
+        output_tokens=output_tokens if has_usage else None,
+        tokens_partial=tokens_partial,
+    )
 
 
 def _audit_summary(job: ReviewJobStatus, trace: dict | None) -> ReviewAuditSummary | None:

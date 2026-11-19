@@ -240,7 +240,6 @@ async def run_pr_review(
                     or "unknown",
                     "fallback_used": fallback_used,
                     "models_attempted": " -> ".join(attempted_models),
-                    "audit_duration_ms": max(0, int((time.monotonic() - review_started_at) * 1000)),
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                 }
@@ -254,7 +253,13 @@ async def run_pr_review(
                 else:
                     if ocr_plan is not None:
                         _app_db.set_review_job_ocr(job_id, **ocr)
-                    _app_db.set_review_job_execution(job_id, **execution)
+                    _app_db.set_review_job_execution(
+                        job_id,
+                        **execution,
+                        audit_duration_ms=max(
+                            0, int((time.monotonic() - review_started_at) * 1000)
+                        ),
+                    )
             except Exception:
                 # Operational provenance must never replace the review's real
                 # success or failure with a telemetry write error.

@@ -506,10 +506,23 @@ async def test_buffered_review_trace_coalesces_and_retries_without_holding_revie
 
     monkeypatch.setattr(store, "save_runs", save)
     writer = AuditWriter(store, interval=0.001)
-    trace = ReviewTrace(writer, 42, 1, 2)
+    assert store.db.enqueue_review_job(
+        owner="o",
+        repo="r",
+        pr_number=42,
+        head_sha="a" * 40,
+        pr_url="https://github.com/o/r/pull/42",
+        pr_title="review",
+        installation_id=1,
+        is_private=True,
+    )
+    job = store.db.claim_next_review_job()
+    assert job is not None
+    trace = ReviewTrace(writer, job.id, 1, 2)
+    trace.started_monotonic -= 2
     run = {
         "id": "first-run",
-        "job_id": "42",
+        "job_id": str(job.id),
         "created_at": time.time(),
         "scenario": "security",
         "status": "running",
@@ -528,17 +541,26 @@ async def test_buffered_review_trace_coalesces_and_retries_without_holding_revie
         }
     )
     trace.observe(run)
-    trace.finish("completed")
+    with pytest.raises(TimeoutError), trace.measure("review"):
+        raise TimeoutError("detail excluded from telemetry")
+    trace.record_job_metrics({"input_tokens": 5, "output_tokens": 6})
+    trace.finish("failed")
     assert not attempts  # The review submits events without waiting for storage.
     await writer.close()
     assert len(attempts) == 2
-    assert len(attempts[-1]) == 2
-    final = store.review_trace(42)
+    assert len(attempts[-1]) == 3
+    final = store.review_trace(job.id)
+    assert final["status"] == "failed"
+    assert next(s for s in final["stages"] if s["id"] == "review")["errors"] == ["TimeoutError"]
     stage = next(s for s in final["stages"] if s["id"] == "security")
     assert stage["status"] == "completed"
     assert stage["models"][0]["input_tokens"] == 5
     assert stage["models"][0]["output_tokens"] == 6
-    assert [r["id"] for r in store.runs("42")] == ["first-run"]
+    assert [r["id"] for r in store.runs(str(job.id))] == ["first-run"]
+    save_runs(attempts[-1])  # Duplicate delivery must not re-add the counters.
+    [listed] = store.db.list_review_jobs()
+    assert listed.audit_duration_ms >= 2_000
+    assert (listed.input_tokens, listed.output_tokens) == (5, 6)
 
 
 @pytest.mark.parametrize("cancel_waiter", [False, True])

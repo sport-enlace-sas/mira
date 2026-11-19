@@ -47,6 +47,12 @@ export interface ReviewJobModel {
   created_at: number
   updated_at: number
   audit_summary?: ReviewAuditSummary | null
+  audit_totals?: {
+    duration_ms: number | null
+    input_tokens: number | null
+    output_tokens: number | null
+    tokens_partial: boolean
+  } | null
 }
 
 export interface SymbolModel {
@@ -493,6 +499,7 @@ export interface ReviewAuditStage {
   started_at: number | null
   finished_at: number | null
   phases: string[]
+  errors?: string[]
   issues?: {
     provider: string
     model: string

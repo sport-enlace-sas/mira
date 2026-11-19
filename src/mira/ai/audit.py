@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
 from uuid import uuid4
 
+from mira.exceptions import LLMError
+
 if TYPE_CHECKING:
     from mira.ai.store import AIStore
 
@@ -118,12 +120,14 @@ class ReviewTrace:
         self.attempt = attempt
         self.worker = worker
         self.started_at = time.time()
+        self.started_monotonic = time.monotonic()
         self.finished_at: float | None = None
         self.status = "running"
         self.result: dict | None = None
         self.runs: dict[str, dict] = {}
         self.spans: dict[str, list[dict]] = {}
         self.failed_stages: set[str] = set()
+        self.execution_metrics: dict = {}
         self.changed = asyncio.Event()
         self.stop = asyncio.Event()
         self.progress_task: asyncio.Task | None = None
@@ -140,8 +144,9 @@ class ReviewTrace:
         except asyncio.CancelledError:
             span["status"] = "cancelled"
             raise
-        except Exception:
+        except Exception as exc:
             span["status"] = "failed"
+            span["error"] = exc.code if isinstance(exc, LLMError) else type(exc).__name__
             raise
         else:
             span["status"] = "success"
@@ -176,6 +181,18 @@ class ReviewTrace:
         self.writer.submit(self.snapshot())
 
     def record_job_metrics(self, metrics: dict) -> None:
+        self.execution_metrics = metrics
+
+    def record_result(self, result: dict) -> None:
+        self.result = result
+        self.emit()
+
+    def finish(self, status: str) -> None:
+        if self.finished_at is not None:
+            return
+        self.status = status
+        self.finished_at = time.time()
+        self.emit()
         self.writer.submit(
             {
                 "id": f"metrics:{self.id}",
@@ -183,20 +200,16 @@ class ReviewTrace:
                 "created_at": self.started_at,
                 "job_id": self.job_id,
                 "attempt": self.attempt,
-                "job_metrics": metrics,
+                "job_metrics": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    **self.execution_metrics,
+                    "audit_duration_ms": max(
+                        0, int((time.monotonic() - self.started_monotonic) * 1000)
+                    ),
+                },
             }
         )
-
-    def record_result(self, result: dict) -> None:
-        self.result = result
-        self.emit()
-
-    def finish(self, status: str) -> None:
-        if self.finished_at is not None and self.status == status:
-            return
-        self.status = status
-        self.finished_at = time.time()
-        self.emit()
 
     def snapshot(self) -> dict:
         now = self.finished_at or time.time()
@@ -292,6 +305,7 @@ class ReviewTrace:
                     "finished_at": ended if status != "running" else None,
                     "models": list(models.values()),
                     "issues": list(issues.values()),
+                    "errors": sorted({span["error"] for span in sources if "error" in span}),
                     "phases": sorted(phases),
                 }
             )

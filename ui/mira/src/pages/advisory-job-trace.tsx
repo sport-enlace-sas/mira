@@ -1,4 +1,4 @@
-import { Activity, ChevronDown, Timer } from "lucide-react"
+import { Activity, AlertCircle, ChevronDown, Timer } from "lucide-react"
 import { useRef } from "react"
 
 import { api, type ReviewAuditStage, type ReviewAuditTrace, type ReviewJobModel } from "@/lib/api"
@@ -36,6 +36,77 @@ const ISSUE_LABEL: Record<string, string> = {
   timeout: "Tiempo de respuesta del modelo agotado",
   tools_incompatible: "Herramientas incompatibles",
   vault: "Almacén de credenciales no disponible",
+}
+
+const FAILURE_LABEL: Record<string, string> = {
+  ai_flow_exhausted: "El flujo agotó sus alternativas de IA.",
+  FlowExhaustedError: "El flujo agotó sus alternativas de IA.",
+  review_chunks_failed: "Fallaron todos los bloques de revisión.",
+  TimeoutError: "La operación excedió el tiempo de espera.",
+  ProviderError: "Falló la comunicación con el proveedor del PR.",
+}
+
+function failureLabel(error: string) {
+  const code = error.split(":", 1)[0]
+  return FAILURE_LABEL[code] ?? (/^[\w]{1,80}$/.test(code) ? "Error registrado · " + code : null)
+}
+
+function AuditFailure({ job, trace }: { job: ReviewJobModel; trace: ReviewAuditTrace | null }) {
+  const failed = job.status === "failed"
+  const stages = trace?.stages.filter((stage) => stage.status === "failed") ?? []
+  if (!failed && !(job.status === "completed" && stages.length)) return null
+
+  const collision = failed && job.error === "review already running"
+  const where = collision ? "Inicio de la revisión" : "Etapa sin registro"
+  const why = collision
+    ? "Ya había otra auditoría del mismo PR en curso."
+    : failureLabel(job.error) ?? "El motivo del fallo no quedó registrado."
+
+  return (
+    <section aria-label={failed ? "Por qué falló" : "Etapas con fallos"} className={cn(
+      "min-w-0 rounded-lg border px-3 py-3 sm:px-3.5",
+      failed
+        ? "border-destructive/30 bg-destructive/5"
+        : "border-amber-600/30 bg-amber-600/5",
+    )}>
+      <h3 className="flex items-center gap-2 text-sm font-semibold">
+        <AlertCircle aria-hidden="true" className="size-4 shrink-0" />
+        {failed ? "Por qué falló" : "Etapas con fallos"}
+      </h3>
+      {collision || !stages.length ? (
+        <div className="mt-2 min-w-0 text-sm">
+          <p className="font-medium">{where}</p>
+          <p className="mt-0.5 wrap-anywhere text-muted-foreground">{why}</p>
+        </div>
+      ) : (
+        <ul className="mt-2 space-y-2 text-sm">
+          {stages.map((stage) => {
+            const issues = stage.issues ?? []
+            const errors = stage.errors?.map(failureLabel).filter(Boolean) ?? []
+            return (
+              <li key={stage.id} className="min-w-0">
+                <p className="font-medium">{STAGE_NAME[stage.id] ?? stage.label}</p>
+                {issues.length > 0 ? (
+                  <ul className="mt-0.5 space-y-1 text-xs text-muted-foreground">
+                    {issues.map((issue) => (
+                      <li key={`${issue.provider}/${issue.model}/${issue.cause}/${issue.result}`} className="wrap-anywhere">
+                        {ISSUE_LABEL[issue.cause] ?? issue.label} · <code translate="no">{issue.model}</code> ({issue.provider})
+                        {issue.count > 1 && ` ×${issue.count}`}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-0.5 wrap-anywhere text-muted-foreground">
+                    {errors.length ? errors.join(" · ") : failed ? why : "El motivo del fallo no quedó registrado."}
+                  </p>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
 }
 
 const STAGE_TONE = {
@@ -224,11 +295,14 @@ export function AdvisoryJobTrace({ job, refresh, now }: { job: ReviewJobModel; r
           ? "El recorrido estará disponible cuando este intento registre sus primeras etapas."
           : "Esta revisión no tiene un recorrido registrado."
     return (
-      <section aria-label="Recorrido de auditoría" className="rounded-lg border border-dashed px-3 py-4">
-        <p className="wrap-anywhere text-sm text-muted-foreground" role={loading ? "status" : undefined}>
-          {message}
-        </p>
-      </section>
+      <>
+        <AuditFailure job={job} trace={null} />
+        <section aria-label="Recorrido de auditoría" className="rounded-lg border border-dashed px-3 py-4">
+          <p className="wrap-anywhere text-sm text-muted-foreground" role={loading ? "status" : undefined}>
+            {message}
+          </p>
+        </section>
+      </>
     )
   }
 
@@ -248,6 +322,7 @@ export function AdvisoryJobTrace({ job, refresh, now }: { job: ReviewJobModel; r
 
   return (
     <section aria-label="Recorrido de auditoría" className="min-w-0 space-y-3">
+      <AuditFailure job={job} trace={previousAttempt ? null : trace} />
       <header className="flex min-w-0 flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <h3 className="flex items-center gap-2 text-sm font-semibold">
